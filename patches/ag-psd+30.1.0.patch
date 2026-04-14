@@ -1,0 +1,26 @@
+diff --git a/node_modules/ag-psd/dist/additionalInfo.js b/node_modules/ag-psd/dist/additionalInfo.js
+index 2e62b06..041b2e8 100644
+--- a/node_modules/ag-psd/dist/additionalInfo.js
++++ b/node_modules/ag-psd/dist/additionalInfo.js
+@@ -3419,7 +3419,6 @@ addHandler('lfx2', function (target) { return target.effects !== undefined && !h
+     if (version !== 0)
+         throw new Error("Invalid lfx2 version");
+     var desc = (0, descriptor_1.readVersionAndDescriptor)(reader);
+-    // console.log('READ', require('util').inspect(desc, false, 99, true));
+     // TODO: don't discard if we got it from lmfx
+     // discard if read in 'lrFX' section
+     target.effects = (0, descriptor_1.parseEffects)(desc, !!reader.logMissingFeatures);
+diff --git a/node_modules/ag-psd/dist/helpers.js b/node_modules/ag-psd/dist/helpers.js
+index e18ef7b..f03d93f 100644
+--- a/node_modules/ag-psd/dist/helpers.js
++++ b/node_modules/ag-psd/dist/helpers.js
+@@ -54,6 +54,9 @@ function revMap(map) {
+ exports.revMap = revMap;
+ function createEnum(prefix, def, map) {
+     var rev = revMap(map);
++    // Patch: ag-psd missing abbreviated blend mode keys (lddg=linearDodge, lbrn=linearBurn)
++    var _extraAliases = { 'lddg': 'linearDodge', 'lbrn': 'linearBurn' };
++    for (var _ak in _extraAliases) { if (!rev[_ak] && rev[_extraAliases[_ak]]) rev[_ak] = rev[_extraAliases[_ak]]; }
+     var decode = function (val) {
+         var value = val.split('.')[1];
+         if (value && !rev[value])
