@@ -57,6 +57,7 @@ export interface SerializedTextData {
   horizontalAlignment: string;
   styles: SerializedTextStyle[];
   transformScale: number;
+  rotation?: number;
   docBoundsY?: number;
   docBboxCenterX?: number;
   gradientOverlay?: SerializedGradientOverlay;

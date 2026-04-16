@@ -322,7 +322,13 @@ async function createLayerNode(
         applyEffects(text, layer.effects, onLog, layer.name);
         applyStrokes(text, layer.strokes, onLog, layer.name);
 
-        alignTextRenderBoundsToLayer(text, layer, parent, onLog);
+        if (layer.textData?.rotation) {
+          text.x = layer.x;
+          text.y = layer.y;
+          text.rotation = layer.textData.rotation;
+        } else {
+          alignTextRenderBoundsToLayer(text, layer, parent, onLog);
+        }
 
         onLog('info', `Created text: "${layer.name}"`);
         node = text;

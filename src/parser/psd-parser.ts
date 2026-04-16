@@ -70,7 +70,7 @@ function convertTextData(text: LayerTextData): SerializedTextData {
   const baseStrokeColor = base?.strokeColor;
 
   const txScale = (text.transform && text.transform.length >= 4)
-    ? Math.abs(text.transform[3])
+    ? Math.sqrt(text.transform[1] * text.transform[1] + text.transform[3] * text.transform[3])
     : 1;
 
   if (text.styleRuns && text.styleRuns.length > 0) {
@@ -127,8 +127,8 @@ function convertTextData(text: LayerTextData): SerializedTextData {
   let docBboxCenterX: number | undefined;
 
   if (text.transform && text.transform.length >= 6) {
-    const sx = Math.abs(text.transform[0]);
-    const sy = Math.abs(text.transform[3]);
+    const sx = Math.sqrt(text.transform[0] * text.transform[0] + text.transform[2] * text.transform[2]);
+    const sy = Math.sqrt(text.transform[1] * text.transform[1] + text.transform[3] * text.transform[3]);
     const tx = text.transform[4];
     const ty = text.transform[5];
 
@@ -147,7 +147,15 @@ function convertTextData(text: LayerTextData): SerializedTextData {
 
   }
 
-  const result: SerializedTextData = { text: fullText, horizontalAlignment: alignment, styles, transformScale: txScale, docBoundsY, docBboxCenterX };
+  let rotation: number | undefined;
+  if (text.transform && text.transform.length >= 4) {
+    const angleDeg = Math.atan2(text.transform[2], text.transform[0]) * (180 / Math.PI);
+    if (Math.abs(angleDeg) > 0.1) {
+      rotation = angleDeg;
+    }
+  }
+
+  const result: SerializedTextData = { text: fullText, horizontalAlignment: alignment, styles, transformScale: txScale, rotation, docBoundsY, docBboxCenterX };
 
   if (text.shapeType) {
     result.shapeType = text.shapeType;
