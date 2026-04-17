@@ -1,0 +1,76 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v1.0.0)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and publish release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Resolve release tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "name=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "name=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Verify build artifacts
+        run: |
+          test -f dist/code.js || (echo "Missing dist/code.js" && exit 1)
+          test -f dist/ui.html || (echo "Missing dist/ui.html" && exit 1)
+
+      - name: Package plugin
+        id: package
+        run: |
+          TAG="${{ steps.tag.outputs.name }}"
+          PKG_DIR="psd-to-figma-${TAG}"
+          mkdir -p "${PKG_DIR}/dist"
+          cp dist/code.js "${PKG_DIR}/dist/"
+          cp dist/ui.html "${PKG_DIR}/dist/"
+          cp manifest.json "${PKG_DIR}/"
+          cp README.md "${PKG_DIR}/" 2>/dev/null || true
+          ZIP_NAME="${PKG_DIR}.zip"
+          zip -r "${ZIP_NAME}" "${PKG_DIR}"
+          echo "zip=${ZIP_NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.name }}
+          name: ${{ steps.tag.outputs.name }}
+          generate_release_notes: true
+          files: |
+            ${{ steps.package.outputs.zip }}
+            dist/code.js
+            dist/ui.html
+            manifest.json
