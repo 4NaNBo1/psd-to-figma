@@ -130,25 +130,34 @@ function convertTextData(text: LayerTextData): SerializedTextData {
     const [a, b, c, d, tx, ty] = text.transform;
     const sx = Math.sqrt(a * a + c * c);
     const sy = Math.sqrt(b * b + d * d);
+    const isRotated = Math.abs(b) > 0.001 || Math.abs(c) > 0.001;
 
-    if (text.boundingBox) {
-      const bbL = text.boundingBox.left.value;
-      const bbR = text.boundingBox.right.value;
-      const bbT = text.boundingBox.top.value;
-
-      const docBboxLx = a * bbL + c * bbT + tx;
-      const docBboxRx = a * bbR + c * bbT + tx;
-      const docBboxLy = b * bbL + d * bbT + ty;
-      docBboxCenterX = (docBboxLx + docBboxRx) / 2;
-      docBoundsY = docBboxLy;
-    } else if (text.bounds) {
-      const bT = text.bounds.top.value;
-      const bL = text.bounds.left.value;
-      docBoundsY = b * bL + d * bT + ty;
-      const bR = text.bounds.right.value;
-      const docBoundsLx = a * bL + c * bT + tx;
-      const docBoundsRx = a * bR + c * bT + tx;
-      docBboxCenterX = (docBoundsLx + docBoundsRx) / 2;
+    if (isRotated) {
+      if (text.boundingBox) {
+        const bbL = text.boundingBox.left.value;
+        const bbR = text.boundingBox.right.value;
+        const bbT = text.boundingBox.top.value;
+        docBboxCenterX = (a * bbL + c * bbT + tx + a * bbR + c * bbT + tx) / 2;
+        docBoundsY = b * bbL + d * bbT + ty;
+      } else if (text.bounds) {
+        const bT = text.bounds.top.value;
+        const bL = text.bounds.left.value;
+        const bR = text.bounds.right.value;
+        docBboxCenterX = (a * bL + c * bT + tx + a * bR + c * bT + tx) / 2;
+        docBoundsY = b * bL + d * bT + ty;
+      }
+    } else {
+      if (text.bounds) {
+        const bT = text.bounds.top.value;
+        docBoundsY = sy * bT + ty;
+      }
+      if (text.boundingBox) {
+        const bbL = text.boundingBox.left.value;
+        const bbR = text.boundingBox.right.value;
+        const docBboxL = sx * bbL + tx;
+        const docBboxR = sx * bbR + tx;
+        docBboxCenterX = (docBboxL + docBboxR) / 2;
+      }
     }
 
   }
