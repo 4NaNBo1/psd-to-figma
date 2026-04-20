@@ -127,22 +127,28 @@ function convertTextData(text: LayerTextData): SerializedTextData {
   let docBboxCenterX: number | undefined;
 
   if (text.transform && text.transform.length >= 6) {
-    const sx = Math.sqrt(text.transform[0] * text.transform[0] + text.transform[2] * text.transform[2]);
-    const sy = Math.sqrt(text.transform[1] * text.transform[1] + text.transform[3] * text.transform[3]);
-    const tx = text.transform[4];
-    const ty = text.transform[5];
-
-    if (text.bounds) {
-      const bT = text.bounds.top.value;
-      docBoundsY = sy * bT + ty;
-    }
+    const [a, b, c, d, tx, ty] = text.transform;
+    const sx = Math.sqrt(a * a + c * c);
+    const sy = Math.sqrt(b * b + d * d);
 
     if (text.boundingBox) {
       const bbL = text.boundingBox.left.value;
       const bbR = text.boundingBox.right.value;
-      const docBboxL = sx * bbL + tx;
-      const docBboxR = sx * bbR + tx;
-      docBboxCenterX = (docBboxL + docBboxR) / 2;
+      const bbT = text.boundingBox.top.value;
+
+      const docBboxLx = a * bbL + c * bbT + tx;
+      const docBboxRx = a * bbR + c * bbT + tx;
+      const docBboxLy = b * bbL + d * bbT + ty;
+      docBboxCenterX = (docBboxLx + docBboxRx) / 2;
+      docBoundsY = docBboxLy;
+    } else if (text.bounds) {
+      const bT = text.bounds.top.value;
+      const bL = text.bounds.left.value;
+      docBoundsY = b * bL + d * bT + ty;
+      const bR = text.bounds.right.value;
+      const docBoundsLx = a * bL + c * bT + tx;
+      const docBoundsRx = a * bR + c * bT + tx;
+      docBboxCenterX = (docBoundsLx + docBoundsRx) / 2;
     }
 
   }
