@@ -175,10 +175,14 @@ export async function applyTextProperties(
 
   node.fontName = defaultFont;
 
-  const isBoxText = td.shapeType === 'box' && layer.width > 0 && layer.height > 0;
+  const boxW = td.boxBounds?.width ?? 0;
+  const boxH = td.boxBounds?.height ?? 0;
+  const isBoxText = td.shapeType === 'box' && (boxW > 0 || (layer.width > 0 && layer.height > 0));
+  const resizeW = boxW > 0 ? boxW : layer.width;
+  const resizeH = boxH > 0 ? boxH : layer.height;
   if (isBoxText) {
     node.textAutoResize = 'HEIGHT';
-    node.resize(layer.width, layer.height);
+    node.resize(resizeW, resizeH);
   } else {
     node.textAutoResize = 'WIDTH_AND_HEIGHT';
   }
@@ -188,8 +192,9 @@ export async function applyTextProperties(
 
   if (isBoxText) {
     node.textAutoResize = 'NONE';
-    node.resize(layer.width, layer.height);
+    node.resize(resizeW, resizeH);
   }
+
 
   if (td.styles.length > 0) {
     for (const style of td.styles) {

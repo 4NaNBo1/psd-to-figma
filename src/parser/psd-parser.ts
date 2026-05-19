@@ -66,6 +66,10 @@ function convertTextData(text: LayerTextData): SerializedTextData {
   const baseFauxItalic = base?.fauxItalic ?? false;
   const baseTracking = base?.tracking ?? 0;
   const baseLeading = base?.leading;
+  const baseAutoLeading = base?.autoLeading ?? false;
+  const paragraphAutoLeadingRatio = text.paragraphStyle?.autoLeading
+    ?? text.paragraphStyleRuns?.[0]?.style?.autoLeading
+    ?? 1.2;
   const baseFillColor = base?.fillColor;
   const baseStrokeColor = base?.strokeColor;
 
@@ -85,17 +89,24 @@ function convertTextData(text: LayerTextData): SerializedTextData {
       const fauxItalic = s.fauxItalic ?? baseFauxItalic;
       const tracking = s.tracking ?? baseTracking;
       const leading = s.leading ?? baseLeading;
+      const autoLeading = s.autoLeading ?? baseAutoLeading;
       const fillColor = s.fillColor ?? baseFillColor;
       const strokeColor = s.strokeColor ?? baseStrokeColor;
 
       const scaledFontSize = fontSize * txScale;
+      let resolvedLeading: number | null;
+      if (autoLeading && (!leading || leading === 0)) {
+        resolvedLeading = text.shapeType === 'box' ? scaledFontSize * paragraphAutoLeadingRatio : null;
+      } else {
+        resolvedLeading = leading != null ? leading * txScale : null;
+      }
       const style: SerializedTextStyle = {
         fontFamily: fontName,
         fontStyle: fauxBold ? 'Bold' : fauxItalic ? 'Italic' : 'Regular',
         fontSize: scaledFontSize,
         color: toColor(fillColor),
         letterSpacing: (tracking / 1000) * scaledFontSize,
-        lineHeight: leading != null ? leading * txScale : null,
+        lineHeight: resolvedLeading,
         start: offset,
         end,
       };
@@ -107,13 +118,19 @@ function convertTextData(text: LayerTextData): SerializedTextData {
     }
   } else {
     const scaledFontSize = baseFontSize * txScale;
+    let resolvedLeading: number | null;
+    if (baseAutoLeading && (!baseLeading || baseLeading === 0)) {
+      resolvedLeading = text.shapeType === 'box' ? scaledFontSize * paragraphAutoLeadingRatio : null;
+    } else {
+      resolvedLeading = baseLeading != null ? baseLeading * txScale : null;
+    }
     const style: SerializedTextStyle = {
       fontFamily: baseFontName,
       fontStyle: baseFauxBold ? 'Bold' : baseFauxItalic ? 'Italic' : 'Regular',
       fontSize: scaledFontSize,
       color: toColor(baseFillColor),
       letterSpacing: (baseTracking / 1000) * scaledFontSize,
-      lineHeight: baseLeading != null ? baseLeading * txScale : null,
+      lineHeight: resolvedLeading,
       start: 0,
       end: fullText.length,
     };
@@ -250,6 +267,78 @@ async function imageDataToPng(
 
   logger.warn(`Image ${imageData.width}x${imageData.height} exceeds Figma limit, downscaled to ${dstW}x${dstH}`);
   return canvasToPng(downscaled);
+}
+
+function applyLayerMask(
+  imageData: { data: Uint8ClampedArray | Uint8Array | Uint16Array | Float32Array; width: number; height: number },
+  layer: Layer
+): { data: Uint8ClampedArray; width: number; height: number } | null {
+  const mask = layer.mask;
+  if (!mask || mask.disabled) return null;
+  if (!mask.imageData && !mask.canvas) return null;
+
+  const layerLeft = layer.left ?? 0;
+  const layerTop = layer.top ?? 0;
+  const imgW = imageData.width;
+  const imgH = imageData.height;
+
+  let maskPixels: Uint8ClampedArray | Uint8Array | Uint16Array | Float32Array;
+  let maskW: number;
+  let maskH: number;
+
+  if (mask.imageData) {
+    maskPixels = mask.imageData.data;
+    maskW = mask.imageData.width;
+    maskH = mask.imageData.height;
+  } else {
+    const cvs = mask.canvas as HTMLCanvasElement;
+    const ctx = cvs.getContext('2d')!;
+    const mData = ctx.getImageData(0, 0, cvs.width, cvs.height);
+    maskPixels = mData.data;
+    maskW = cvs.width;
+    maskH = cvs.height;
+  }
+
+  const maskLeft = mask.left ?? 0;
+  const maskTop = mask.top ?? 0;
+  const defaultColor = mask.defaultColor ?? 255;
+
+  const isSingleChannel = maskPixels.length === maskW * maskH;
+  const maskStride = isSingleChannel ? 1 : 4;
+
+  const pixelCount = imgW * imgH * 4;
+  const result = new Uint8ClampedArray(pixelCount);
+  const srcData = imageData.data;
+  if (srcData instanceof Uint8ClampedArray || srcData instanceof Uint8Array) {
+    result.set(srcData.subarray(0, pixelCount));
+  } else {
+    for (let i = 0; i < pixelCount; i++) {
+      result[i] = Math.min(255, Math.max(0, Math.round(Number(srcData[i]))));
+    }
+  }
+
+  for (let y = 0; y < imgH; y++) {
+    for (let x = 0; x < imgW; x++) {
+      const docX = layerLeft + x;
+      const docY = layerTop + y;
+
+      let maskAlpha: number;
+      const mxLocal = docX - maskLeft;
+      const myLocal = docY - maskTop;
+
+      if (mxLocal >= 0 && mxLocal < maskW && myLocal >= 0 && myLocal < maskH) {
+        const mIdx = (myLocal * maskW + mxLocal) * maskStride;
+        maskAlpha = Math.round(Number(maskPixels[mIdx]));
+      } else {
+        maskAlpha = defaultColor;
+      }
+
+      const pIdx = (y * imgW + x) * 4;
+      result[pIdx + 3] = Math.round((result[pIdx + 3] * maskAlpha) / 255);
+    }
+  }
+
+  return { data: result, width: imgW, height: imgH };
 }
 
 function getLayerBounds(layer: Layer): { left: number; top: number; right: number; bottom: number } {
@@ -906,6 +995,7 @@ async function serializeLayer(
     strokes: convertStrokes(layer.effects),
   };
 
+
   if (layer.vectorOrigination) {
     for (const desc of layer.vectorOrigination.keyDescriptorList) {
       if (desc.keyOriginRRectRadii) {
@@ -923,6 +1013,7 @@ async function serializeLayer(
 
   if (type === 'text' && layer.text) {
     serialized.textData = convertTextData(layer.text);
+
 
     if (serialized.textData.docBboxCenterX != null) {
       serialized.textData.docBboxCenterX -= parentLeft;
@@ -978,6 +1069,9 @@ async function serializeLayer(
   if (type !== 'text' && layer.imageData && layer.imageData.width > 0 && layer.imageData.height > 0) {
     onProgress({ percent: 0, message: `Encoding image: ${layer.name}` });
     try {
+      const maskedData = applyLayerMask(layer.imageData, layer);
+      const effectiveImageData = maskedData ?? layer.imageData;
+
       const enabledStrokes = getEnabledStrokes(layer);
       const enabledDropShadows = getEnabledDropShadows(layer);
       const layerFillOpacity = (layer as any).fillOpacity ?? 1;
@@ -986,7 +1080,7 @@ async function serializeLayer(
       const needsComposite = enabledStrokes.length > 0 || layerFillOpacity < 1 || !!solidFill || !!gradOverlay || enabledDropShadows.length > 0;
 
       if (needsComposite) {
-        const { png, expand } = await compositeLayerEffects(layer.imageData, enabledStrokes, layerFillOpacity, solidFill, gradOverlay, enabledDropShadows);
+        const { png, expand } = await compositeLayerEffects(effectiveImageData, enabledStrokes, layerFillOpacity, solidFill, gradOverlay, enabledDropShadows);
         serialized.imageIndex = images.length;
         images.push(png);
         if (expand > 0) {
@@ -998,10 +1092,10 @@ async function serializeLayer(
         }
         logger.info(`Layer "${layer.name}": composited with ${enabledStrokes.length} strokes, ${enabledDropShadows.length} shadows, fillOpacity=${layerFillOpacity}, expand=${expand} (${serialized.width}x${serialized.height})`);
       } else {
-        const png = await imageDataToPng(layer.imageData);
+        const png = await imageDataToPng(effectiveImageData);
         serialized.imageIndex = images.length;
         images.push(png);
-        logger.info(`Layer "${layer.name}": encoded imageData (${layer.imageData.width}x${layer.imageData.height})`);
+        logger.info(`Layer "${layer.name}": encoded imageData (${effectiveImageData.width}x${effectiveImageData.height})`);
       }
     } catch (e) {
       logger.warn(`Failed to encode imageData for "${layer.name}": ${e instanceof Error ? e.message : e}`);
@@ -1010,6 +1104,11 @@ async function serializeLayer(
     onProgress({ percent: 0, message: `Encoding canvas: ${layer.name}` });
     try {
       const cvs = layer.canvas as HTMLCanvasElement;
+      const cctx = cvs.getContext('2d')!;
+      const rawCanvasData = cctx.getImageData(0, 0, cvs.width, cvs.height);
+      const maskedCanvasData = applyLayerMask(rawCanvasData, layer);
+      const effectiveCanvasData = maskedCanvasData ?? rawCanvasData;
+
       const enabledStrokes = getEnabledStrokes(layer);
       const enabledDropShadowsC = getEnabledDropShadows(layer);
       const layerFillOpacity = (layer as any).fillOpacity ?? 1;
@@ -1018,9 +1117,7 @@ async function serializeLayer(
       const needsComposite = enabledStrokes.length > 0 || layerFillOpacity < 1 || !!solidFill || !!gradOverlay || enabledDropShadowsC.length > 0;
 
       if (needsComposite && cvs.width > 0 && cvs.height > 0) {
-        const cctx = cvs.getContext('2d')!;
-        const cImgData = cctx.getImageData(0, 0, cvs.width, cvs.height);
-        const { png, expand } = await compositeLayerEffects(cImgData, enabledStrokes, layerFillOpacity, solidFill, gradOverlay, enabledDropShadowsC);
+        const { png, expand } = await compositeLayerEffects(effectiveCanvasData, enabledStrokes, layerFillOpacity, solidFill, gradOverlay, enabledDropShadowsC);
         serialized.imageIndex = images.length;
         images.push(png);
         if (expand > 0) {
@@ -1032,10 +1129,10 @@ async function serializeLayer(
         }
         logger.info(`Layer "${layer.name}": composited canvas with ${enabledStrokes.length} strokes, ${enabledDropShadowsC.length} shadows, fillOpacity=${layerFillOpacity}, expand=${expand} (${serialized.width}x${serialized.height})`);
       } else {
-        const png = await canvasToPng(cvs);
+        const png = maskedCanvasData ? await imageDataToPng(effectiveCanvasData) : await canvasToPng(cvs);
         serialized.imageIndex = images.length;
         images.push(png);
-        logger.info(`Layer "${layer.name}": encoded canvas`);
+        logger.info(`Layer "${layer.name}": encoded canvas${maskedCanvasData ? ' (masked)' : ''}`);
       }
     } catch (e) {
       logger.warn(`Failed to encode canvas for "${layer.name}": ${e instanceof Error ? e.message : e}`);
@@ -1078,6 +1175,8 @@ export async function parsePsdFile(
 
   if (psd.children) {
     const total = psd.children.length;
+
+
     for (let i = 0; i < psd.children.length; i++) {
       const layerName = psd.children[i].name ?? 'unnamed';
       logger.info(`Processing top-level layer ${i + 1}/${total}: "${layerName}"`);
