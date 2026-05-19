@@ -9,7 +9,6 @@ dist/
 Thumbs.db
 
 # Editor
-.cursor/
 .vscode/
 *.swp
 *.swo

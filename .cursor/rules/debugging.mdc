@@ -1,0 +1,32 @@
+---
+description: "HARD BLOCK — 禁止 fetch/XHR/WS，调试只用 logger / sendLog"
+alwaysApply: true
+---
+
+# 调试方式：仅限内置日志
+
+> Figma 插件沙箱 CSP 禁止对外网络请求。`fetch` / `XMLHttpRequest` / `WebSocket` / `sendBeacon` 写入代码 = 插件崩溃。
+
+## 禁止列表（零例外）
+
+`fetch(`、`XMLHttpRequest`、`new WebSocket`、`navigator.sendBeacon`、任何外部 URL。
+**包括调试、日志采集、健康检查。没有"只是 catch 掉"的例外。**
+
+## 唯一允许的调试方式
+
+| 位置 | API | 示例 |
+|------|-----|------|
+| UI 侧 (`src/*.ts`) | `logger.info/warn/error` | `logger.info(\`mask applied: ${w}x${h}\`)` |
+| 主线程 (`src/code.ts`) | `sendLog(level, msg)` | `sendLog('error', \`Import failed: ${msg}\`)` |
+
+不需要 import 路径以外的任何东西。用户通过「复制日志」按钮获取所有输出。
+
+## Debug 模式流程
+
+修改 `src/` 后需要用户验证前 → 先 `npm run build`，构建失败就修复重试。
+
+## 自检（每次生成/修改代码后执行）
+
+1. 全文搜索 `fetch(` → 有则删除
+2. 全文搜索 `XMLHttpRequest` / `WebSocket` → 有则删除
+3. 所有调试输出是否都走 `logger.*` 或 `sendLog` → 必须是
