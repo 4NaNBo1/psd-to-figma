@@ -2,6 +2,12 @@ import { parsePsdFile } from './parser/psd-parser';
 import type { SerializedPsd, PluginMessage } from './types/psd-types';
 import { logger } from './logger';
 
+declare const __VERSION__: string;
+
+const REPO_OWNER = '4NaNBo1';
+const REPO_NAME = 'psd-to-figma';
+const CURRENT_VERSION = __VERSION__;
+
 const dropZone = document.getElementById('dropZone')!;
 const fileInput = document.getElementById('fileInput') as HTMLInputElement;
 const progressArea = document.getElementById('progressArea')!;
@@ -9,6 +15,9 @@ const progressFill = document.getElementById('progressFill')!;
 const progressText = document.getElementById('progressText')!;
 const errorArea = document.getElementById('errorArea')!;
 const copyLogBtn = document.getElementById('copyLogBtn') as HTMLButtonElement;
+const footer = document.getElementById('footer')!;
+
+footer.textContent = `by ${REPO_OWNER} · v${CURRENT_VERSION}`;
 
 let isProcessing = false;
 
@@ -161,3 +170,43 @@ window.onmessage = (event) => {
       break;
   }
 };
+
+function compareVersions(a: string, b: string): number {
+  const pa = a.split('.').map(Number);
+  const pb = b.split('.').map(Number);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const na = pa[i] || 0;
+    const nb = pb[i] || 0;
+    if (na !== nb) return na - nb;
+  }
+  return 0;
+}
+
+async function checkForUpdate() {
+  try {
+    const res = await fetch(
+      `https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/releases/latest`
+    );
+    if (!res.ok) return;
+
+    const data = await res.json();
+    const tag: string = data.tag_name ?? '';
+    const latest = tag.replace(/^v/, '');
+
+    if (!latest || compareVersions(latest, CURRENT_VERSION) <= 0) return;
+
+    const link = document.createElement('a');
+    link.textContent = `v${latest} 可用`;
+    link.href = `https://github.com/${REPO_OWNER}/${REPO_NAME}/releases/tag/${tag}`;
+    link.addEventListener('click', (e) => {
+      e.preventDefault();
+      window.open(link.href, '_blank');
+    });
+    footer.appendChild(document.createTextNode(' · '));
+    footer.appendChild(link);
+  } catch {
+    // silently ignore network errors
+  }
+}
+
+checkForUpdate();

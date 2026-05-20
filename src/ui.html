@@ -22,13 +22,20 @@
       max-width: 360px;
     }
 
-    h2 {
-      font-size: 15px;
-      font-weight: 600;
+    .footer {
+      margin-top: 16px;
       text-align: center;
-      margin-bottom: 16px;
-      color: #fff;
+      font-size: 11px;
+      color: #666;
     }
+
+    .footer a {
+      color: #a78bfa;
+      text-decoration: none;
+      margin-left: 6px;
+    }
+
+    .footer a:hover { text-decoration: underline; }
 
     .drop-zone {
       border: 2px dashed #555;
@@ -153,8 +160,6 @@
 </head>
 <body>
   <div class="container">
-    <h2>PSD Importer</h2>
-
     <div class="drop-zone" id="dropZone">
       <div class="icon">&#128193;</div>
       <div class="main-text">拖入 PSD 文件或点击选择</div>
@@ -171,6 +176,8 @@
     </div>
 
     <div class="error-area" id="errorArea"></div>
+
+    <div class="footer" id="footer"></div>
   </div>
 
   <button class="copy-log-fab" id="copyLogBtn" title="复制日志">

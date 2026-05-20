@@ -2,6 +2,8 @@ const esbuild = require('esbuild');
 const fs = require('fs');
 const path = require('path');
 
+const pkg = JSON.parse(fs.readFileSync(path.resolve(__dirname, 'package.json'), 'utf8'));
+const version = (process.env.VERSION || pkg.version).replace(/^v/, '');
 const isWatch = process.argv.includes('--watch');
 
 const htmlPlugin = {
@@ -40,10 +42,9 @@ const copyManifestsPlugin = {
       figmaManifest.ui = './ui.html';
       fs.writeFileSync(path.resolve(distDir, 'manifest.json'), JSON.stringify(figmaManifest, null, 2));
 
-      fs.copyFileSync(
-        path.resolve(__dirname, 'manifest.mastergo.json'),
-        path.resolve(distDir, 'manifest.mastergo.json')
-      );
+      const mgManifest = JSON.parse(fs.readFileSync(path.resolve(__dirname, 'manifest.mastergo.json'), 'utf8'));
+      mgManifest.name = `PSD Importer by 4NaNBo1 - v${version}`;
+      fs.writeFileSync(path.resolve(distDir, 'manifest.mastergo.json'), JSON.stringify(mgManifest, null, 2));
     });
   },
 };
@@ -55,6 +56,7 @@ async function build() {
     target: 'es2017',
     define: {
       'process.env.NODE_ENV': '"production"',
+      '__VERSION__': JSON.stringify(version),
     },
   };
 

@@ -2,12 +2,13 @@ import type { PluginMessage, SerializedPsd } from './types/psd-types';
 import { buildIRTree } from './ir/builder';
 import { createRenderer } from './platform/index';
 
+declare const __VERSION__: string;
 declare const mg: any;
 const isMasterGo = typeof mg !== 'undefined';
 
 const api = isMasterGo ? mg : figma;
 
-api.showUI(__html__, { width: 400, height: 360 });
+api.showUI(__html__, { width: 400, height: 360, title: `PSD Importer by 4NaNBo1 - v${__VERSION__}` });
 
 type LogLevel = 'info' | 'warn' | 'error';
 
