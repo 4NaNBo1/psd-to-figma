@@ -9,6 +9,7 @@
   },
   "devDependencies": {
     "@figma/plugin-typings": "^1.100.0",
+    "@mastergo/plugin-typings": "^2.16.1",
     "ag-psd": "^30.1.0",
     "esbuild": "^0.24.0",
     "patch-package": "^8.0.1",

@@ -1014,7 +1014,6 @@ async function serializeLayer(
   if (type === 'text' && layer.text) {
     serialized.textData = convertTextData(layer.text);
 
-
     if (serialized.textData.docBboxCenterX != null) {
       serialized.textData.docBboxCenterX -= parentLeft;
     }
@@ -1022,7 +1021,7 @@ async function serializeLayer(
       serialized.textData.docBoundsY -= parentTop;
     }
 
-    const solidFills = layer.effects?.solidFill;
+    const solidFills = (layer.effects as any)?.solidFill;
     if (solidFills && serialized.textData) {
       for (const sf of solidFills) {
         if (sf.enabled && sf.color) {
@@ -1063,10 +1062,12 @@ async function serializeLayer(
       }
     }
 
-    logger.info(`Layer "${layer.name}": text, font="${layer.text.style?.font?.name ?? 'unknown'}"`);
+    const textHasStroke = getEnabledStrokes(layer).length > 0;
+    const textHasGradOverlay = !!getEnabledGradientOverlay(layer);
+    logger.info(`Layer "${layer.name}": text (stroke=${textHasStroke}, gradient=${textHasGradOverlay}), font="${layer.text.style?.font?.name ?? 'unknown'}"`);
   }
 
-  if (type !== 'text' && layer.imageData && layer.imageData.width > 0 && layer.imageData.height > 0) {
+  if (serialized.type !== 'text' && layer.imageData && layer.imageData.width > 0 && layer.imageData.height > 0) {
     onProgress({ percent: 0, message: `Encoding image: ${layer.name}` });
     try {
       const maskedData = applyLayerMask(layer.imageData, layer);
@@ -1100,7 +1101,7 @@ async function serializeLayer(
     } catch (e) {
       logger.warn(`Failed to encode imageData for "${layer.name}": ${e instanceof Error ? e.message : e}`);
     }
-  } else if (type !== 'text' && layer.canvas) {
+  } else if (serialized.type !== 'text' && layer.canvas) {
     onProgress({ percent: 0, message: `Encoding canvas: ${layer.name}` });
     try {
       const cvs = layer.canvas as HTMLCanvasElement;

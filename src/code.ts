@@ -1,44 +1,63 @@
 import type { PluginMessage, SerializedPsd } from './types/psd-types';
-import { buildFigmaTree } from './converter/node-factory';
+import { buildIRTree } from './ir/builder';
+import { createRenderer } from './platform/index';
 
-figma.showUI(__html__, { width: 400, height: 360, themeColors: true });
+declare const mg: any;
+const isMasterGo = typeof mg !== 'undefined';
+
+const api = isMasterGo ? mg : figma;
+
+api.showUI(__html__, { width: 400, height: 360 });
 
 type LogLevel = 'info' | 'warn' | 'error';
 
 function sendLog(level: LogLevel, message: string) {
-  figma.ui.postMessage({ type: 'log', level, message } as PluginMessage);
+  api.ui.postMessage({ type: 'log', level, message } as PluginMessage);
 }
 
-figma.ui.onmessage = async (msg: PluginMessage) => {
+api.ui.onmessage = async (rawMsg: any) => {
+  const msg: PluginMessage = isMasterGo && rawMsg?.pluginMessage ? rawMsg.pluginMessage : rawMsg;
+
   if (msg.type !== 'import-psd') return;
 
   const psd = msg.data;
   sendLog('info', `Received PSD: "${psd.name}" ${psd.width}x${psd.height}, ${psd.layers.length} layers, ${psd.images.length} images`);
 
   try {
-    figma.ui.postMessage({
+    api.ui.postMessage({
       type: 'progress-update',
-      percent: 92,
-      message: 'Creating Figma layers...',
+      percent: 90,
+      message: 'Building IR tree...',
     } as PluginMessage);
 
-    sendLog('info', 'Building Figma tree...');
+    sendLog('info', 'Building IR tree...');
+    const irTree = buildIRTree(psd);
+    sendLog('info', `IR tree built: type=${irTree.type}, children=${irTree.children?.length}`);
 
-    await buildFigmaTree(psd, (percent, message) => {
-      figma.ui.postMessage({
+    api.ui.postMessage({
+      type: 'progress-update',
+      percent: 92,
+      message: 'Creating layers...',
+    } as PluginMessage);
+
+    const renderer = createRenderer();
+    sendLog('info', `Renderer: ${renderer.constructor?.name}`);
+
+    await renderer.render(irTree, (percent, message) => {
+      api.ui.postMessage({
         type: 'progress-update',
         percent: 92 + Math.round(percent * 0.08),
         message,
       } as PluginMessage);
     }, sendLog);
 
-    sendLog('info', 'Figma tree built successfully');
-    figma.ui.postMessage({ type: 'done' } as PluginMessage);
-    figma.notify('PSD import complete!');
+    sendLog('info', 'Render complete');
+    api.ui.postMessage({ type: 'done' } as PluginMessage);
+    api.notify('PSD import complete!');
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Unknown error during import';
     sendLog('error', `Import failed: ${message}`);
-    figma.ui.postMessage({ type: 'error', message } as PluginMessage);
-    figma.notify('PSD import failed', { error: true });
+    api.ui.postMessage({ type: 'error', message } as PluginMessage);
+    api.notify('PSD import failed', { error: true });
   }
 };

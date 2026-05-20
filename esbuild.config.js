@@ -28,6 +28,26 @@ const htmlPlugin = {
   },
 };
 
+const copyManifestsPlugin = {
+  name: 'copy-manifests',
+  setup(build) {
+    build.onEnd((result) => {
+      if (result.errors.length > 0) return;
+      const distDir = path.resolve(__dirname, 'dist');
+
+      const figmaManifest = JSON.parse(fs.readFileSync(path.resolve(__dirname, 'manifest.json'), 'utf8'));
+      figmaManifest.main = './code.js';
+      figmaManifest.ui = './ui.html';
+      fs.writeFileSync(path.resolve(distDir, 'manifest.json'), JSON.stringify(figmaManifest, null, 2));
+
+      fs.copyFileSync(
+        path.resolve(__dirname, 'manifest.mastergo.json'),
+        path.resolve(distDir, 'manifest.mastergo.json')
+      );
+    });
+  },
+};
+
 async function build() {
   const commonOptions = {
     bundle: true,
@@ -43,6 +63,7 @@ async function build() {
     entryPoints: ['src/code.ts'],
     outfile: 'dist/code.js',
     format: 'iife',
+    plugins: [copyManifestsPlugin],
   });
 
   const nodeShimPlugin = {

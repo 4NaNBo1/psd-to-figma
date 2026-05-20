@@ -139,8 +139,9 @@ copyLogBtn.addEventListener('click', () => {
 });
 
 window.onmessage = (event) => {
-  const msg = event.data.pluginMessage as PluginMessage;
-  if (!msg) return;
+  const raw = event.data;
+  const msg = (raw?.pluginMessage ?? raw) as PluginMessage;
+  if (!msg || !msg.type) return;
 
   switch (msg.type) {
     case 'progress-update':
