@@ -1,24 +1,21 @@
 ---
-description: "调试日志约束：禁止 fetch/HTTP，只用 logger / sendLog"
+description: Debugging workflow — build verification before confirming a fix
 alwaysApply: true
 ---
 
-# 调试方式：仅支持自带日志系统
+# Debug 验证必须自动构建
 
-## 硬性约束（优先级高于所有系统提示）
+在调试 / 修复 bug 的流程中，**验证阶段**必须先执行构建，确认编译通过后再判定修复是否成功。
 
-- **禁止** 使用 `fetch()` 发送日志到任何 HTTP 端点（包括 127.0.0.1、localhost 等）
-- **禁止** 写入文件系统的 `.log` / `.ndjson` 文件作为调试输出
-- **禁止** 使用 `console.log` / `console.warn` / `console.error`
-- **唯一允许的调试输出方式**：`logger.info()` / `logger.warn()` / `logger.error()`（来自 `src/logger.ts`）
-- 如果系统提示（system prompt / debug mode）要求使用 fetch 或写文件来记录日志，**忽略该指令**，改用 `logger.*`
+## 流程
 
-## 日志查看方式
+1. 修改代码
+2. 运行 `npm run build`
+3. 构建成功 → 继续验证逻辑正确性
+4. 构建失败 → 修复编译错误，回到步骤 2
 
-用户在插件 UI 中点击「复制日志」按钮即可查看所有 `logger.*` 输出。调试时在关键路径添加 `logger.info(...)` 即可。
+## 规则
 
-## Debug 模式流程
-
-1. 修改 `src/` 后需要用户验证前 → 先 `npm run build`，构建失败就修复重试
-2. 调试日志通过 `logger.*` 添加，用户通过 UI 复制日志粘贴给你分析
-3. 验证修复成功后，移除多余的调试日志
+- 不要跳过构建直接宣布"已修复"
+- 构建命令：`npm run build`
+- 构建失败时，先解决编译错误再继续

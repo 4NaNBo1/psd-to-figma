@@ -1,5 +1,6 @@
 import { parsePsdFile } from './parser/psd-parser';
-import type { SerializedPsd, PluginMessage } from './types/psd-types';
+import type { SerializedPsd, PluginMessage, ExportNodeData } from './types/psd-types';
+import { buildAndDownloadPsd } from './exporter/psd-builder';
 import { logger } from './logger';
 
 declare const __VERSION__: string;
@@ -8,6 +9,7 @@ const REPO_OWNER = '4NaNBo1';
 const REPO_NAME = 'psd-to-figma';
 const CURRENT_VERSION = __VERSION__;
 
+// Import tab elements
 const dropZone = document.getElementById('dropZone')!;
 const fileInput = document.getElementById('fileInput') as HTMLInputElement;
 const progressArea = document.getElementById('progressArea')!;
@@ -17,9 +19,37 @@ const errorArea = document.getElementById('errorArea')!;
 const copyLogBtn = document.getElementById('copyLogBtn') as HTMLButtonElement;
 const footer = document.getElementById('footer')!;
 
+// Tab elements
+const tabBtns = document.querySelectorAll<HTMLButtonElement>('.tab-btn');
+const tabImport = document.getElementById('tabImport')!;
+const tabExport = document.getElementById('tabExport')!;
+
+// Export tab elements
+const selectionInfo = document.getElementById('selectionInfo')!;
+const filenameRow = document.getElementById('filenameRow')!;
+const exportFileName = document.getElementById('exportFileName') as HTMLInputElement;
+const exportBtn = document.getElementById('exportBtn') as HTMLButtonElement;
+const exportProgressArea = document.getElementById('exportProgressArea')!;
+const exportProgressFill = document.getElementById('exportProgressFill')!;
+const exportProgressText = document.getElementById('exportProgressText')!;
+const exportErrorArea = document.getElementById('exportErrorArea')!;
+
 footer.textContent = `by ${REPO_OWNER} · v${CURRENT_VERSION}`;
 
 let isProcessing = false;
+let isExporting = false;
+let selectionCount = 0;
+
+// --- Tab switching ---
+tabBtns.forEach(btn => {
+  btn.addEventListener('click', () => {
+    const tab = btn.dataset.tab;
+    tabBtns.forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    tabImport.classList.toggle('active', tab === 'import');
+    tabExport.classList.toggle('active', tab === 'export');
+  });
+});
 
 function showProgress(percent: number, message: string) {
   progressArea.classList.add('visible');
@@ -147,6 +177,62 @@ copyLogBtn.addEventListener('click', () => {
   }
 });
 
+// --- Export tab logic ---
+function showExportProgress(percent: number, message: string) {
+  exportProgressArea.classList.add('visible');
+  exportProgressFill.style.width = `${percent}%`;
+  exportProgressText.textContent = message;
+}
+
+function showExportError(message: string) {
+  exportErrorArea.classList.add('visible');
+  exportErrorArea.textContent = message;
+}
+
+function resetExportUI() {
+  exportProgressArea.classList.remove('visible');
+  exportErrorArea.classList.remove('visible');
+  exportProgressFill.style.width = '0%';
+  exportProgressText.textContent = '';
+  exportErrorArea.textContent = '';
+}
+
+function updateSelectionDisplay(count: number, names: string[]) {
+  selectionCount = count;
+  if (count === 0) {
+    selectionInfo.innerHTML =
+      '<div class="sel-icon">&#127912;</div>' +
+      '<div class="sel-text">请在画布中选中要导出的节点</div>';
+    filenameRow.style.display = 'none';
+    exportBtn.disabled = true;
+  } else {
+    const nameList = names.slice(0, 3).join('、') + (names.length > 3 ? ` 等` : '');
+    selectionInfo.innerHTML =
+      '<div class="sel-icon">&#9989;</div>' +
+      `<div class="sel-count">已选中 ${count} 个节点</div>` +
+      `<div class="sel-names">${nameList}</div>`;
+    filenameRow.style.display = 'flex';
+    if (!exportFileName.value) {
+      exportFileName.value = names[0] ?? 'export';
+    }
+    exportBtn.disabled = false;
+  }
+}
+
+exportBtn.addEventListener('click', () => {
+  if (isExporting || selectionCount === 0) return;
+  isExporting = true;
+  exportBtn.disabled = true;
+  resetExportUI();
+
+  const fileName = exportFileName.value.trim() || 'export';
+  showExportProgress(0, '开始导出...');
+  logger.info(`Export started: ${fileName}`);
+
+  const message: PluginMessage = { type: 'export-psd', fileName };
+  parent.postMessage({ pluginMessage: message }, '*');
+});
+
 window.onmessage = (event) => {
   const raw = event.data;
   const msg = (raw?.pluginMessage ?? raw) as PluginMessage;
@@ -167,6 +253,41 @@ window.onmessage = (event) => {
       break;
     case 'log':
       logger[msg.level](msg.message);
+      break;
+
+    case 'selection-changed':
+      updateSelectionDisplay(msg.data.count, msg.data.names);
+      break;
+
+    case 'export-progress':
+      showExportProgress(msg.percent, msg.message);
+      break;
+
+    case 'export-psd-data': {
+      const nodes = msg.nodes as ExportNodeData[];
+      const fileName = exportFileName.value.trim() || 'export';
+      showExportProgress(65, '构建 PSD 文件...');
+
+      buildAndDownloadPsd(nodes, msg.width, msg.height, fileName, (percent, message) => {
+        showExportProgress(percent, message);
+      }).then(() => {
+        logger.info('Export complete');
+        isExporting = false;
+        exportBtn.disabled = selectionCount === 0;
+      }).catch((err) => {
+        const errMsg = err instanceof Error ? err.message : 'PSD 生成失败';
+        logger.error(`Export failed: ${errMsg}`);
+        isExporting = false;
+        exportBtn.disabled = selectionCount === 0;
+      });
+      break;
+    }
+
+    case 'export-psd-error':
+      logger.error(`Export error: ${msg.message}`);
+      showExportError(msg.message);
+      isExporting = false;
+      exportBtn.disabled = selectionCount === 0;
       break;
   }
 };

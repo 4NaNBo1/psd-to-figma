@@ -11,16 +11,43 @@
       color: #e0e0e0;
       display: flex;
       flex-direction: column;
+      min-height: 100vh;
+    }
+
+    .tab-bar {
+      display: flex;
+      border-bottom: 1px solid #333;
+      background: #252525;
+      flex-shrink: 0;
+    }
+
+    .tab-btn {
+      flex: 1;
+      padding: 10px 0;
+      border: none;
+      background: transparent;
+      color: #888;
+      font-size: 13px;
+      font-weight: 500;
+      cursor: pointer;
+      border-bottom: 2px solid transparent;
+      transition: all 0.2s;
+    }
+
+    .tab-btn:hover { color: #ccc; background: #2a2a2a; }
+    .tab-btn.active { color: #a78bfa; border-bottom-color: #7b61ff; }
+
+    .tab-content {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
       align-items: center;
       justify-content: center;
-      min-height: 100vh;
       padding: 16px;
     }
 
-    .container {
-      width: 100%;
-      max-width: 360px;
-    }
+    .tab-panel { display: none; width: 100%; max-width: 360px; }
+    .tab-panel.active { display: block; }
 
     .footer {
       margin-top: 16px;
@@ -156,28 +183,157 @@
       stroke-linecap: round;
       stroke-linejoin: round;
     }
+
+    /* Export tab styles */
+    .export-section {
+      background: #2a2a2a;
+      border-radius: 12px;
+      padding: 20px;
+    }
+
+    .selection-info {
+      text-align: center;
+      padding: 16px 0;
+    }
+
+    .selection-info .sel-icon {
+      font-size: 32px;
+      color: #7b61ff;
+      margin-bottom: 8px;
+    }
+
+    .selection-info .sel-text {
+      font-size: 13px;
+      color: #aaa;
+    }
+
+    .selection-info .sel-names {
+      font-size: 12px;
+      color: #888;
+      margin-top: 6px;
+      max-height: 48px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .selection-info .sel-count {
+      font-size: 14px;
+      font-weight: 500;
+      color: #ddd;
+    }
+
+    .filename-row {
+      margin-top: 16px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .filename-row label {
+      font-size: 12px;
+      color: #aaa;
+      white-space: nowrap;
+    }
+
+    .filename-row input {
+      flex: 1;
+      padding: 6px 10px;
+      border: 1px solid #444;
+      border-radius: 6px;
+      background: #1e1e1e;
+      color: #e0e0e0;
+      font-size: 13px;
+      outline: none;
+      transition: border-color 0.2s;
+    }
+
+    .filename-row input:focus {
+      border-color: #7b61ff;
+    }
+
+    .filename-row .ext {
+      font-size: 12px;
+      color: #888;
+    }
+
+    .export-btn {
+      margin-top: 16px;
+      width: 100%;
+      padding: 10px 0;
+      border: none;
+      border-radius: 8px;
+      background: linear-gradient(135deg, #7b61ff, #a78bfa);
+      color: #fff;
+      font-size: 14px;
+      font-weight: 500;
+      cursor: pointer;
+      transition: opacity 0.2s, transform 0.1s;
+    }
+
+    .export-btn:hover { opacity: 0.9; }
+    .export-btn:active { transform: scale(0.98); }
+    .export-btn:disabled {
+      opacity: 0.4;
+      cursor: not-allowed;
+      transform: none;
+    }
   </style>
 </head>
 <body>
-  <div class="container">
-    <div class="drop-zone" id="dropZone">
-      <div class="icon">&#128193;</div>
-      <div class="main-text">拖入 PSD 文件或点击选择</div>
-      <p>支持 .psd 格式 (RGB 模式)</p>
-    </div>
+  <div class="tab-bar">
+    <button class="tab-btn active" data-tab="import">导入 PSD</button>
+    <button class="tab-btn" data-tab="export">导出 PSD</button>
+  </div>
 
-    <input type="file" id="fileInput" accept=".psd">
-
-    <div class="progress-area" id="progressArea">
-      <div class="progress-bar-bg">
-        <div class="progress-bar-fill" id="progressFill"></div>
+  <div class="tab-content">
+    <!-- Import Tab -->
+    <div class="tab-panel active" id="tabImport">
+      <div class="drop-zone" id="dropZone">
+        <div class="icon">&#128193;</div>
+        <div class="main-text">拖入 PSD 文件或点击选择</div>
+        <p>支持 .psd 格式 (RGB 模式)</p>
       </div>
-      <div class="progress-text" id="progressText"></div>
+
+      <input type="file" id="fileInput" accept=".psd">
+
+      <div class="progress-area" id="progressArea">
+        <div class="progress-bar-bg">
+          <div class="progress-bar-fill" id="progressFill"></div>
+        </div>
+        <div class="progress-text" id="progressText"></div>
+      </div>
+
+      <div class="error-area" id="errorArea"></div>
+
+      <div class="footer" id="footer"></div>
     </div>
 
-    <div class="error-area" id="errorArea"></div>
+    <!-- Export Tab -->
+    <div class="tab-panel" id="tabExport">
+      <div class="export-section">
+        <div class="selection-info" id="selectionInfo">
+          <div class="sel-icon">&#127912;</div>
+          <div class="sel-text">请在画布中选中要导出的节点</div>
+        </div>
 
-    <div class="footer" id="footer"></div>
+        <div class="filename-row" id="filenameRow" style="display:none;">
+          <label>文件名</label>
+          <input type="text" id="exportFileName" placeholder="输入文件名">
+          <span class="ext">.psd</span>
+        </div>
+
+        <button class="export-btn" id="exportBtn" disabled>导出 PSD</button>
+      </div>
+
+      <div class="progress-area" id="exportProgressArea">
+        <div class="progress-bar-bg">
+          <div class="progress-bar-fill" id="exportProgressFill"></div>
+        </div>
+        <div class="progress-text" id="exportProgressText"></div>
+      </div>
+
+      <div class="error-area" id="exportErrorArea"></div>
+    </div>
   </div>
 
   <button class="copy-log-fab" id="copyLogBtn" title="复制日志">
