@@ -34,7 +34,17 @@ const exportProgressFill = document.getElementById('exportProgressFill')!;
 const exportProgressText = document.getElementById('exportProgressText')!;
 const exportErrorArea = document.getElementById('exportErrorArea')!;
 
-footer.textContent = `by ${REPO_OWNER} · v${CURRENT_VERSION}`;
+footer.innerHTML =
+  `by <a id="authorLink">${REPO_OWNER}</a> · <a id="versionLink">v${CURRENT_VERSION}</a>`;
+
+document.getElementById('authorLink')!.addEventListener('click', (e) => {
+  e.preventDefault();
+  window.open(`https://github.com/${REPO_OWNER}`, '_blank');
+});
+document.getElementById('versionLink')!.addEventListener('click', (e) => {
+  e.preventDefault();
+  window.open(`https://github.com/${REPO_OWNER}/${REPO_NAME}`, '_blank');
+});
 
 let isProcessing = false;
 let isExporting = false;
@@ -317,7 +327,8 @@ async function checkForUpdate() {
     if (!latest || compareVersions(latest, CURRENT_VERSION) <= 0) return;
 
     const link = document.createElement('a');
-    link.textContent = `v${latest} 可用`;
+    link.textContent = `v${latest} ↑`;
+    link.style.color = '#4ade80';
     link.href = `https://github.com/${REPO_OWNER}/${REPO_NAME}/releases/tag/${tag}`;
     link.addEventListener('click', (e) => {
       e.preventDefault();

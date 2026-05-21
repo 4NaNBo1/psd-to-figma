@@ -9,7 +9,7 @@ const isMasterGo = typeof mg !== 'undefined';
 
 const api = isMasterGo ? mg : figma;
 
-api.showUI(__html__, { width: 400, height: 460, title: `PSD Tool by 4NaNBo1 - v${__VERSION__}` });
+api.showUI(__html__, { width: 400, height: 460, title: `PSD Import & Export` });
 
 type LogLevel = 'info' | 'warn' | 'error';
 

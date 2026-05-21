@@ -1,5 +1,5 @@
 {
-  "name": "PSD Importer",
+  "name": "PSD Import & Export",
   "id": "psd-to-figma-importer",
   "api": "1.0.0",
   "main": "dist/code.js",

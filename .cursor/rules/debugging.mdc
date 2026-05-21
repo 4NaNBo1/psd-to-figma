@@ -1,21 +1,22 @@
 ---
-description: Debugging workflow — build verification before confirming a fix
+description: Auto-build after every code change
 alwaysApply: true
 ---
 
-# Debug 验证必须自动构建
+# 代码修改后自动构建
 
-在调试 / 修复 bug 的流程中，**验证阶段**必须先执行构建，确认编译通过后再判定修复是否成功。
+Agent 每次修改代码后，**必须**立即执行构建，确认编译通过后再继续后续操作。
 
 ## 流程
 
 1. 修改代码
 2. 运行 `npm run build`
-3. 构建成功 → 继续验证逻辑正确性
+3. 构建成功 → 继续下一步操作
 4. 构建失败 → 修复编译错误，回到步骤 2
 
 ## 规则
 
-- 不要跳过构建直接宣布"已修复"
+- 任何代码变更（新功能、重构、修复、配置调整等）后都必须构建
+- 不要跳过构建直接宣布"已完成"
 - 构建命令：`npm run build`
 - 构建失败时，先解决编译错误再继续
