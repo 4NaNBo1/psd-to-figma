@@ -280,6 +280,10 @@ function buildTextProps(layer: SerializedLayer): IRTextProps | undefined {
     shapeType: td.shapeType,
     docBoundsY: td.docBoundsY,
     docBboxCenterX: td.docBboxCenterX,
+    txOffsetX: td.txOffsetX,
+    bounds: td.bounds,
+    boundingBox: td.boundingBox,
+    textIndex: td.textIndex,
   };
 }
 
@@ -486,6 +490,7 @@ export function buildIRTree(psd: SerializedPsd): IRNode {
     effects: [],
     strokes: [],
     children: [rootFrame],
+    psdEngineData: psd.engineData,
   };
 
   return section;

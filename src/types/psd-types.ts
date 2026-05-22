@@ -52,6 +52,13 @@ export interface SerializedGradientOverlay {
   opacity: number;
 }
 
+export interface PsdTextBounds {
+  top: number;
+  left: number;
+  right: number;
+  bottom: number;
+}
+
 export interface SerializedTextData {
   text: string;
   horizontalAlignment: string;
@@ -60,6 +67,13 @@ export interface SerializedTextData {
   rotation?: number;
   docBoundsY?: number;
   docBboxCenterX?: number;
+  txOffsetX?: number;
+  /** Original PSD bounds (font-metric-derived character bbox relative to transform) */
+  bounds?: PsdTextBounds;
+  /** Original PSD boundingBox (actual character pixel bbox relative to transform) */
+  boundingBox?: PsdTextBounds;
+  /** Original PSD layer.text.index (TextFrameSet index in top-level engineData). */
+  textIndex?: number;
   gradientOverlay?: SerializedGradientOverlay;
   shapeType?: 'point' | 'box';
   boxBounds?: { width: number; height: number };
@@ -101,6 +115,8 @@ export interface SerializedPsd {
   height: number;
   layers: SerializedLayer[];
   images: string[];
+  /** Original PSD top-level engineData (Txt2 block, base64). Used to preserve text engine data on roundtrip. */
+  engineData?: string;
 }
 
 // --- Export types (design tool -> PSD) ---
@@ -139,6 +155,16 @@ export interface ExportTextInfo {
   characters: string;
   alignment: 'LEFT' | 'CENTER' | 'RIGHT' | 'JUSTIFIED';
   styles: ExportTextStyleRange[];
+  textAutoResize?: 'NONE' | 'HEIGHT' | 'WIDTH_AND_HEIGHT';
+  /** Asymmetric font offset from visual character center to PSD transform.tx.
+   * Positive value means PSD tx is right of visual center. */
+  txOffsetX?: number;
+  /** Original PSD bounds (font-metric-derived character bbox relative to transform) */
+  bounds?: PsdTextBounds;
+  /** Original PSD boundingBox (actual character pixel bbox relative to transform) */
+  boundingBox?: PsdTextBounds;
+  /** Original PSD layer.text.index for TextFrameSet lookup. */
+  textIndex?: number;
 }
 
 export interface ExportEffectInfo {

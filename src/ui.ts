@@ -280,7 +280,7 @@ window.onmessage = (event) => {
 
       buildAndDownloadPsd(nodes, msg.width, msg.height, fileName, (percent, message) => {
         showExportProgress(percent, message);
-      }).then(() => {
+      }, msg.engineData).then(() => {
         logger.info('Export complete');
         isExporting = false;
         exportBtn.disabled = selectionCount === 0;

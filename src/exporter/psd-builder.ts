@@ -55,7 +55,7 @@ function base64ToUint8Array(base64: string): Uint8Array {
 
 function pngToCanvas(pngBytes: Uint8Array): Promise<HTMLCanvasElement> {
   return new Promise((resolve, reject) => {
-    const blob = new Blob([pngBytes], { type: 'image/png' });
+    const blob = new Blob([pngBytes as BlobPart], { type: 'image/png' });
     const url = URL.createObjectURL(blob);
     const img = new Image();
     img.onload = () => {
@@ -73,6 +73,48 @@ function pngToCanvas(pngBytes: Uint8Array): Promise<HTMLCanvasElement> {
     };
     img.src = url;
   });
+}
+
+/**
+ * Trims transparent pixels from canvas edges and returns the cropped canvas.
+ * Used for text layer bitmaps so ag-psd's internal trim doesn't shift our layer.top/left.
+ */
+function trimCanvasTransparent(srcCanvas: HTMLCanvasElement): { canvas: HTMLCanvasElement } {
+  const ctx = srcCanvas.getContext('2d')!;
+  const w = srcCanvas.width;
+  const h = srcCanvas.height;
+  const data = ctx.getImageData(0, 0, w, h).data;
+  let top = 0, left = 0, right = w, bottom = h;
+  outer1: for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      if (data[(y * w + x) * 4 + 3] !== 0) { top = y; break outer1; }
+    }
+  }
+  outer2: for (let y = h - 1; y >= top; y--) {
+    for (let x = 0; x < w; x++) {
+      if (data[(y * w + x) * 4 + 3] !== 0) { bottom = y + 1; break outer2; }
+    }
+  }
+  outer3: for (let x = 0; x < w; x++) {
+    for (let y = top; y < bottom; y++) {
+      if (data[(y * w + x) * 4 + 3] !== 0) { left = x; break outer3; }
+    }
+  }
+  outer4: for (let x = w - 1; x >= left; x--) {
+    for (let y = top; y < bottom; y++) {
+      if (data[(y * w + x) * 4 + 3] !== 0) { right = x + 1; break outer4; }
+    }
+  }
+  const newW = right - left;
+  const newH = bottom - top;
+  if (newW <= 0 || newH <= 0 || (newW === w && newH === h)) {
+    return { canvas: srcCanvas };
+  }
+  const out = document.createElement('canvas');
+  out.width = newW;
+  out.height = newH;
+  out.getContext('2d')!.drawImage(srcCanvas, -left, -top);
+  return { canvas: out };
 }
 
 function buildEffects(node: ExportNodeData): {
@@ -178,12 +220,43 @@ function buildEffects(node: ExportNodeData): {
 }
 
 async function buildLayer(node: ExportNodeData): Promise<Layer> {
+  let layerTop = Math.round(node.y);
+  let layerLeft = Math.round(node.x);
+  let layerBottom = Math.round(node.y + node.height);
+  let layerRight = Math.round(node.x + node.width);
+
+  // For text layers, set layer bbox to match PSD A's character pixel range
+  // (= transform + boundingBox), so PS sees correct boundaries.
+  const tiForBbox = node.textInfo;
+  const bboxForLayer = tiForBbox?.boundingBox;
+  if (tiForBbox && tiForBbox.characters && bboxForLayer) {
+    const firstStyle = tiForBbox.styles[0];
+    const fontSize = firstStyle?.fontSize ?? 16;
+    const isPointText = tiForBbox.textAutoResize === 'WIDTH_AND_HEIGHT';
+
+    if (isPointText) {
+      const centerX = node.x + node.width / 2;
+      const tx = centerX + (tiForBbox.txOffsetX ?? 0);
+      const ty = node.y + fontSize * 0.857;
+      layerTop = Math.round(ty + bboxForLayer.top);
+      layerBottom = Math.round(ty + bboxForLayer.bottom);
+      layerLeft = Math.round(tx + bboxForLayer.left);
+      layerRight = Math.round(tx + bboxForLayer.right);
+    } else {
+      const ty = node.y - (tiForBbox.bounds?.top ?? -fontSize * 0.097);
+      layerTop = Math.round(ty + bboxForLayer.top);
+      layerBottom = Math.round(ty + bboxForLayer.bottom);
+      layerLeft = Math.round(node.x + bboxForLayer.left);
+      layerRight = Math.round(node.x + bboxForLayer.right);
+    }
+  }
+
   const layer: Layer = {
     name: node.name,
-    top: Math.round(node.y),
-    left: Math.round(node.x),
-    bottom: Math.round(node.y + node.height),
-    right: Math.round(node.x + node.width),
+    top: layerTop,
+    left: layerLeft,
+    bottom: layerBottom,
+    right: layerRight,
     blendMode: toBlendMode(node.blendMode),
     opacity: node.opacity,
     hidden: !node.visible,
@@ -195,10 +268,17 @@ async function buildLayer(node: ExportNodeData): Promise<Layer> {
     layer.effects = effects;
   }
 
+  const isTextLayer = !!(node.textInfo && node.textInfo.characters);
   if (node.imageBase64) {
     try {
       const pngBytes = base64ToUint8Array(node.imageBase64);
-      layer.canvas = await pngToCanvas(pngBytes);
+      const rawCanvas = await pngToCanvas(pngBytes);
+      if (isTextLayer) {
+        // Pre-trim transparent edges so ag-psd's internal trim doesn't shift our layer.top/left.
+        layer.canvas = trimCanvasTransparent(rawCanvas).canvas;
+      } else {
+        layer.canvas = rawCanvas;
+      }
     } catch { /* leave without image data */ }
   }
 
@@ -213,46 +293,167 @@ async function buildLayer(node: ExportNodeData): Promise<Layer> {
       'JUSTIFIED': 'justify-all',
     };
 
-    const baselineFix = (firstStyle?.fontSize ?? 16) * 0.143;
-    layer.text = {
-      text: ti.characters,
-      transform: [1, 0, 0, 1, node.x, node.y + baselineFix],
-      orientation: 'horizontal',
-      antiAlias: 'smooth',
-      left: node.x,
-      top: node.y + baselineFix,
-      right: node.x + node.width,
-      bottom: node.y + node.height + baselineFix,
-      gridding: 'none',
-      shapeType: 'box',
-      boxBounds: [0, 0, node.width, node.height],
-      style: firstStyle ? {
-        font: { name: toPostScriptName(firstStyle.fontFamily, firstStyle.fontStyle) },
-        fontSize: firstStyle.fontSize,
-        fillColor: toRGBA(firstStyle.color),
-        tracking: Math.round((firstStyle.letterSpacing / firstStyle.fontSize) * 1000),
-        leading: firstStyle.lineHeight ?? undefined,
-        autoKerning: true,
-      } : undefined,
-      paragraphStyle: {
-        justification: (justificationMap[ti.alignment] ?? 'left') as any,
-      },
+    const isPointText = ti.textAutoResize === 'WIDTH_AND_HEIGHT';
+    const fontSize = firstStyle?.fontSize ?? 16;
+
+    const centerX = node.x + node.width / 2;
+    const centerY = node.y + node.height / 2;
+
+    const hasExplicitLeading = firstStyle?.lineHeight != null && firstStyle.lineHeight > 0;
+    const baseStyle = firstStyle ? {
+      font: { name: toPostScriptName(firstStyle.fontFamily, firstStyle.fontStyle) },
+      fontSize: firstStyle.fontSize,
+      fauxBold: firstStyle.fontStyle === 'Bold' || firstStyle.fontStyle === 'Bold Italic',
+      fauxItalic: firstStyle.fontStyle === 'Italic' || firstStyle.fontStyle === 'Bold Italic',
+      autoLeading: !hasExplicitLeading,
+      leading: hasExplicitLeading ? firstStyle.lineHeight! : 0,
+      horizontalScale: 1,
+      verticalScale: 1,
+      tracking: firstStyle.fontSize > 0 ? Math.round((firstStyle.letterSpacing / firstStyle.fontSize) * 1000) : 0,
+      autoKerning: true,
+      kerning: 0,
+      baselineShift: 0,
+      fontCaps: 0,
+      fontBaseline: 0,
+      underline: false,
+      strikethrough: false,
+      ligatures: true,
+      dLigatures: false,
+      language: 0,
+      fillColor: toRGBA(firstStyle.color),
+      yUnderline: 1,
+      hindiNumbers: false,
+      kashida: 1,
+      diacriticPos: 2,
+    } : undefined;
+
+    const fullParagraphStyle = {
+      justification: (justificationMap[ti.alignment] ?? 'left') as any,
+      firstLineIndent: 0,
+      startIndent: 0,
+      endIndent: 0,
+      spaceBefore: 0,
+      spaceAfter: 0,
+      autoHyphenate: false,
+      hyphenatedWordSize: 6,
+      preHyphen: 2,
+      postHyphen: 2,
+      consecutiveHyphens: 8,
+      zone: 36,
+      wordSpacing: [0.8, 1, 1.33] as [number, number, number],
+      letterSpacing: [0, 0, 0] as [number, number, number],
+      glyphSpacing: [1, 1, 1] as [number, number, number],
+      autoLeading: 1.2,
+      leadingType: 0,
+      hanging: false,
+      burasagari: false,
+      kinsokuOrder: 0,
+      everyLineComposer: false,
     };
 
-    if (ti.styles.length > 1) {
-      layer.text.styleRuns = ti.styles.map(s => ({
-        length: s.end - s.start,
-        style: {
-          font: { name: toPostScriptName(s.fontFamily, s.fontStyle) },
-          fontSize: s.fontSize,
-          fillColor: toRGBA(s.color),
-          tracking: s.fontSize > 0 ? Math.round((s.letterSpacing / s.fontSize) * 1000) : 0,
-          leading: s.lineHeight ?? undefined,
-          autoKerning: true,
-          fauxBold: s.fontStyle === 'Bold' || s.fontStyle === 'Bold Italic',
-          fauxItalic: s.fontStyle === 'Italic' || s.fontStyle === 'Bold Italic',
+    if (isPointText) {
+      const ascent = fontSize * 0.857;
+      const ty = node.y + ascent;
+      const halfW = node.width / 2;
+      const txAdjusted = centerX + (ti.txOffsetX ?? 0);
+
+      const boundsTop = ti.bounds?.top ?? -fontSize * 0.857;
+      const boundsBottom = ti.bounds?.bottom ?? fontSize * 0.514;
+      const boundsLeft = ti.bounds?.left ?? -halfW;
+      const boundsRight = ti.bounds?.right ?? halfW;
+      const bboxTop = ti.boundingBox?.top ?? -fontSize * 0.776;
+      const bboxBottom = ti.boundingBox?.bottom ?? fontSize * 0.240;
+      const bboxLeft = ti.boundingBox?.left ?? -halfW;
+      const bboxRight = ti.boundingBox?.right ?? halfW;
+
+      layer.text = {
+        text: ti.characters,
+        transform: [1, 0, 0, 1, txAdjusted, ty],
+        orientation: 'horizontal',
+        antiAlias: 'sharp',
+        gridding: 'none',
+        shapeType: 'point',
+        pointBase: [0, 0],
+        left: 0,
+        top: 0,
+        right: 0,
+        bottom: 0,
+        bounds: {
+          top: { units: 'Points' as any, value: boundsTop },
+          left: { units: 'Points' as any, value: boundsLeft },
+          right: { units: 'Points' as any, value: boundsRight },
+          bottom: { units: 'Points' as any, value: boundsBottom },
         },
-      }));
+        boundingBox: {
+          top: { units: 'Points' as any, value: bboxTop },
+          left: { units: 'Points' as any, value: bboxLeft },
+          right: { units: 'Points' as any, value: bboxRight },
+          bottom: { units: 'Points' as any, value: bboxBottom },
+        },
+        style: baseStyle,
+        paragraphStyle: fullParagraphStyle,
+      };
+    } else {
+      const boxBoundsTop = ti.bounds?.top ?? -fontSize * 0.097;
+      const ty = node.y - boxBoundsTop;
+      const boundsBottom = ti.bounds?.bottom ?? node.height;
+      const boundsLeft = ti.bounds?.left ?? 0;
+      const boundsRight = ti.bounds?.right ?? node.width;
+      const bboxTop = ti.boundingBox?.top ?? -fontSize * 0.016;
+      const bboxBottom = ti.boundingBox?.bottom ?? fontSize * 1.97;
+      const bboxLeft = ti.boundingBox?.left ?? 0;
+      const bboxRight = ti.boundingBox?.right ?? node.width;
+      layer.text = {
+        text: ti.characters,
+        transform: [1, 0, 0, 1, node.x, ty],
+        orientation: 'horizontal',
+        antiAlias: 'sharp',
+        left: node.x,
+        top: ty,
+        right: node.x + node.width,
+        bottom: ty + node.height,
+        gridding: 'none',
+        shapeType: 'box',
+        boxBounds: [0, 0, node.width, node.height],
+        bounds: {
+          top: { units: 'Points' as any, value: boxBoundsTop },
+          left: { units: 'Points' as any, value: boundsLeft },
+          right: { units: 'Points' as any, value: boundsRight },
+          bottom: { units: 'Points' as any, value: boundsBottom },
+        },
+        boundingBox: {
+          top: { units: 'Points' as any, value: bboxTop },
+          left: { units: 'Points' as any, value: bboxLeft },
+          right: { units: 'Points' as any, value: bboxRight },
+          bottom: { units: 'Points' as any, value: bboxBottom },
+        },
+        style: baseStyle,
+        paragraphStyle: fullParagraphStyle,
+      };
+    }
+
+    if (ti.textIndex != null) {
+      layer.text.index = ti.textIndex;
+    }
+
+    if (ti.styles.length > 1) {
+      layer.text.styleRuns = ti.styles.map(s => {
+        const sHasLeading = s.lineHeight != null && s.lineHeight > 0;
+        return {
+          length: s.end - s.start,
+          style: {
+            font: { name: toPostScriptName(s.fontFamily, s.fontStyle) },
+            fontSize: s.fontSize,
+            fillColor: toRGBA(s.color),
+            tracking: s.fontSize > 0 ? Math.round((s.letterSpacing / s.fontSize) * 1000) : 0,
+            leading: sHasLeading ? s.lineHeight! : 0,
+            autoLeading: !sHasLeading,
+            autoKerning: true,
+            fauxBold: s.fontStyle === 'Bold' || s.fontStyle === 'Bold Italic',
+            fauxItalic: s.fontStyle === 'Italic' || s.fontStyle === 'Bold Italic',
+          },
+        };
+      });
     }
 
   }
@@ -306,6 +507,7 @@ export async function buildAndDownloadPsd(
   height: number,
   fileName: string,
   onProgress: (percent: number, message: string) => void,
+  engineData?: string,
 ): Promise<void> {
   onProgress(65, '构建 PSD 图层结构...');
 
@@ -326,10 +528,15 @@ export async function buildAndDownloadPsd(
     children,
   };
 
+  // Preserve the original PSD's engineData (Txt2 block, base64) so PS can correctly associate
+  // each text layer (via text.index) with the global TextFrameSet and render with correct font sizes.
+  if (engineData) {
+    psd.engineData = engineData;
+  }
+
   const arrayBuffer = writePsd(psd, {
     generateThumbnail: true,
     trimImageData: true,
-    invalidateTextLayers: true,
   });
 
   onProgress(95, '准备下载...');

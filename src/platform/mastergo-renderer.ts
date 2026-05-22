@@ -190,7 +190,7 @@ async function renderTextNode(
         if (range.lineHeight != null && range.lineHeight > 0) {
           text.setRangeLineHeight(start, end, { value: range.lineHeight, unit: 'PIXELS' });
         } else {
-          text.setRangeLineHeight(start, end, { value: range.fontSize, unit: 'PIXELS' });
+          text.setRangeLineHeight(start, end, { unit: 'AUTO' });
         }
       }
 
@@ -244,6 +244,19 @@ async function renderTextNode(
     text.rotation = tp.rotation;
   }
 
+  if (tp.txOffsetX != null && Number.isFinite(tp.txOffsetX)) {
+    try { text.setPluginData('psd_tx_offset_x', String(tp.txOffsetX)); } catch { /* ignore */ }
+  }
+  if (tp.bounds) {
+    try { text.setPluginData('psd_bounds', JSON.stringify(tp.bounds)); } catch { /* ignore */ }
+  }
+  if (tp.boundingBox) {
+    try { text.setPluginData('psd_bounding_box', JSON.stringify(tp.boundingBox)); } catch { /* ignore */ }
+  }
+  if (tp.textIndex != null && Number.isFinite(tp.textIndex)) {
+    try { text.setPluginData('psd_text_index', String(tp.textIndex)); } catch { /* ignore */ }
+  }
+
   return text;
 }
 
@@ -251,24 +264,37 @@ function alignTextPosition(text: any, irNode: IRNode, onLog: LogFn): void {
   const tp = irNode.textProps!;
   const hasPrecise = tp.docBoundsY != null || tp.docBboxCenterX != null;
 
+  let targetX: number, targetY: number;
   if (hasPrecise) {
     if (tp.docBboxCenterX != null) {
-      text.x = tp.docBboxCenterX - text.width / 2;
+      targetX = tp.docBboxCenterX - text.width / 2;
     } else {
-      text.x = irNode.x + irNode.width / 2 - text.width / 2;
+      targetX = irNode.x + irNode.width / 2 - text.width / 2;
     }
     if (tp.docBoundsY != null) {
-      text.y = tp.docBoundsY;
+      targetY = tp.docBoundsY;
     } else {
-      text.y = irNode.y + irNode.height / 2 - text.height / 2;
+      targetY = irNode.y + irNode.height / 2 - text.height / 2;
     }
   } else {
     const psCenterX = irNode.x + irNode.width / 2;
     const psCenterY = irNode.y + irNode.height / 2;
-    text.x = psCenterX - text.width / 2;
-    text.y = psCenterY - text.height / 2;
-    onLog('info', `Text "${irNode.name}" align (fallback): original(${irNode.x.toFixed(2)}, ${irNode.y.toFixed(2)}) -> final(${text.x.toFixed(2)}, ${text.y.toFixed(2)})`);
+    targetX = psCenterX - text.width / 2;
+    targetY = psCenterY - text.height / 2;
+    onLog('info', `Text "${irNode.name}" align (fallback): original(${irNode.x.toFixed(2)}, ${irNode.y.toFixed(2)}) -> final(${targetX.toFixed(2)}, ${targetY.toFixed(2)})`);
   }
+
+  text.x = targetX;
+  text.y = targetY;
+
+  try {
+    const renderBoundsY = text.absoluteRenderBounds?.y;
+    const boundingBoxY = text.absoluteBoundingBox?.y;
+    if (Number.isFinite(renderBoundsY) && Number.isFinite(boundingBoxY)) {
+      const linePadding = renderBoundsY - boundingBoxY;
+      text.y = targetY - linePadding;
+    }
+  } catch { /* keep targetY */ }
 }
 
 async function renderNode(
@@ -292,6 +318,10 @@ async function renderNode(
         parent.appendChild(section);
         section.width = irNode.width;
         section.height = irNode.height;
+
+        if (irNode.psdEngineData) {
+          try { section.setPluginData('psd_engine_data', irNode.psdEngineData); } catch { /* ignore */ }
+        }
 
         if (irNode.children) {
           for (const child of irNode.children) {

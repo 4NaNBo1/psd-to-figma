@@ -61,6 +61,13 @@ export interface IRTextRange {
   fills: IRFill[];
 }
 
+export interface IRTextBounds {
+  top: number;
+  left: number;
+  right: number;
+  bottom: number;
+}
+
 export interface IRTextProps {
   characters: string;
   alignment: 'LEFT' | 'CENTER' | 'RIGHT' | 'JUSTIFIED';
@@ -74,6 +81,10 @@ export interface IRTextProps {
   shapeType?: 'point' | 'box';
   docBoundsY?: number;
   docBboxCenterX?: number;
+  txOffsetX?: number;
+  bounds?: IRTextBounds;
+  boundingBox?: IRTextBounds;
+  textIndex?: number;
 }
 
 export interface IRNode {
@@ -97,4 +108,6 @@ export interface IRNode {
   children?: IRNode[];
 
   isRootFrame?: boolean;
+  /** Set on the root section: original PSD top-level engineData (base64 Txt2 block) */
+  psdEngineData?: string;
 }

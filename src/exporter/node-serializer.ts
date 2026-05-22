@@ -280,7 +280,7 @@ function extractTextInfo(node: any): ExportTextInfo | undefined {
         lineHeight,
       };
     });
-    return { characters, alignment, styles };
+    return { characters, alignment, styles, textAutoResize: node.textAutoResize };
   }
 
   // Figma: Try whole-range first -- if the entire text has uniform style, one call is enough
@@ -305,6 +305,7 @@ function extractTextInfo(node: any): ExportTextInfo | undefined {
         fontSize: typeof fs === 'number' ? fs : 16,
         color, letterSpacing: 0, lineHeight: null,
       }],
+      textAutoResize: node.textAutoResize,
     };
   }
 
@@ -347,7 +348,7 @@ function extractTextInfo(node: any): ExportTextInfo | undefined {
     pos = runEnd;
   }
 
-  return { characters, alignment, styles };
+  return { characters, alignment, styles, textAutoResize: node.textAutoResize };
 }
 
 const MAX_IMAGE_DIMENSION = 4096;
@@ -367,7 +368,7 @@ function yieldThread(): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, 0));
 }
 
-async function exportNodeImage(node: any): Promise<string | undefined> {
+async function exportNodeImage(node: any, options?: { withoutStrokesAndEffects?: boolean }): Promise<string | undefined> {
   if (typeof node.exportAsync !== 'function') return undefined;
 
   const w = node.width ?? 0;
@@ -379,6 +380,23 @@ async function exportNodeImage(node: any): Promise<string | undefined> {
     scale = MAX_IMAGE_DIMENSION / Math.max(w, h);
   }
 
+  // For text layers, temporarily disable strokes/effects to get a tight character-bounded image,
+  // matching PSD's native text layer canvas size (which doesn't include stroke extension).
+  let savedStrokes: any[] | undefined;
+  let savedEffects: any[] | undefined;
+  if (options?.withoutStrokesAndEffects) {
+    try {
+      if (Array.isArray(node.strokes) && node.strokes.length > 0) {
+        savedStrokes = node.strokes;
+        node.strokes = [];
+      }
+      if (Array.isArray(node.effects) && node.effects.length > 0) {
+        savedEffects = node.effects;
+        node.effects = [];
+      }
+    } catch { /* ignore */ }
+  }
+
   try {
     const bytes: Uint8Array = await withTimeout(
       node.exportAsync({ format: 'PNG', constraint: { type: 'SCALE', value: scale } }),
@@ -388,6 +406,13 @@ async function exportNodeImage(node: any): Promise<string | undefined> {
     return uint8ArrayToBase64(bytes);
   } catch {
     return undefined;
+  } finally {
+    if (savedStrokes !== undefined) {
+      try { node.strokes = savedStrokes; } catch { /* ignore */ }
+    }
+    if (savedEffects !== undefined) {
+      try { node.effects = savedEffects; } catch { /* ignore */ }
+    }
   }
 }
 
@@ -429,8 +454,19 @@ async function serializeNode(
     `导出节点 ${processed.count}/${total}: ${node.name}`,
   );
 
-  const absX = node.absoluteTransform?.[0]?.[2] ?? node.x ?? 0;
-  const absY = node.absoluteTransform?.[1]?.[2] ?? node.y ?? 0;
+  let absX = node.absoluteTransform?.[0]?.[2] ?? node.x ?? 0;
+  let absY = node.absoluteTransform?.[1]?.[2] ?? node.y ?? 0;
+
+  if (nodeType === 'text') {
+    try {
+      const rb = node.absoluteRenderBounds;
+      const ab = node.absoluteBoundingBox;
+      if (rb && ab && Number.isFinite(rb.y) && Number.isFinite(ab.y)) {
+        absY = absY + (rb.y - ab.y);
+      }
+    } catch { /* fall back to node.x/y */ }
+  }
+
   const relX = absX - parentX;
   const relY = absY - parentY;
 
@@ -455,10 +491,33 @@ async function serializeNode(
 
   if (nodeType === 'text') {
     data.textInfo = extractTextInfo(node);
+    if (data.textInfo) {
+      try {
+        const getData = (key: string): string => typeof node.getPluginData === 'function' ? node.getPluginData(key) : '';
+        const txOffStr = getData('psd_tx_offset_x');
+        if (txOffStr) {
+          const v = parseFloat(txOffStr);
+          if (Number.isFinite(v)) data.textInfo.txOffsetX = v;
+        }
+        const boundsStr = getData('psd_bounds');
+        if (boundsStr) {
+          try { data.textInfo.bounds = JSON.parse(boundsStr); } catch { /* ignore */ }
+        }
+        const bboxStr = getData('psd_bounding_box');
+        if (bboxStr) {
+          try { data.textInfo.boundingBox = JSON.parse(bboxStr); } catch { /* ignore */ }
+        }
+        const textIndexStr = getData('psd_text_index');
+        if (textIndexStr) {
+          const v = parseInt(textIndexStr, 10);
+          if (Number.isFinite(v)) data.textInfo.textIndex = v;
+        }
+      } catch { /* ignore */ }
+    }
     data.fills = extractFills(node);
     data.strokes = extractStrokes(node);
     data.effects = extractEffects(node);
-    data.imageBase64 = await exportNodeImage(node);
+    data.imageBase64 = await exportNodeImage(node, { withoutStrokesAndEffects: true });
     onLog('info', `Text "${node.name}": ${data.textInfo?.characters.length ?? 0} chars`);
   } else if (nodeType === 'instance') {
     data.fills = extractFills(node);
@@ -516,10 +575,27 @@ async function serializeNode(
   return data;
 }
 
+function findPsdEngineData(node: any): string | undefined {
+  if (!node || typeof node !== 'object') return undefined;
+  try {
+    if (typeof node.getPluginData === 'function') {
+      const v = node.getPluginData('psd_engine_data');
+      if (v) return v;
+    }
+  } catch { /* ignore */ }
+  if ('children' in node && Array.isArray(node.children)) {
+    for (const child of node.children) {
+      const r = findPsdEngineData(child);
+      if (r) return r;
+    }
+  }
+  return undefined;
+}
+
 export async function serializeSelection(
   onLog: LogFn,
   onProgress: ProgressFn,
-): Promise<{ nodes: ExportNodeData[]; width: number; height: number }> {
+): Promise<{ nodes: ExportNodeData[]; width: number; height: number; engineData?: string }> {
   const page = isMasterGo ? mg.document.currentPage : api.currentPage;
   const selection = page.selection;
 
@@ -532,6 +608,28 @@ export async function serializeSelection(
     totalNodes += countNodes(node);
   }
   onLog('info', `Selection: ${selection.length} top-level nodes, ${totalNodes} total`);
+
+  // Look up the original PSD engineData stored on import (in selection subtree first, then parent chain).
+  let engineData: string | undefined;
+  for (const node of selection) {
+    engineData = findPsdEngineData(node);
+    if (engineData) break;
+  }
+  if (!engineData) {
+    for (const node of selection) {
+      let cursor: any = node;
+      while (cursor && typeof cursor === 'object') {
+        try {
+          if (typeof cursor.getPluginData === 'function') {
+            const v = cursor.getPluginData('psd_engine_data');
+            if (v) { engineData = v; break; }
+          }
+        } catch { /* ignore */ }
+        cursor = cursor.parent;
+      }
+      if (engineData) break;
+    }
+  }
 
   const nodes: ExportNodeData[] = [];
   const processed = { count: 0 };
@@ -555,5 +653,6 @@ export async function serializeSelection(
     nodes,
     width: Math.max(1, Math.round(maxX - minX)),
     height: Math.max(1, Math.round(maxY - minY)),
+    engineData,
   };
 }

@@ -67,9 +67,6 @@ function convertTextData(text: LayerTextData): SerializedTextData {
   const baseTracking = base?.tracking ?? 0;
   const baseLeading = base?.leading;
   const baseAutoLeading = base?.autoLeading ?? false;
-  const paragraphAutoLeadingRatio = text.paragraphStyle?.autoLeading
-    ?? text.paragraphStyleRuns?.[0]?.style?.autoLeading
-    ?? 1.2;
   const baseFillColor = base?.fillColor;
   const baseStrokeColor = base?.strokeColor;
 
@@ -96,7 +93,7 @@ function convertTextData(text: LayerTextData): SerializedTextData {
       const scaledFontSize = fontSize * txScale;
       let resolvedLeading: number | null;
       if (autoLeading && (!leading || leading === 0)) {
-        resolvedLeading = text.shapeType === 'box' ? scaledFontSize * paragraphAutoLeadingRatio : null;
+        resolvedLeading = null;
       } else {
         resolvedLeading = leading != null ? leading * txScale : null;
       }
@@ -120,7 +117,7 @@ function convertTextData(text: LayerTextData): SerializedTextData {
     const scaledFontSize = baseFontSize * txScale;
     let resolvedLeading: number | null;
     if (baseAutoLeading && (!baseLeading || baseLeading === 0)) {
-      resolvedLeading = text.shapeType === 'box' ? scaledFontSize * paragraphAutoLeadingRatio : null;
+      resolvedLeading = null;
     } else {
       resolvedLeading = baseLeading != null ? baseLeading * txScale : null;
     }
@@ -142,6 +139,7 @@ function convertTextData(text: LayerTextData): SerializedTextData {
 
   let docBoundsY: number | undefined;
   let docBboxCenterX: number | undefined;
+  let txOffsetX: number | undefined;
 
   if (text.transform && text.transform.length >= 6) {
     const [a, b, c, d, tx, ty] = text.transform;
@@ -174,6 +172,7 @@ function convertTextData(text: LayerTextData): SerializedTextData {
         const docBboxL = sx * bbL + tx;
         const docBboxR = sx * bbR + tx;
         docBboxCenterX = (docBboxL + docBboxR) / 2;
+        txOffsetX = tx - docBboxCenterX;
       }
     }
 
@@ -187,7 +186,24 @@ function convertTextData(text: LayerTextData): SerializedTextData {
     }
   }
 
-  const result: SerializedTextData = { text: fullText, horizontalAlignment: alignment, styles, transformScale: txScale, rotation, docBoundsY, docBboxCenterX };
+  const result: SerializedTextData = { text: fullText, horizontalAlignment: alignment, styles, transformScale: txScale, rotation, docBoundsY, docBboxCenterX, txOffsetX, textIndex: text.index };
+
+  if (text.bounds) {
+    result.bounds = {
+      top: text.bounds.top.value,
+      left: text.bounds.left.value,
+      right: text.bounds.right.value,
+      bottom: text.bounds.bottom.value,
+    };
+  }
+  if (text.boundingBox) {
+    result.boundingBox = {
+      top: text.boundingBox.top.value,
+      left: text.boundingBox.left.value,
+      right: text.boundingBox.right.value,
+      bottom: text.boundingBox.bottom.value,
+    };
+  }
 
   if (text.shapeType) {
     result.shapeType = text.shapeType;
@@ -1201,6 +1217,7 @@ export async function parsePsdFile(
     name: '',
     width: psd.width,
     height: psd.height,
+    engineData: psd.engineData,
     layers,
     images: base64Images,
   };
