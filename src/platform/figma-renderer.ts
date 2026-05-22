@@ -71,9 +71,11 @@ function applyStrokes(node: SceneNode, strokes: IRStroke[]): void {
     opacity: s.opacity ?? s.color.a,
   }));
   if ('strokes' in node) {
-    (node as GeometryMixin).strokes = figmaStrokes;
-    (node as GeometryMixin).strokeWeight = stroke.weight;
-    (node as GeometryMixin).strokeAlign = stroke.align as 'INSIDE' | 'OUTSIDE' | 'CENTER';
+    const gm = node as GeometryMixin;
+    gm.strokes = figmaStrokes;
+    gm.strokeWeight = stroke.weight;
+    gm.strokeAlign = stroke.align as 'INSIDE' | 'OUTSIDE' | 'CENTER';
+    try { (gm as { strokeJoin: StrokeJoin }).strokeJoin = 'ROUND'; } catch (_e) { /* ignore */ }
   }
 }
 

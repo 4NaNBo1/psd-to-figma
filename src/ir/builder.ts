@@ -264,6 +264,7 @@ function buildTextProps(layer: SerializedLayer): IRTextProps | undefined {
         [cos, sin, cx - cos * cx - sin * cy],
         [-sin, cos, cy + sin * cx - cos * cy],
       ],
+      angle: go.angle,
     };
   }
 

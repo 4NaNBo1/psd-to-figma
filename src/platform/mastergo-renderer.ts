@@ -72,6 +72,22 @@ function applyEffects(node: any, effects: IRShadow[]): void {
   }));
 }
 
+/**
+ * Compute mastergo gradientHandlePositions from PSD angle (degrees).
+ * PSD convention: 0° = left-to-right, 90° = bottom-to-top (standard Cartesian, y up).
+ * mastergo space: top-left (0,0), bottom-right (1,1) (y down).
+ */
+function gradientHandlesFromPsdAngle(angleDeg: number): { x: number; y: number }[] {
+  const rad = (angleDeg * Math.PI) / 180;
+  const c = Math.cos(rad);
+  const s = Math.sin(rad);
+  return [
+    { x: 0.5 - 0.5 * c, y: 0.5 + 0.5 * s },
+    { x: 0.5 + 0.5 * c, y: 0.5 - 0.5 * s },
+    { x: 0.5 - 0.5 * s, y: 0.5 - 0.5 * c },
+  ];
+}
+
 function applyStrokes(node: any, strokes: IRStroke[]): void {
   if (strokes.length === 0) return;
   const stroke = strokes[0];
@@ -84,6 +100,7 @@ function applyStrokes(node: any, strokes: IRStroke[]): void {
   }));
   node.strokeWeight = stroke.weight;
   node.strokeAlign = stroke.align;
+  try { node.strokeJoin = 'ROUND'; } catch (_e) { /* ignore */ }
 }
 
 async function applyImageFill(node: any, fill: IRImageFill, onLog: LogFn, name: string): Promise<void> {
@@ -124,7 +141,7 @@ async function applyFills(node: any, fills: IRFill[], onLog: LogFn, name: string
         color: { r: s.color.r, g: s.color.g, b: s.color.b, a: s.color.a },
       })),
       transform: fill.transform,
-      gradientHandlePositions: [{ x: 0, y: 0.5 }, { x: 1, y: 0.5 }, { x: 0, y: 0 }],
+      gradientHandlePositions: gradientHandlesFromPsdAngle(fill.angle),
       isVisible: true,
       alpha: 1,
       blendMode: 'NORMAL',
@@ -224,7 +241,7 @@ async function renderTextNode(
         color: { r: s.color.r, g: s.color.g, b: s.color.b, a: s.color.a },
       })),
       transform: go.transform,
-      gradientHandlePositions: [{ x: 0, y: 0.5 }, { x: 1, y: 0.5 }, { x: 0, y: 0 }],
+      gradientHandlePositions: gradientHandlesFromPsdAngle(go.angle),
       isVisible: true,
       alpha: 1,
       blendMode: 'NORMAL',

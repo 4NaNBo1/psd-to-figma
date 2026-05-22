@@ -23,6 +23,8 @@ export interface IRGradientFill {
   type: 'GRADIENT_LINEAR';
   stops: { position: number; color: IRColor }[];
   transform: [[number, number, number], [number, number, number]];
+  /** PSD source angle in degrees. PS convention: 0° = left-to-right, 90° = bottom-to-top. */
+  angle: number;
 }
 
 export type IRFill = IRImageFill | IRSolidFill | IRGradientFill;
