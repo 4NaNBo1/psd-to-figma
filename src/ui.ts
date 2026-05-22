@@ -49,6 +49,9 @@ document.getElementById('versionLink')!.addEventListener('click', (e) => {
 let isProcessing = false;
 let isExporting = false;
 let selectionCount = 0;
+// 文件名是否处于"自动跟随选中"状态：true 表示当前值由选中节点自动填入，
+// 用户手动编辑后变为 false，输入框被清空后再恢复为 true
+let isAutoFileName = true;
 
 // --- Tab switching ---
 tabBtns.forEach(btn => {
@@ -222,12 +225,18 @@ function updateSelectionDisplay(count: number, names: string[]) {
       `<div class="sel-count">已选中 ${count} 个节点</div>` +
       `<div class="sel-names">${nameList}</div>`;
     filenameRow.style.display = 'flex';
-    if (!exportFileName.value) {
+    // 选中多个时取第一个；处于自动跟随状态则始终更新文件名
+    if (isAutoFileName) {
       exportFileName.value = names[0] ?? 'export';
     }
     exportBtn.disabled = false;
   }
 }
+
+exportFileName.addEventListener('input', () => {
+  // 用户清空输入框 → 恢复为自动跟随；否则视为手动编辑
+  isAutoFileName = exportFileName.value.trim() === '';
+});
 
 exportBtn.addEventListener('click', () => {
   if (isExporting || selectionCount === 0) return;

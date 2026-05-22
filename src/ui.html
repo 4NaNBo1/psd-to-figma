@@ -39,15 +39,29 @@
 
     .tab-content {
       flex: 1;
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      justify-content: center;
-      padding: 16px;
+      position: relative;
     }
 
-    .tab-panel { display: none; width: 100%; max-width: 360px; }
-    .tab-panel.active { display: block; }
+    .tab-panel {
+      position: absolute;
+      top: 0;
+      left: 0;
+      right: 0;
+      width: auto;
+      max-width: 360px;
+      margin: 0 auto;
+      padding: 16px;
+      visibility: hidden;
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 0.15s ease;
+    }
+
+    .tab-panel.active {
+      visibility: visible;
+      opacity: 1;
+      pointer-events: auto;
+    }
 
     .footer {
       position: fixed;
@@ -80,6 +94,11 @@
       cursor: pointer;
       transition: border-color 0.2s, background 0.2s;
       background: #2a2a2a;
+      height: 270px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
     }
 
     .drop-zone:hover,
@@ -110,10 +129,10 @@
 
     .progress-area {
       margin-top: 20px;
-      display: none;
+      visibility: hidden;
     }
 
-    .progress-area.visible { display: block; }
+    .progress-area.visible { visibility: visible; }
 
     .progress-bar-bg {
       width: 100%;
@@ -198,6 +217,10 @@
       background: #2a2a2a;
       border-radius: 12px;
       padding: 20px;
+      height: 270px;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
     }
 
     .selection-info {
@@ -287,14 +310,6 @@
       transform: none;
     }
 
-    #tabExport .progress-area {
-      display: block;
-      visibility: hidden;
-    }
-
-    #tabExport .progress-area.visible {
-      visibility: visible;
-    }
   </style>
 </head>
 <body>
