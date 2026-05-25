@@ -88,9 +88,7 @@ function gradientHandlesFromPsdAngle(angleDeg: number): { x: number; y: number }
   ];
 }
 
-function applyStrokes(node: any, strokes: IRStroke[]): void {
-  if (strokes.length === 0) return;
-  const stroke = strokes[0];
+function applySingleStroke(node: any, stroke: IRStroke): void {
   node.strokes = stroke.fills.map((s) => ({
     type: 'SOLID',
     color: { r: s.color.r, g: s.color.g, b: s.color.b, a: s.opacity ?? s.color.a },
@@ -101,6 +99,15 @@ function applyStrokes(node: any, strokes: IRStroke[]): void {
   node.strokeWeight = stroke.weight;
   node.strokeAlign = stroke.align;
   try { node.strokeJoin = 'ROUND'; } catch (_e) { /* ignore */ }
+}
+
+function applyStrokes(node: any, strokes: IRStroke[], onLog?: LogFn, nodeName?: string): void {
+  if (strokes.length === 0) return;
+  // 形状/frame 节点受 mastergo 单节点限制只能渲染一个 stroke
+  if (onLog && strokes.length > 1) {
+    onLog('warn', `Node "${nodeName ?? '?'}" has ${strokes.length} strokes; only strokes[0] applied (platform limitation)`);
+  }
+  applySingleStroke(node, strokes[0]);
 }
 
 async function applyImageFill(node: any, fill: IRImageFill, onLog: LogFn, name: string): Promise<void> {
@@ -149,13 +156,18 @@ async function applyFills(node: any, fills: IRFill[], onLog: LogFn, name: string
   }
 }
 
-async function renderTextNode(
+// 创建并样式化一个文本节点；strokeOverride 决定本节点承载的 stroke（undefined = 不画 stroke）
+// 返回 { node, linePadding } - linePadding 是 alignTextPosition 实际应用的 baseline 偏移
+async function createStyledTextNode(
   irNode: IRNode,
   parent: any,
-  onLog: LogFn
-): Promise<any> {
+  onLog: LogFn,
+  strokeOverride: IRStroke | undefined,
+  nameSuffix: string,
+  linePaddingOverride?: number
+): Promise<{ node: any; linePadding: number }> {
   const text = mg.createText();
-  text.name = irNode.name;
+  text.name = irNode.name + nameSuffix;
   text.visible = irNode.visible;
   if (irNode.opacity !== 1) text.opacity = irNode.opacity;
   text.blendMode = irNode.blendMode;
@@ -254,9 +266,11 @@ async function renderTextNode(
   }
 
   applyEffects(text, irNode.effects);
-  applyStrokes(text, irNode.strokes);
+  if (strokeOverride) {
+    applySingleStroke(text, strokeOverride);
+  }
 
-  alignTextPosition(text, irNode, onLog);
+  const linePadding = alignTextPosition(text, irNode, onLog, linePaddingOverride);
   if (tp.rotation) {
     text.rotation = tp.rotation;
   }
@@ -274,10 +288,53 @@ async function renderTextNode(
     try { text.setPluginData('psd_text_index', String(tp.textIndex)); } catch { /* ignore */ }
   }
 
-  return text;
+  return { node: text, linePadding };
 }
 
-function alignTextPosition(text: any, irNode: IRNode, onLog: LogFn): void {
+async function renderTextNode(
+  irNode: IRNode,
+  parent: any,
+  onLog: LogFn
+): Promise<any> {
+  const strokes = irNode.strokes;
+
+  if (strokes.length <= 1) {
+    const { node } = await createStyledTextNode(irNode, parent, onLog, strokes[0], '');
+    return node;
+  }
+
+  // 多 stroke：PSD 中 stroke[0] 在最上层。mastergo 单节点只能有一个
+  // strokeWeight/strokeAlign，所以拆成多个相同字符的文本副本叠加，每个
+  // 承载一个 stroke。
+  //
+  // 对齐策略：alignTextPosition 末尾的 linePadding 修正基于 absoluteRenderBounds，
+  // 而 absoluteRenderBounds 受 stroke 宽度影响，会让不同 stroke 副本的最终 text.y
+  // 错位。所以先创建顶层 (stroke[0]) 节点拿到它的 linePadding，再用同一个 padding
+  // 创建底层副本，保证字符 baseline 重合。
+  const top = await createStyledTextNode(irNode, parent, onLog, strokes[0], '');
+  const sharedPadding = top.linePadding;
+
+  for (let i = 1; i < strokes.length; i++) {
+    const suffix = ` (stroke ${i + 1})`;
+    const { node: clone } = await createStyledTextNode(irNode, parent, onLog, strokes[i], suffix, sharedPadding);
+    // 将副本移到顶层节点之前（更下层），保证 stroke[0] 在最上、stroke[N-1] 在最下
+    try {
+      const topIdx = parent.children.indexOf(top.node);
+      if (typeof parent.insertChild === 'function' && topIdx >= 0) {
+        parent.insertChild(topIdx, clone);
+      }
+    } catch (e) {
+      onLog('warn', `Failed to reorder multi-stroke text "${clone.name}": ${e instanceof Error ? e.message : e}`);
+    }
+  }
+
+  return top.node;
+}
+
+// 对齐文本节点位置；返回 alignment 实际应用的 linePadding（baseline 偏移），
+// 用于多 stroke 副本传入 linePaddingOverride 以保证字符 baseline 完全对齐
+// （否则 mastergo 的 absoluteRenderBounds 会因 stroke 宽度不同而产生位置偏差）。
+function alignTextPosition(text: any, irNode: IRNode, onLog: LogFn, linePaddingOverride?: number): number {
   const tp = irNode.textProps!;
   const hasPrecise = tp.docBoundsY != null || tp.docBboxCenterX != null;
 
@@ -304,14 +361,21 @@ function alignTextPosition(text: any, irNode: IRNode, onLog: LogFn): void {
   text.x = targetX;
   text.y = targetY;
 
+  if (linePaddingOverride != null && Number.isFinite(linePaddingOverride)) {
+    text.y = targetY - linePaddingOverride;
+    return linePaddingOverride;
+  }
+
+  let appliedPadding = 0;
   try {
     const renderBoundsY = text.absoluteRenderBounds?.y;
     const boundingBoxY = text.absoluteBoundingBox?.y;
     if (Number.isFinite(renderBoundsY) && Number.isFinite(boundingBoxY)) {
-      const linePadding = renderBoundsY - boundingBoxY;
-      text.y = targetY - linePadding;
+      appliedPadding = renderBoundsY - boundingBoxY;
+      text.y = targetY - appliedPadding;
     }
   } catch { /* keep targetY */ }
+  return appliedPadding;
 }
 
 async function renderNode(
@@ -365,7 +429,7 @@ async function renderNode(
         frame.y = irNode.y;
 
         applyEffects(frame, irNode.effects);
-        applyStrokes(frame, irNode.strokes);
+        applyStrokes(frame, irNode.strokes, onLog, irNode.name);
         applyCornerRadii(frame, irNode.cornerRadii);
 
         if (irNode.children) {
@@ -401,7 +465,7 @@ async function renderNode(
 
         await applyFills(rect, irNode.fills, onLog, irNode.name);
         applyEffects(rect, irNode.effects);
-        applyStrokes(rect, irNode.strokes);
+        applyStrokes(rect, irNode.strokes, onLog, irNode.name);
         applyCornerRadii(rect, irNode.cornerRadii);
 
         onNodeCreated();

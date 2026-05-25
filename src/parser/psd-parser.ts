@@ -425,10 +425,12 @@ function getArtboardBounds(layer: Layer): { left: number; top: number; right: nu
 
 function getEnabledStrokes(layer: Layer): LayerEffectStroke[] {
   if (!layer.effects || layer.effects.disabled || !layer.effects.stroke) return [];
-  return layer.effects.stroke.filter(s => s.enabled && s.fillType === 'color');
+  // 接受所有 enabled stroke（包含 color/gradient/pattern fillType）；
+  // 合成管线会按 fillType 选择对应的着色源
+  return layer.effects.stroke.filter(s => s.enabled);
 }
 
-interface DropShadowCompositeInfo {
+interface ShadowCompositeInfo {
   offsetX: number;
   offsetY: number;
   blur: number;
@@ -439,16 +441,19 @@ interface DropShadowCompositeInfo {
   opacity: number;
 }
 
-function getEnabledDropShadows(layer: Layer): DropShadowCompositeInfo[] {
-  if (!layer.effects || layer.effects.disabled || !layer.effects.dropShadow) return [];
-  const result: DropShadowCompositeInfo[] = [];
-  for (const ds of layer.effects.dropShadow) {
-    if (!ds.enabled) continue;
-    const angle = ((ds.angle ?? 120) * Math.PI) / 180;
-    const distance = ds.distance?.value ?? 0;
-    const c = ds.color;
-    const size = ds.size?.value ?? 0;
-    const chokePct = (ds.choke?.value ?? 0) / 100;
+// 兼容旧名（外部调用点）
+type DropShadowCompositeInfo = ShadowCompositeInfo;
+
+function readShadowList(items: { enabled?: boolean; angle?: number; distance?: { value?: number }; size?: { value?: number }; choke?: { value?: number }; color?: any; opacity?: number }[] | undefined): ShadowCompositeInfo[] {
+  if (!items) return [];
+  const result: ShadowCompositeInfo[] = [];
+  for (const s of items) {
+    if (!s.enabled) continue;
+    const angle = ((s.angle ?? 120) * Math.PI) / 180;
+    const distance = s.distance?.value ?? 0;
+    const c = s.color;
+    const size = s.size?.value ?? 0;
+    const chokePct = (s.choke?.value ?? 0) / 100;
     result.push({
       offsetX: Math.round(Math.cos(angle) * distance),
       offsetY: Math.round(Math.sin(angle) * distance),
@@ -457,19 +462,198 @@ function getEnabledDropShadows(layer: Layer): DropShadowCompositeInfo[] {
       r: Math.round(('r' in (c ?? {})) ? (c as { r: number }).r : 0),
       g: Math.round(('g' in (c ?? {})) ? (c as { g: number }).g : 0),
       b: Math.round(('b' in (c ?? {})) ? (c as { b: number }).b : 0),
-      opacity: (ds as { opacity?: number }).opacity ?? 1,
+      opacity: s.opacity ?? 1,
     });
   }
   return result;
 }
 
-function computeShadowExpansion(shadows: DropShadowCompositeInfo[]): number {
+function getEnabledDropShadows(layer: Layer): ShadowCompositeInfo[] {
+  if (!layer.effects || layer.effects.disabled) return [];
+  return readShadowList(layer.effects.dropShadow);
+}
+
+function getEnabledInnerShadows(layer: Layer): ShadowCompositeInfo[] {
+  if (!layer.effects || layer.effects.disabled) return [];
+  return readShadowList(layer.effects.innerShadow);
+}
+
+// Outer/Inner Glow: 没有 angle/distance（即偏移=0），用 size 当 blur+spread，choke 当 spread
+function readGlow(g: { enabled?: boolean; size?: { value?: number }; choke?: { value?: number }; color?: any; opacity?: number } | undefined): ShadowCompositeInfo | null {
+  if (!g || !g.enabled) return null;
+  const size = g.size?.value ?? 0;
+  const chokePct = (g.choke?.value ?? 0) / 100;
+  const c = g.color;
+  return {
+    offsetX: 0,
+    offsetY: 0,
+    blur: size * (1 - chokePct),
+    spread: size * chokePct,
+    r: Math.round(('r' in (c ?? {})) ? (c as { r: number }).r : 0),
+    g: Math.round(('g' in (c ?? {})) ? (c as { g: number }).g : 0),
+    b: Math.round(('b' in (c ?? {})) ? (c as { b: number }).b : 0),
+    opacity: g.opacity ?? 1,
+  };
+}
+
+function getEnabledOuterGlow(layer: Layer): ShadowCompositeInfo | null {
+  if (!layer.effects || layer.effects.disabled) return null;
+  return readGlow(layer.effects.outerGlow);
+}
+
+function getEnabledInnerGlow(layer: Layer): ShadowCompositeInfo | null {
+  if (!layer.effects || layer.effects.disabled) return null;
+  return readGlow(layer.effects.innerGlow);
+}
+
+function computeShadowExpansion(shadows: ShadowCompositeInfo[]): number {
   let expand = 0;
   for (const s of shadows) {
     const reach = s.blur + s.spread + Math.max(Math.abs(s.offsetX), Math.abs(s.offsetY));
     expand = Math.max(expand, Math.ceil(reach));
   }
   return expand;
+}
+
+interface BevelInfo {
+  /** 主样式：决定 highlight/shadow 的位置（"inner bevel"|"outer bevel"|"emboss"|"pillow emboss"|"stroke emboss"） */
+  style: string;
+  /** size：影响等高线宽度（描述斜面有多宽） */
+  size: number;
+  /** soften：在 size 上额外的模糊 */
+  soften: number;
+  /** angle / altitude（度）：光照方向 */
+  angle: number;
+  altitude: number;
+  /** direction：'up' = highlight 在亮面，'down' = 反转 */
+  direction: 'up' | 'down';
+  /** strength：高光/阴影强度（0~100 → 0~1） */
+  strength: number;
+  highlightR: number; highlightG: number; highlightB: number; highlightOpacity: number;
+  shadowR: number; shadowG: number; shadowB: number; shadowOpacity: number;
+}
+
+function getEnabledBevel(layer: Layer): BevelInfo | null {
+  if (!layer.effects || layer.effects.disabled || !layer.effects.bevel) return null;
+  const b: any = layer.effects.bevel;
+  if (!b.enabled) return null;
+  const hc = b.highlightColor ?? { r: 255, g: 255, b: 255 };
+  const sc = b.shadowColor ?? { r: 0, g: 0, b: 0 };
+  return {
+    style: String(b.style ?? 'inner bevel'),
+    size: b.size?.value ?? 0,
+    soften: b.soften?.value ?? 0,
+    angle: b.angle ?? 120,
+    altitude: b.altitude ?? 30,
+    direction: (b.direction === 'down' ? 'down' : 'up'),
+    strength: Math.max(0, Math.min(1, (b.strength ?? 100) / 100)),
+    highlightR: Math.round(hc.r ?? 255),
+    highlightG: Math.round(hc.g ?? 255),
+    highlightB: Math.round(hc.b ?? 255),
+    highlightOpacity: b.highlightOpacity ?? 0.75,
+    shadowR: Math.round(sc.r ?? 0),
+    shadowG: Math.round(sc.g ?? 0),
+    shadowB: Math.round(sc.b ?? 0),
+    shadowOpacity: b.shadowOpacity ?? 0.75,
+  };
+}
+
+interface SatinInfo {
+  r: number; g: number; b: number;
+  opacity: number;
+  size: number;
+  distance: number;
+  angle: number;
+  invert: boolean;
+}
+
+function getEnabledSatin(layer: Layer): SatinInfo | null {
+  if (!layer.effects || layer.effects.disabled || !layer.effects.satin) return null;
+  const s: any = layer.effects.satin;
+  if (!s.enabled) return null;
+  const c = s.color ?? { r: 0, g: 0, b: 0 };
+  return {
+    r: Math.round(c.r ?? 0),
+    g: Math.round(c.g ?? 0),
+    b: Math.round(c.b ?? 0),
+    opacity: s.opacity ?? 0.5,
+    size: s.size?.value ?? 0,
+    distance: s.distance?.value ?? 0,
+    angle: s.angle ?? 19,
+    invert: !!s.invert,
+  };
+}
+
+interface PatternOverlayInfo {
+  /** pattern 像素数据：RGBA 8bit, length = w*h*4 */
+  rgba: Uint8ClampedArray;
+  w: number;
+  h: number;
+  scale: number;
+  opacity: number;
+  phaseX: number;
+  phaseY: number;
+}
+
+/**
+ * 在 layer.patterns / psd.patterns 中按 id 查找模式，把其内嵌图片解码为 RGBA。
+ * 这是异步因为我们要用 Image / blob URL（PSD 中的 pattern.data 已经是 PNG bytes）。
+ */
+async function resolvePatternData(
+  patternId: string | undefined,
+  layer: Layer,
+  psdPatterns: { id: string; bounds: { w: number; h: number }; data: Uint8Array }[] | undefined
+): Promise<{ rgba: Uint8ClampedArray; w: number; h: number } | null> {
+  if (!patternId) return null;
+  const candidates: { id: string; bounds: { w: number; h: number }; data: Uint8Array }[] = [];
+  const layerPatterns = (layer as any).patterns as typeof candidates | undefined;
+  if (Array.isArray(layerPatterns)) candidates.push(...layerPatterns);
+  if (Array.isArray(psdPatterns)) candidates.push(...psdPatterns);
+  const match = candidates.find(p => p.id === patternId);
+  if (!match || !match.data || match.data.length === 0) return null;
+
+  const w = match.bounds?.w ?? 0;
+  const h = match.bounds?.h ?? 0;
+  const pixelCount = w * h;
+  if (pixelCount <= 0) return null;
+
+  const raw = match.data;
+  const rgba = new Uint8ClampedArray(pixelCount * 4);
+  if (raw.length === pixelCount * 4) {
+    // 假定 ag-psd 已经把模式像素返回为 RGBA8
+    rgba.set(raw);
+  } else if (raw.length === pixelCount * 3) {
+    for (let i = 0; i < pixelCount; i++) {
+      rgba[i * 4] = raw[i * 3];
+      rgba[i * 4 + 1] = raw[i * 3 + 1];
+      rgba[i * 4 + 2] = raw[i * 3 + 2];
+      rgba[i * 4 + 3] = 255;
+    }
+  } else if (raw.length === pixelCount) {
+    // 单通道：当 alpha mask 处理
+    for (let i = 0; i < pixelCount; i++) {
+      rgba[i * 4] = 128;
+      rgba[i * 4 + 1] = 128;
+      rgba[i * 4 + 2] = 128;
+      rgba[i * 4 + 3] = raw[i];
+    }
+  } else {
+    return null;
+  }
+  return { rgba, w, h };
+}
+
+function getPatternOverlayMeta(layer: Layer): { id: string; scale: number; opacity: number; phaseX: number; phaseY: number } | null {
+  if (!layer.effects || layer.effects.disabled || !layer.effects.patternOverlay) return null;
+  const p: any = layer.effects.patternOverlay;
+  if (!p.enabled || !p.pattern?.id) return null;
+  return {
+    id: p.pattern.id,
+    scale: (p.scale ?? 1),
+    opacity: p.opacity ?? 1,
+    phaseX: p.phase?.x ?? 0,
+    phaseY: p.phase?.y ?? 0,
+  };
 }
 
 function boxBlurAlpha(src: Uint8Array, w: number, h: number, radius: number): Uint8Array {
@@ -509,12 +693,20 @@ interface ColorOverlayInfo {
 interface GradientStop { location: number; midpoint: number; r: number; g: number; b: number; }
 interface GradientOpacityStop { location: number; midpoint: number; opacity: number; }
 
+type GradientStyleKind = 'linear' | 'radial' | 'angle' | 'reflected' | 'diamond';
+
 interface GradientOverlayInfo {
   angle: number;
   reverse: boolean;
   colorStops: GradientStop[];
   opacityStops: GradientOpacityStop[];
   opacity: number;
+  style: GradientStyleKind;
+  scale: number;
+}
+
+interface GradientStrokeInfo extends GradientOverlayInfo {
+  // 占位以便和 GradientOverlayInfo 区分类型
 }
 
 function getEnabledSolidFill(layer: Layer): ColorOverlayInfo | null {
@@ -534,32 +726,47 @@ function getEnabledSolidFill(layer: Layer): ColorOverlayInfo | null {
   return null;
 }
 
+function normalizeGradientStyle(s: string | undefined): GradientStyleKind {
+  if (s === 'radial' || s === 'angle' || s === 'reflected' || s === 'diamond') return s;
+  return 'linear';
+}
+
+function readGradientFromEffect(go: any): GradientOverlayInfo | null {
+  if (!go || !go.gradient) return null;
+  const g = go.gradient;
+  // 只处理 solid gradient（noise gradient 暂不支持还原）
+  if (g.type !== 'solid' && g.type !== undefined) return null;
+  const colorStops: GradientStop[] = (g.colorStops || []).map((s: any) => ({
+    location: s.location ?? 0,
+    midpoint: s.midpoint ?? 0.5,
+    r: Math.round(s.color?.r ?? 0),
+    g: Math.round(s.color?.g ?? 0),
+    b: Math.round(s.color?.b ?? 0),
+  }));
+  const opacityStops: GradientOpacityStop[] = (g.opacityStops || []).map((s: any) => ({
+    location: s.location ?? 0,
+    midpoint: s.midpoint ?? 0.5,
+    opacity: s.opacity ?? 1,
+  }));
+  return {
+    angle: go.angle ?? 90,
+    reverse: go.reverse ?? false,
+    colorStops,
+    opacityStops,
+    opacity: go.opacity ?? 1,
+    style: normalizeGradientStyle(go.type),
+    scale: go.scale ?? 1,
+  };
+}
+
 function getEnabledGradientOverlay(layer: Layer): GradientOverlayInfo | null {
   if (!layer.effects || layer.effects.disabled) return null;
   const overlays = (layer.effects as any).gradientOverlay;
   if (!Array.isArray(overlays)) return null;
   for (const go of overlays) {
-    if (!go.enabled || !go.gradient) continue;
-    const g = go.gradient;
-    const colorStops: GradientStop[] = (g.colorStops || []).map((s: any) => ({
-      location: s.location ?? 0,
-      midpoint: s.midpoint ?? 0.5,
-      r: Math.round(s.color?.r ?? 0),
-      g: Math.round(s.color?.g ?? 0),
-      b: Math.round(s.color?.b ?? 0),
-    }));
-    const opacityStops: GradientOpacityStop[] = (g.opacityStops || []).map((s: any) => ({
-      location: s.location ?? 0,
-      midpoint: s.midpoint ?? 0.5,
-      opacity: s.opacity ?? 1,
-    }));
-    return {
-      angle: go.angle ?? 90,
-      reverse: go.reverse ?? false,
-      colorStops,
-      opacityStops,
-      opacity: go.opacity ?? 1,
-    };
+    if (!go.enabled) continue;
+    const info = readGradientFromEffect(go);
+    if (info) return info;
   }
   return null;
 }
@@ -625,39 +832,135 @@ function applyColorOverlayToPixels(
   }
 }
 
+/**
+ * 计算坐标 (x,y) 在不同梯度类型下的归一化参数 t ∈ [0,1]。
+ * PSD 角度：0° = 左→右，90° = 底→上（Cartesian，y up）。
+ * 这里 y 是图像坐标 down，所以 dy = -sin(angle)。
+ */
+function gradientParamAt(
+  x: number, y: number,
+  w: number, h: number,
+  grad: GradientOverlayInfo
+): number {
+  const cx = w / 2, cy = h / 2;
+  const px = x - cx, py = y - cy;
+  const angleRad = grad.angle * Math.PI / 180;
+  const dx = Math.cos(angleRad);
+  const dy = -Math.sin(angleRad);
+  const scale = grad.scale > 0 ? grad.scale : 1;
+
+  switch (grad.style) {
+    case 'radial': {
+      const half = Math.min(w, h) / 2 * scale;
+      const dist = Math.sqrt(px * px + py * py);
+      return half === 0 ? 0 : Math.max(0, Math.min(1, dist / half));
+    }
+    case 'angle': {
+      // PS angle gradient：从 angle 起，逆时针 360°
+      let theta = Math.atan2(-py, px) * 180 / Math.PI; // 0=右, 90=上
+      let t = (grad.angle - theta) / 360;
+      t = t - Math.floor(t); // wrap [0,1)
+      return t;
+    }
+    case 'reflected': {
+      const halfLen = (Math.abs(dx) * w + Math.abs(dy) * h) / 2 * scale;
+      const proj = Math.abs(px * dx + py * dy);
+      return halfLen === 0 ? 0 : Math.max(0, Math.min(1, proj / halfLen));
+    }
+    case 'diamond': {
+      const halfLen = Math.max(w, h) / 2 * scale;
+      // 旋转坐标系
+      const rx = px * dx + py * dy;
+      const ry = -px * dy + py * dx;
+      const dist = Math.abs(rx) + Math.abs(ry);
+      return halfLen === 0 ? 0 : Math.max(0, Math.min(1, dist / halfLen));
+    }
+    case 'linear':
+    default: {
+      const halfLen = (Math.abs(dx) * w + Math.abs(dy) * h) / 2 * scale;
+      const proj = px * dx + py * dy;
+      return halfLen === 0 ? 0.5 : Math.max(0, Math.min(1, (proj + halfLen) / (2 * halfLen)));
+    }
+  }
+}
+
+function sampleGradient(grad: GradientOverlayInfo, tIn: number): { r: number; g: number; b: number; a: number } {
+  let t = tIn;
+  if (grad.reverse) t = 1 - t;
+  const c = interpolateGradientColor(grad.colorStops, t);
+  const a = interpolateGradientOpacity(grad.opacityStops, t) * grad.opacity;
+  return { r: c.r, g: c.g, b: c.b, a };
+}
+
 function applyGradientOverlayToPixels(
   pixels: Uint8ClampedArray,
   w: number, h: number,
   grad: GradientOverlayInfo
 ): void {
-  const angleRad = grad.angle * Math.PI / 180;
-  const dx = Math.cos(angleRad);
-  const dy = -Math.sin(angleRad);
-  const cx = w / 2, cy = h / 2;
-  const halfLen = (Math.abs(dx) * w + Math.abs(dy) * h) / 2;
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const idx = (y * w + x) * 4;
+      if (pixels[idx + 3] === 0) continue;
+
+      const t = gradientParamAt(x, y, w, h, grad);
+      const s = sampleGradient(grad, t);
+      const opac = s.a;
+
+      if (opac >= 1) {
+        pixels[idx] = s.r;
+        pixels[idx + 1] = s.g;
+        pixels[idx + 2] = s.b;
+      } else {
+        pixels[idx] = Math.round(pixels[idx] * (1 - opac) + s.r * opac);
+        pixels[idx + 1] = Math.round(pixels[idx + 1] * (1 - opac) + s.g * opac);
+        pixels[idx + 2] = Math.round(pixels[idx + 2] * (1 - opac) + s.b * opac);
+      }
+    }
+  }
+}
+
+/**
+ * 在 RGBA pixels（与图层同尺寸）上铺设 pattern，乘以原 alpha 掩膜来确定影响范围。
+ * 用 phaseX/phaseY 决定 pattern 的原点偏移。
+ */
+function applyPatternOverlayToPixels(
+  pixels: Uint8ClampedArray,
+  w: number, h: number,
+  pat: PatternOverlayInfo
+): void {
+  const pw = pat.w;
+  const ph = pat.h;
+  if (pw <= 0 || ph <= 0) return;
+  const scale = pat.scale > 0 ? pat.scale : 1;
+  const effW = Math.max(1, pw * scale);
+  const effH = Math.max(1, ph * scale);
 
   for (let y = 0; y < h; y++) {
     for (let x = 0; x < w; x++) {
       const idx = (y * w + x) * 4;
       if (pixels[idx + 3] === 0) continue;
 
-      const px = x - cx, py = y - cy;
-      const proj = px * dx + py * dy;
-      let t = halfLen === 0 ? 0.5 : (proj + halfLen) / (2 * halfLen);
-      if (grad.reverse) t = 1 - t;
-      t = Math.max(0, Math.min(1, t));
-
-      const c = interpolateGradientColor(grad.colorStops, t);
-      const opac = interpolateGradientOpacity(grad.opacityStops, t) * grad.opacity;
-
+      const u = ((x - pat.phaseX) / effW);
+      const v = ((y - pat.phaseY) / effH);
+      const fu = u - Math.floor(u);
+      const fv = v - Math.floor(v);
+      const sx = Math.min(pw - 1, Math.max(0, Math.floor(fu * pw)));
+      const sy = Math.min(ph - 1, Math.max(0, Math.floor(fv * ph)));
+      const pi = (sy * pw + sx) * 4;
+      const pr = pat.rgba[pi];
+      const pg = pat.rgba[pi + 1];
+      const pb = pat.rgba[pi + 2];
+      const pa = pat.rgba[pi + 3];
+      const opac = (pa / 255) * pat.opacity;
+      if (opac <= 0) continue;
       if (opac >= 1) {
-        pixels[idx] = c.r;
-        pixels[idx + 1] = c.g;
-        pixels[idx + 2] = c.b;
+        pixels[idx] = pr;
+        pixels[idx + 1] = pg;
+        pixels[idx + 2] = pb;
       } else {
-        pixels[idx] = Math.round(pixels[idx] * (1 - opac) + c.r * opac);
-        pixels[idx + 1] = Math.round(pixels[idx + 1] * (1 - opac) + c.g * opac);
-        pixels[idx + 2] = Math.round(pixels[idx + 2] * (1 - opac) + c.b * opac);
+        pixels[idx] = Math.round(pixels[idx] * (1 - opac) + pr * opac);
+        pixels[idx + 1] = Math.round(pixels[idx + 1] * (1 - opac) + pg * opac);
+        pixels[idx + 2] = Math.round(pixels[idx + 2] * (1 - opac) + pb * opac);
       }
     }
   }
@@ -738,22 +1041,451 @@ function erodeAlpha(alpha: Uint8Array, w: number, h: number, radius: number): Ui
   return out;
 }
 
+/**
+ * 计算到形状边缘的 Chamfer 距离场（基于 alpha 0/255 阈值）。
+ * 形状内的像素返回正距离，形状外的像素返回 0。
+ * 用两遍扫描的近似距离变换（成本远低于精确 EDT）。
+ */
+function insideDistanceField(alpha: Uint8Array, w: number, h: number): Float32Array {
+  const INF = 1e9;
+  const dist = new Float32Array(w * h);
+  for (let i = 0; i < w * h; i++) {
+    dist[i] = alpha[i] >= 128 ? INF : 0;
+  }
+  // 正向扫描
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const i = y * w + x;
+      if (dist[i] === 0) continue;
+      let m = dist[i];
+      if (x > 0) m = Math.min(m, dist[i - 1] + 1);
+      if (y > 0) m = Math.min(m, dist[i - w] + 1);
+      if (x > 0 && y > 0) m = Math.min(m, dist[i - w - 1] + Math.SQRT2);
+      if (x < w - 1 && y > 0) m = Math.min(m, dist[i - w + 1] + Math.SQRT2);
+      dist[i] = m;
+    }
+  }
+  // 反向扫描
+  for (let y = h - 1; y >= 0; y--) {
+    for (let x = w - 1; x >= 0; x--) {
+      const i = y * w + x;
+      if (dist[i] === 0) continue;
+      let m = dist[i];
+      if (x < w - 1) m = Math.min(m, dist[i + 1] + 1);
+      if (y < h - 1) m = Math.min(m, dist[i + w] + 1);
+      if (x < w - 1 && y < h - 1) m = Math.min(m, dist[i + w + 1] + Math.SQRT2);
+      if (x > 0 && y < h - 1) m = Math.min(m, dist[i + w - 1] + Math.SQRT2);
+      dist[i] = m;
+    }
+  }
+  return dist;
+}
+
+function outsideDistanceField(alpha: Uint8Array, w: number, h: number): Float32Array {
+  const inv = new Uint8Array(w * h);
+  for (let i = 0; i < w * h; i++) inv[i] = alpha[i] >= 128 ? 0 : 255;
+  return insideDistanceField(inv, w, h);
+}
+
+/**
+ * 将带 sigma 的高斯模糊近似为 3 次 box blur。
+ */
+function blurFloat(src: Float32Array, w: number, h: number, radius: number): Float32Array {
+  if (radius <= 0) return src;
+  let current = src;
+  const passes = 3;
+  const r = Math.max(1, Math.round(radius / passes));
+  for (let p = 0; p < passes; p++) {
+    const tmp = new Float32Array(w * h);
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        let sum = 0, count = 0;
+        const xMin = Math.max(0, x - r), xMax = Math.min(w - 1, x + r);
+        for (let nx = xMin; nx <= xMax; nx++) {
+          sum += current[y * w + nx];
+          count++;
+        }
+        tmp[y * w + x] = sum / count;
+      }
+    }
+    const out = new Float32Array(w * h);
+    for (let x = 0; x < w; x++) {
+      for (let y = 0; y < h; y++) {
+        let sum = 0, count = 0;
+        const yMin = Math.max(0, y - r), yMax = Math.min(h - 1, y + r);
+        for (let ny = yMin; ny <= yMax; ny++) {
+          sum += tmp[ny * w + x];
+          count++;
+        }
+        out[y * w + x] = sum / count;
+      }
+    }
+    current = out;
+  }
+  return current;
+}
+
+/**
+ * 基于内部距离场计算 PS 风格的 Bevel/Emboss 高度场（0~1，边缘=0，中心或外缘=1，
+ * 通过 size 控制斜面宽度）。
+ */
+function bevelHeightField(
+  alpha: Uint8Array, w: number, h: number, size: number, style: string
+): Float32Array {
+  const height = new Float32Array(w * h);
+  const insideD = insideDistanceField(alpha, w, h);
+  const outsideD = outsideDistanceField(alpha, w, h);
+  for (let i = 0; i < w * h; i++) {
+    const di = insideD[i];
+    const dout = outsideD[i];
+    if (style === 'outer bevel') {
+      // 外斜面：形状外靠近边缘的环带升起
+      if (alpha[i] >= 128) {
+        height[i] = 1;
+      } else {
+        height[i] = Math.max(0, 1 - dout / size);
+      }
+    } else if (style === 'emboss') {
+      // 浮雕：内/外都对称地形成斜面
+      if (alpha[i] >= 128) {
+        height[i] = Math.min(1, di / size);
+      } else {
+        height[i] = -Math.max(0, 1 - dout / size);
+      }
+    } else if (style === 'pillow emboss') {
+      if (alpha[i] >= 128) {
+        height[i] = Math.min(1, di / size);
+      } else {
+        height[i] = -Math.min(1, dout / size);
+      }
+    } else {
+      // inner bevel 默认
+      if (alpha[i] >= 128) {
+        height[i] = Math.min(1, di / size);
+      }
+    }
+  }
+  return height;
+}
+
+/**
+ * 直接基于高度场计算光照（Phong-like），返回每像素 (highlight, shadow) 强度 ∈ [0,1]。
+ * 这里 light direction 由 bevel.angle + altitude 决定。
+ */
+function bevelLighting(
+  height: Float32Array, w: number, h: number, angleDeg: number, altitudeDeg: number, direction: 'up' | 'down'
+): { highlight: Float32Array; shadow: Float32Array } {
+  const a = angleDeg * Math.PI / 180;
+  const alt = altitudeDeg * Math.PI / 180;
+  // 光源方向：在屏幕平面上 angle 决定 x/y 投影，altitude 决定 z
+  const lx = Math.cos(a) * Math.cos(alt);
+  const ly = -Math.sin(a) * Math.cos(alt);
+  const lz = Math.sin(alt);
+  const dirSign = direction === 'up' ? 1 : -1;
+
+  const highlight = new Float32Array(w * h);
+  const shadow = new Float32Array(w * h);
+
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const i = y * w + x;
+      // 中心差分计算法线 (nx, ny, nz)，z=1
+      const xL = x > 0 ? height[i - 1] : height[i];
+      const xR = x < w - 1 ? height[i + 1] : height[i];
+      const yT = y > 0 ? height[i - w] : height[i];
+      const yB = y < h - 1 ? height[i + w] : height[i];
+      let nx = (xL - xR) * dirSign;
+      let ny = (yT - yB) * dirSign;
+      const nz = 1.0;
+      // 归一化
+      const len = Math.sqrt(nx * nx + ny * ny + nz * nz);
+      nx /= len; ny /= len;
+      const nzN = nz / len;
+      const dot = nx * lx + ny * ly + nzN * lz;
+      if (dot > 0) {
+        highlight[i] = Math.min(1, dot);
+      } else {
+        shadow[i] = Math.min(1, -dot);
+      }
+    }
+  }
+  return { highlight, shadow };
+}
+
+/**
+ * 把 Bevel 的高光/阴影应用到 RGBA 像素（在合成 fill 之上、stroke 之前）。
+ * Bevel 只在 alpha>0 的区域可见（对 inner bevel/emboss/pillow），outer bevel 会扩展到外缘。
+ */
+function applyBevelToPixels(
+  pixels: Uint8ClampedArray, w: number, h: number, alpha: Uint8Array,
+  bevel: BevelInfo
+): void {
+  if (bevel.size <= 0) return;
+  let height = bevelHeightField(alpha, w, h, bevel.size, bevel.style);
+  if (bevel.soften > 0) {
+    height = blurFloat(height, w, h, bevel.soften);
+  }
+  const { highlight, shadow } = bevelLighting(height, w, h, bevel.angle, bevel.altitude, bevel.direction);
+
+  const hOp = bevel.highlightOpacity * bevel.strength;
+  const sOp = bevel.shadowOpacity * bevel.strength;
+
+  for (let i = 0; i < w * h; i++) {
+    const idx = i * 4;
+    if (pixels[idx + 3] === 0 && bevel.style !== 'outer bevel') continue;
+    const hAmt = highlight[i] * hOp;
+    if (hAmt > 0) {
+      const f = hAmt;
+      pixels[idx] = Math.round(pixels[idx] * (1 - f) + bevel.highlightR * f);
+      pixels[idx + 1] = Math.round(pixels[idx + 1] * (1 - f) + bevel.highlightG * f);
+      pixels[idx + 2] = Math.round(pixels[idx + 2] * (1 - f) + bevel.highlightB * f);
+    }
+    const sAmt = shadow[i] * sOp;
+    if (sAmt > 0) {
+      const f = sAmt;
+      pixels[idx] = Math.round(pixels[idx] * (1 - f) + bevel.shadowR * f);
+      pixels[idx + 1] = Math.round(pixels[idx + 1] * (1 - f) + bevel.shadowG * f);
+      pixels[idx + 2] = Math.round(pixels[idx + 2] * (1 - f) + bevel.shadowB * f);
+    }
+  }
+}
+
+/**
+ * Satin 效果：对 alpha 双向偏移取差，得到内部"光泽带"形状。
+ */
+function applySatinToPixels(
+  pixels: Uint8ClampedArray, w: number, h: number, origAlpha: Uint8Array,
+  satin: SatinInfo
+): void {
+  const ang = satin.angle * Math.PI / 180;
+  const dx = Math.round(Math.cos(ang) * satin.distance);
+  const dy = Math.round(-Math.sin(ang) * satin.distance);
+  // 计算前向/反向偏移 alpha
+  const fwd = new Uint8Array(w * h);
+  const bwd = new Uint8Array(w * h);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const fx = x - dx, fy = y - dy;
+      const bx = x + dx, by = y + dy;
+      fwd[y * w + x] = (fx >= 0 && fx < w && fy >= 0 && fy < h) ? origAlpha[fy * w + fx] : 0;
+      bwd[y * w + x] = (bx >= 0 && bx < w && by >= 0 && by < h) ? origAlpha[by * w + bx] : 0;
+    }
+  }
+  // 取与/绝对差 + 模糊
+  const result = new Float32Array(w * h);
+  for (let i = 0; i < w * h; i++) {
+    const a = origAlpha[i];
+    if (a === 0) continue;
+    const f = fwd[i], b = bwd[i];
+    // PS 公式近似：|f - b| / 255
+    const diff = Math.abs(f - b) / 255;
+    result[i] = satin.invert ? (1 - diff) : diff;
+  }
+  const blurred = satin.size > 0 ? blurFloat(result, w, h, satin.size) : result;
+
+  for (let i = 0; i < w * h; i++) {
+    const idx = i * 4;
+    if (pixels[idx + 3] === 0) continue;
+    // 仅作用在 alpha>0 区域，用 origAlpha 作为掩膜
+    const mask = origAlpha[i] / 255;
+    const f = blurred[i] * satin.opacity * mask;
+    if (f <= 0) continue;
+    const ff = Math.min(1, f);
+    pixels[idx] = Math.round(pixels[idx] * (1 - ff) + satin.r * ff);
+    pixels[idx + 1] = Math.round(pixels[idx + 1] * (1 - ff) + satin.g * ff);
+    pixels[idx + 2] = Math.round(pixels[idx + 2] * (1 - ff) + satin.b * ff);
+  }
+}
+
+/** 收集合成所需的完整图层效果信息 */
+interface LayerEffectBundle {
+  strokes: LayerEffectStroke[];
+  fillOpacity: number;
+  solidFill: ColorOverlayInfo | null;
+  gradientOverlay: GradientOverlayInfo | null;
+  patternOverlay: PatternOverlayInfo | null;
+  bevel: BevelInfo | null;
+  satin: SatinInfo | null;
+  dropShadows: ShadowCompositeInfo[];
+  innerShadows: ShadowCompositeInfo[];
+  outerGlow: ShadowCompositeInfo | null;
+  innerGlow: ShadowCompositeInfo | null;
+}
+
+function hasAnyEffect(b: LayerEffectBundle): boolean {
+  return b.strokes.length > 0 || b.fillOpacity < 1 || !!b.solidFill || !!b.gradientOverlay ||
+    !!b.patternOverlay || !!b.bevel || !!b.satin || b.dropShadows.length > 0 ||
+    b.innerShadows.length > 0 || !!b.outerGlow || !!b.innerGlow;
+}
+
+function copyAlphaToPadded(alpha: Uint8Array, srcW: number, srcH: number, dstW: number, dstH: number, expand: number): Uint8Array {
+  const out = new Uint8Array(dstW * dstH);
+  for (let y = 0; y < srcH; y++) {
+    for (let x = 0; x < srcW; x++) {
+      out[(y + expand) * dstW + (x + expand)] = alpha[y * srcW + x];
+    }
+  }
+  return out;
+}
+
+/** 在 dstPixels 上叠加给定颜色 + alpha 蒙版 */
+function blendColorOnto(
+  dstPixels: Uint8ClampedArray, dstW: number, dstH: number,
+  alphaMask: Uint8Array, r: number, g: number, b: number, opacity: number
+): void {
+  for (let i = 0; i < dstW * dstH; i++) {
+    const a = Math.round(alphaMask[i] * opacity);
+    if (a <= 0) continue;
+    const idx = i * 4;
+    const dstA = dstPixels[idx + 3];
+    if (dstA === 0) {
+      dstPixels[idx] = r;
+      dstPixels[idx + 1] = g;
+      dstPixels[idx + 2] = b;
+      dstPixels[idx + 3] = a;
+    } else {
+      const outA = a + dstA * (1 - a / 255);
+      dstPixels[idx] = Math.round((r * a + dstPixels[idx] * dstA * (1 - a / 255)) / outA);
+      dstPixels[idx + 1] = Math.round((g * a + dstPixels[idx + 1] * dstA * (1 - a / 255)) / outA);
+      dstPixels[idx + 2] = Math.round((b * a + dstPixels[idx + 2] * dstA * (1 - a / 255)) / outA);
+      dstPixels[idx + 3] = Math.round(outA);
+    }
+  }
+}
+
+/** 在 dstPixels 上叠加任意 RGBA 着色源（按像素），用 alphaMask（0~255）作为额外掩膜 */
+function blendRgbaOnto(
+  dstPixels: Uint8ClampedArray, dstW: number, dstH: number,
+  rgba: Uint8ClampedArray, alphaMask: Uint8Array, opacity: number
+): void {
+  for (let i = 0; i < dstW * dstH; i++) {
+    const m = alphaMask[i];
+    if (m === 0) continue;
+    const idx = i * 4;
+    const a = Math.round(((rgba[idx + 3] * m) / 255) * opacity);
+    if (a <= 0) continue;
+    const dstA = dstPixels[idx + 3];
+    if (dstA === 0) {
+      dstPixels[idx] = rgba[idx];
+      dstPixels[idx + 1] = rgba[idx + 1];
+      dstPixels[idx + 2] = rgba[idx + 2];
+      dstPixels[idx + 3] = a;
+    } else {
+      const outA = a + dstA * (1 - a / 255);
+      dstPixels[idx] = Math.round((rgba[idx] * a + dstPixels[idx] * dstA * (1 - a / 255)) / outA);
+      dstPixels[idx + 1] = Math.round((rgba[idx + 1] * a + dstPixels[idx + 1] * dstA * (1 - a / 255)) / outA);
+      dstPixels[idx + 2] = Math.round((rgba[idx + 2] * a + dstPixels[idx + 2] * dstA * (1 - a / 255)) / outA);
+      dstPixels[idx + 3] = Math.round(outA);
+    }
+  }
+}
+
+/** 计算单个 stroke 在 padded dst 空间下的覆盖 alpha（与原 shape 比较的环带） */
+function computeStrokeAlpha(
+  origAlpha: Uint8Array, srcW: number, srcH: number,
+  dstW: number, dstH: number, expand: number,
+  size: number, position: 'inside' | 'center' | 'outside'
+): Uint8Array {
+  const paddedAlpha = copyAlphaToPadded(origAlpha, srcW, srcH, dstW, dstH, expand);
+  const out = new Uint8Array(dstW * dstH);
+
+  if (position === 'outside') {
+    const dilated = dilateAlpha(paddedAlpha, dstW, dstH, size);
+    for (let i = 0; i < dstW * dstH; i++) {
+      out[i] = Math.max(0, dilated[i] - paddedAlpha[i]);
+    }
+  } else if (position === 'inside') {
+    const eroded = erodeAlpha(paddedAlpha, dstW, dstH, size);
+    for (let i = 0; i < dstW * dstH; i++) {
+      out[i] = Math.max(0, paddedAlpha[i] - eroded[i]);
+    }
+  } else {
+    const halfOuter = Math.ceil(size / 2);
+    const halfInner = Math.floor(size / 2);
+    const dilated = dilateAlpha(paddedAlpha, dstW, dstH, halfOuter);
+    const eroded = erodeAlpha(paddedAlpha, dstW, dstH, halfInner);
+    for (let i = 0; i < dstW * dstH; i++) {
+      out[i] = Math.max(0, dilated[i] - eroded[i]);
+    }
+  }
+  return out;
+}
+
+/** 在 dst 空间下，根据 stroke 的 fillType 生成对应 RGBA 着色源（同 dstW×dstH） */
+function buildStrokeColorSource(
+  dstW: number, dstH: number, expand: number,
+  s: LayerEffectStroke
+): Uint8ClampedArray | { type: 'solid'; r: number; g: number; b: number } {
+  if (!s.fillType || s.fillType === 'color') {
+    const c = s.color;
+    return {
+      type: 'solid',
+      r: Math.round(('r' in (c ?? {})) ? (c as { r: number }).r : 0),
+      g: Math.round(('g' in (c ?? {})) ? (c as { g: number }).g : 0),
+      b: Math.round(('b' in (c ?? {})) ? (c as { b: number }).b : 0),
+    };
+  }
+  // gradient stroke：按 stroke 的 angle/style 在整个 dst 空间生成渐变像素
+  if (s.fillType === 'gradient' && s.gradient) {
+    const info = readGradientFromEffect({
+      enabled: true,
+      gradient: s.gradient,
+      angle: s.gradient.angle ?? 0,
+      type: s.gradient.style ?? 'linear',
+      reverse: s.gradient.reverse ?? false,
+      opacity: 1,
+      scale: s.gradient.scale ?? 1,
+    });
+    if (!info) {
+      return { type: 'solid', r: 0, g: 0, b: 0 };
+    }
+    const rgba = new Uint8ClampedArray(dstW * dstH * 4);
+    // 渐变在内层 srcW×srcH 区域上生成；外缘按边界外推
+    const innerW = dstW - 2 * expand;
+    const innerH = dstH - 2 * expand;
+    for (let y = 0; y < dstH; y++) {
+      for (let x = 0; x < dstW; x++) {
+        const ix = x - expand;
+        const iy = y - expand;
+        const cx = Math.max(0, Math.min(innerW - 1, ix));
+        const cy = Math.max(0, Math.min(innerH - 1, iy));
+        const t = gradientParamAt(cx, cy, innerW, innerH, info);
+        const samp = sampleGradient(info, t);
+        const idx = (y * dstW + x) * 4;
+        rgba[idx] = samp.r;
+        rgba[idx + 1] = samp.g;
+        rgba[idx + 2] = samp.b;
+        rgba[idx + 3] = Math.round(samp.a * 255);
+      }
+    }
+    return rgba;
+  }
+  // pattern stroke：暂用近似纯色 fallback（未提供 patternId 时返回黑）
+  return { type: 'solid', r: 0, g: 0, b: 0 };
+}
+
 async function compositeLayerEffects(
   imageData: { data: Uint8ClampedArray | Uint8Array | Uint16Array | Float32Array; width: number; height: number },
-  strokes: LayerEffectStroke[],
   fillOpacity: number,
-  solidFill?: ColorOverlayInfo | null,
-  gradientOverlay?: GradientOverlayInfo | null,
-  dropShadows?: DropShadowCompositeInfo[],
+  effects: LayerEffectBundle,
+  patternOverlayMeta: { id: string; scale: number; opacity: number; phaseX: number; phaseY: number } | null,
+  resolvedPattern: { rgba: Uint8ClampedArray; w: number; h: number } | null,
 ): Promise<{ png: Uint8Array; expand: number }> {
   const srcW = imageData.width;
   const srcH = imageData.height;
+  const strokes = effects.strokes;
+
+  // 计算总 expand：strokes + dropShadows + outerGlow + bevel(outer)
   const strokeExpand = computeStrokeExpansion(strokes);
-  const shadowExpand = dropShadows ? computeShadowExpansion(dropShadows) : 0;
-  const expand = Math.max(strokeExpand, shadowExpand);
+  const shadowExpand = computeShadowExpansion(effects.dropShadows);
+  const outerGlowExpand = effects.outerGlow ? Math.ceil(effects.outerGlow.blur + effects.outerGlow.spread) : 0;
+  const bevelOuterExpand = (effects.bevel && (effects.bevel.style === 'outer bevel' || effects.bevel.style === 'emboss' || effects.bevel.style === 'pillow emboss'))
+    ? Math.ceil(effects.bevel.size + effects.bevel.soften) : 0;
+  const expand = Math.max(strokeExpand, shadowExpand, outerGlowExpand, bevelOuterExpand);
   const dstW = srcW + expand * 2;
   const dstH = srcH + expand * 2;
 
+  // 准备 srcPixels（与原图同尺寸）
   const pixelCount = srcW * srcH * 4;
   const srcPixels = new Uint8ClampedArray(pixelCount);
   const srcData = imageData.data;
@@ -764,75 +1496,81 @@ async function compositeLayerEffects(
       srcPixels[i] = Math.min(255, Math.max(0, Math.round(Number(srcData[i]))));
     }
   }
-
   const origAlpha = extractAlpha(srcPixels, srcW, srcH);
 
-  if (solidFill) {
-    applyColorOverlayToPixels(srcPixels, srcW, srcH, solidFill);
+  // 在 src 空间应用各 overlay（顺序：Pattern → Gradient → Color → Satin）
+  if (effects.patternOverlay) {
+    applyPatternOverlayToPixels(srcPixels, srcW, srcH, effects.patternOverlay);
+  } else if (patternOverlayMeta && resolvedPattern) {
+    applyPatternOverlayToPixels(srcPixels, srcW, srcH, {
+      rgba: resolvedPattern.rgba,
+      w: resolvedPattern.w,
+      h: resolvedPattern.h,
+      scale: patternOverlayMeta.scale,
+      opacity: patternOverlayMeta.opacity,
+      phaseX: patternOverlayMeta.phaseX,
+      phaseY: patternOverlayMeta.phaseY,
+    });
   }
-  if (gradientOverlay) {
-    applyGradientOverlayToPixels(srcPixels, srcW, srcH, gradientOverlay);
+  if (effects.gradientOverlay) {
+    applyGradientOverlayToPixels(srcPixels, srcW, srcH, effects.gradientOverlay);
+  }
+  if (effects.solidFill) {
+    applyColorOverlayToPixels(srcPixels, srcW, srcH, effects.solidFill);
+  }
+  if (effects.satin) {
+    applySatinToPixels(srcPixels, srcW, srcH, origAlpha, effects.satin);
+  }
+  // Bevel 在 fill 之上、stroke 之前
+  if (effects.bevel) {
+    applyBevelToPixels(srcPixels, srcW, srcH, origAlpha, effects.bevel);
   }
 
   const dstPixels = new Uint8ClampedArray(dstW * dstH * 4);
 
-  if (dropShadows && dropShadows.length > 0) {
-    const paddedAlpha = new Uint8Array(dstW * dstH);
-    for (let y = 0; y < srcH; y++) {
-      for (let x = 0; x < srcW; x++) {
-        paddedAlpha[(y + expand) * dstW + (x + expand)] = origAlpha[y * srcW + x];
+  // 1. Drop Shadow（在最下层）
+  for (const shadow of effects.dropShadows) {
+    let shadowAlpha = copyAlphaToPadded(origAlpha, srcW, srcH, dstW, dstH, expand);
+    if (shadow.spread > 0) {
+      shadowAlpha = dilateAlpha(shadowAlpha, dstW, dstH, Math.ceil(shadow.spread));
+    }
+    if (shadow.blur > 0) {
+      const passes = 3;
+      const passRadius = shadow.blur / passes;
+      for (let p = 0; p < passes; p++) {
+        shadowAlpha = boxBlurAlpha(shadowAlpha, dstW, dstH, passRadius);
       }
     }
-
-    for (const shadow of dropShadows) {
-      let shadowAlpha: Uint8Array;
-
-      if (shadow.spread > 0) {
-        shadowAlpha = dilateAlpha(paddedAlpha, dstW, dstH, Math.ceil(shadow.spread));
-      } else {
-        shadowAlpha = new Uint8Array(paddedAlpha);
-      }
-
-      if (shadow.blur > 0) {
-        const passes = 3;
-        const passRadius = shadow.blur / passes;
-        for (let p = 0; p < passes; p++) {
-          shadowAlpha = boxBlurAlpha(shadowAlpha, dstW, dstH, passRadius);
-        }
-      }
-
-      for (let y = 0; y < dstH; y++) {
-        for (let x = 0; x < dstW; x++) {
-          const srcX = x - shadow.offsetX;
-          const srcY = y - shadow.offsetY;
-          if (srcX < 0 || srcX >= dstW || srcY < 0 || srcY >= dstH) continue;
-          const a = Math.round(shadowAlpha[srcY * dstW + srcX] * shadow.opacity);
-          if (a <= 0) continue;
-          const idx = (y * dstW + x) * 4;
-          const dstA = dstPixels[idx + 3];
-          if (dstA === 0) {
-            dstPixels[idx] = shadow.r;
-            dstPixels[idx + 1] = shadow.g;
-            dstPixels[idx + 2] = shadow.b;
-            dstPixels[idx + 3] = a;
-          } else {
-            const outA = a + dstA * (1 - a / 255);
-            dstPixels[idx] = Math.round((shadow.r * a + dstPixels[idx] * dstA * (1 - a / 255)) / outA);
-            dstPixels[idx + 1] = Math.round((shadow.g * a + dstPixels[idx + 1] * dstA * (1 - a / 255)) / outA);
-            dstPixels[idx + 2] = Math.round((shadow.b * a + dstPixels[idx + 2] * dstA * (1 - a / 255)) / outA);
-            dstPixels[idx + 3] = Math.round(outA);
-          }
-        }
+    // 偏移
+    const offsetAlpha = new Uint8Array(dstW * dstH);
+    for (let y = 0; y < dstH; y++) {
+      for (let x = 0; x < dstW; x++) {
+        const sx = x - shadow.offsetX;
+        const sy = y - shadow.offsetY;
+        if (sx < 0 || sx >= dstW || sy < 0 || sy >= dstH) continue;
+        offsetAlpha[y * dstW + x] = shadowAlpha[sy * dstW + sx];
       }
     }
+    blendColorOnto(dstPixels, dstW, dstH, offsetAlpha, shadow.r, shadow.g, shadow.b, shadow.opacity);
   }
 
-  // PSD 合成顺序：drop shadow（已画在 dstPixels 上）→ fill → stroke
-  // stroke 必须画在 fill 之上，否则 inside/center stroke 会被 fill 覆盖。
-  const hasFullCoverageOverlay = !!(solidFill && solidFill.opacity >= 1) ||
-    !!(gradientOverlay && gradientOverlay.opacity >= 1 &&
-       gradientOverlay.opacityStops.every(s => s.opacity >= 1));
+  // 2. Outer Glow（在 fill 下）
+  if (effects.outerGlow) {
+    const g = effects.outerGlow;
+    let glowAlpha = copyAlphaToPadded(origAlpha, srcW, srcH, dstW, dstH, expand);
+    if (g.spread > 0) glowAlpha = dilateAlpha(glowAlpha, dstW, dstH, Math.ceil(g.spread));
+    if (g.blur > 0) {
+      const passes = 3;
+      const passRadius = g.blur / passes;
+      for (let p = 0; p < passes; p++) glowAlpha = boxBlurAlpha(glowAlpha, dstW, dstH, passRadius);
+    }
+    blendColorOnto(dstPixels, dstW, dstH, glowAlpha, g.r, g.g, g.b, g.opacity);
+  }
 
+  // 3. 合成 fill（含 overlays/satin/bevel）到 dst
+  const hasFullCoverageOverlay = !!(effects.solidFill && effects.solidFill.opacity >= 1) ||
+    !!(effects.gradientOverlay && effects.gradientOverlay.opacity >= 1 &&
+       effects.gradientOverlay.opacityStops.every(s => s.opacity >= 1));
   for (let y = 0; y < srcH; y++) {
     for (let x = 0; x < srcW; x++) {
       const si = (y * srcW + x) * 4;
@@ -857,77 +1595,82 @@ async function compositeLayerEffects(
     }
   }
 
-  for (const s of strokes) {
-    const sw = s.size?.value ?? 0;
-    if (sw <= 0) continue;
-    const c = s.color;
-    const sr = Math.round(('r' in (c ?? {})) ? (c as { r: number }).r : 0);
-    const sg = Math.round(('g' in (c ?? {})) ? (c as { g: number }).g : 0);
-    const sb = Math.round(('b' in (c ?? {})) ? (c as { b: number }).b : 0);
-    const sOpacity = s.opacity ?? 1;
-
-    let strokeAlpha: Uint8Array;
-
-    if (s.position === 'outside') {
-      const dilatedW = srcW + expand * 2;
-      const dilatedH = srcH + expand * 2;
-      const paddedAlpha = new Uint8Array(dilatedW * dilatedH);
-      for (let y = 0; y < srcH; y++) {
-        for (let x = 0; x < srcW; x++) {
-          paddedAlpha[(y + expand) * dilatedW + (x + expand)] = origAlpha[y * srcW + x];
-        }
-      }
-      const dilated = dilateAlpha(paddedAlpha, dilatedW, dilatedH, sw);
-      strokeAlpha = new Uint8Array(dstW * dstH);
-      for (let i = 0; i < dstW * dstH; i++) {
-        const da = dilated[i];
-        const oa = paddedAlpha[i];
-        strokeAlpha[i] = Math.max(0, da - oa);
-      }
-    } else if (s.position === 'inside') {
-      const eroded = erodeAlpha(origAlpha, srcW, srcH, sw);
-      strokeAlpha = new Uint8Array(dstW * dstH);
-      for (let y = 0; y < srcH; y++) {
-        for (let x = 0; x < srcW; x++) {
-          const oa = origAlpha[y * srcW + x];
-          const ea = eroded[y * srcW + x];
-          strokeAlpha[(y + expand) * dstW + (x + expand)] = Math.max(0, oa - ea);
-        }
-      }
-    } else {
-      const halfOuter = Math.ceil(sw / 2);
-      const halfInner = Math.floor(sw / 2);
-      const paddedAlpha = new Uint8Array(dstW * dstH);
-      for (let y = 0; y < srcH; y++) {
-        for (let x = 0; x < srcW; x++) {
-          paddedAlpha[(y + expand) * dstW + (x + expand)] = origAlpha[y * srcW + x];
-        }
-      }
-      const dilated = dilateAlpha(paddedAlpha, dstW, dstH, halfOuter);
-      const eroded = erodeAlpha(paddedAlpha, dstW, dstH, halfInner);
-      strokeAlpha = new Uint8Array(dstW * dstH);
-      for (let i = 0; i < dstW * dstH; i++) {
-        strokeAlpha[i] = Math.max(0, dilated[i] - eroded[i]);
+  // 4. Inner Shadow（在 fill 之上，但只在 alpha>0 区域可见）
+  for (const inner of effects.innerShadows) {
+    let invAlpha = new Uint8Array(srcW * srcH);
+    for (let i = 0; i < srcW * srcH; i++) invAlpha[i] = 255 - origAlpha[i];
+    let paddedInv = copyAlphaToPadded(invAlpha, srcW, srcH, dstW, dstH, expand);
+    // 偏移
+    const offsetInv = new Uint8Array(dstW * dstH);
+    for (let y = 0; y < dstH; y++) {
+      for (let x = 0; x < dstW; x++) {
+        const sx = x - inner.offsetX;
+        const sy = y - inner.offsetY;
+        if (sx < 0 || sx >= dstW || sy < 0 || sy >= dstH) continue;
+        offsetInv[y * dstW + x] = paddedInv[sy * dstW + sx];
       }
     }
-
+    let shadowField: Uint8Array = offsetInv;
+    if (inner.spread > 0) shadowField = dilateAlpha(shadowField, dstW, dstH, Math.ceil(inner.spread));
+    if (inner.blur > 0) {
+      const passes = 3;
+      const passRadius = inner.blur / passes;
+      for (let p = 0; p < passes; p++) shadowField = boxBlurAlpha(shadowField, dstW, dstH, passRadius);
+    }
+    // 用 origAlpha 限定在 fill 内部
+    const paddedOrig = copyAlphaToPadded(origAlpha, srcW, srcH, dstW, dstH, expand);
+    const final = new Uint8Array(dstW * dstH);
     for (let i = 0; i < dstW * dstH; i++) {
-      const a = Math.round(strokeAlpha[i] * sOpacity);
-      if (a <= 0) continue;
-      const idx = i * 4;
-      const dstA = dstPixels[idx + 3];
-      if (dstA === 0) {
-        dstPixels[idx] = sr;
-        dstPixels[idx + 1] = sg;
-        dstPixels[idx + 2] = sb;
-        dstPixels[idx + 3] = a;
-      } else {
-        const outA = a + dstA * (1 - a / 255);
-        dstPixels[idx] = Math.round((sr * a + dstPixels[idx] * dstA * (1 - a / 255)) / outA);
-        dstPixels[idx + 1] = Math.round((sg * a + dstPixels[idx + 1] * dstA * (1 - a / 255)) / outA);
-        dstPixels[idx + 2] = Math.round((sb * a + dstPixels[idx + 2] * dstA * (1 - a / 255)) / outA);
-        dstPixels[idx + 3] = Math.round(outA);
-      }
+      final[i] = Math.round((shadowField[i] * paddedOrig[i]) / 255);
+    }
+    blendColorOnto(dstPixels, dstW, dstH, final, inner.r, inner.g, inner.b, inner.opacity);
+  }
+
+  // 5. Inner Glow（沿内边缘）
+  if (effects.innerGlow) {
+    const g = effects.innerGlow;
+    // 计算到形状边缘的内部距离场，转为 0~255 envelope
+    const insideD = insideDistanceField(origAlpha, srcW, srcH);
+    const reach = Math.max(1, g.blur + g.spread);
+    const env = new Uint8Array(srcW * srcH);
+    for (let i = 0; i < srcW * srcH; i++) {
+      if (origAlpha[i] < 128) continue;
+      const d = insideD[i];
+      // d=0 在边缘 → 255；d>=reach → 0
+      const t = Math.max(0, Math.min(1, 1 - d / reach));
+      env[i] = Math.round(t * 255);
+    }
+    let envPadded = copyAlphaToPadded(env, srcW, srcH, dstW, dstH, expand);
+    if (g.blur > 0) {
+      const passes = 3;
+      const passRadius = g.blur / passes;
+      for (let p = 0; p < passes; p++) envPadded = boxBlurAlpha(envPadded, dstW, dstH, passRadius);
+    }
+    // 用 origAlpha 限定在 fill 内部
+    const paddedOrig = copyAlphaToPadded(origAlpha, srcW, srcH, dstW, dstH, expand);
+    const final = new Uint8Array(dstW * dstH);
+    for (let i = 0; i < dstW * dstH; i++) {
+      final[i] = Math.round((envPadded[i] * paddedOrig[i]) / 255);
+    }
+    blendColorOnto(dstPixels, dstW, dstH, final, g.r, g.g, g.b, g.opacity);
+  }
+
+  // 6. Strokes（按 PSD 顺序，stroke[0] 在最上 → 反向遍历后让 stroke[0] 最后画）
+  // 注：PSD stroke 数组的语义：第一个是 UI 最顶层。所以应先画 [N-1] 最后画 [0]。
+  const reversedStrokes = [...strokes].reverse();
+  for (const s of reversedStrokes) {
+    const sw = s.size?.value ?? 0;
+    if (sw <= 0) continue;
+    const sOpacity = s.opacity ?? 1;
+    const strokeAlpha = computeStrokeAlpha(
+      origAlpha, srcW, srcH, dstW, dstH, expand, sw,
+      (s.position ?? 'outside') as 'inside' | 'center' | 'outside'
+    );
+    const colorSrc = buildStrokeColorSource(dstW, dstH, expand, s);
+    if (Array.isArray(colorSrc) || colorSrc instanceof Uint8ClampedArray) {
+      blendRgbaOnto(dstPixels, dstW, dstH, colorSrc as Uint8ClampedArray, strokeAlpha, sOpacity);
+    } else {
+      blendColorOnto(dstPixels, dstW, dstH, strokeAlpha, colorSrc.r, colorSrc.g, colorSrc.b, sOpacity);
     }
   }
 
@@ -1085,31 +1828,45 @@ async function serializeLayer(
     logger.info(`Layer "${layer.name}": text (stroke=${textHasStroke}, gradient=${textHasGradOverlay}), font="${layer.text.style?.font?.name ?? 'unknown'}"`);
   }
 
+  // 收集图层效果 bundle（用于位图合成分支）
+  const layerFillOpacity = (layer as any).fillOpacity ?? 1;
+  const effectBundle: LayerEffectBundle = {
+    strokes: getEnabledStrokes(layer),
+    fillOpacity: layerFillOpacity,
+    solidFill: getEnabledSolidFill(layer),
+    gradientOverlay: getEnabledGradientOverlay(layer),
+    patternOverlay: null,
+    bevel: getEnabledBevel(layer),
+    satin: getEnabledSatin(layer),
+    dropShadows: getEnabledDropShadows(layer),
+    innerShadows: getEnabledInnerShadows(layer),
+    outerGlow: getEnabledOuterGlow(layer),
+    innerGlow: getEnabledInnerGlow(layer),
+  };
+  const patternOverlayMeta = getPatternOverlayMeta(layer);
+  let resolvedPatternData: { rgba: Uint8ClampedArray; w: number; h: number } | null = null;
+  if (patternOverlayMeta) {
+    resolvedPatternData = await resolvePatternData(patternOverlayMeta.id, layer, undefined);
+  }
+
   if (serialized.type !== 'text' && layer.imageData && layer.imageData.width > 0 && layer.imageData.height > 0) {
     onProgress({ percent: 0, message: `Encoding image: ${layer.name}` });
     try {
       const maskedData = applyLayerMask(layer.imageData, layer);
       const effectiveImageData = maskedData ?? layer.imageData;
-
-      const enabledStrokes = getEnabledStrokes(layer);
-      const enabledDropShadows = getEnabledDropShadows(layer);
-      const layerFillOpacity = (layer as any).fillOpacity ?? 1;
-      const solidFill = getEnabledSolidFill(layer);
-      const gradOverlay = getEnabledGradientOverlay(layer);
-      const needsComposite = enabledStrokes.length > 0 || layerFillOpacity < 1 || !!solidFill || !!gradOverlay || enabledDropShadows.length > 0;
+      const needsComposite = hasAnyEffect(effectBundle) || !!patternOverlayMeta;
 
       if (needsComposite) {
-        const { png, expand } = await compositeLayerEffects(effectiveImageData, enabledStrokes, layerFillOpacity, solidFill, gradOverlay, enabledDropShadows);
+        const { png, expand } = await compositeLayerEffects(effectiveImageData, layerFillOpacity, effectBundle, patternOverlayMeta, resolvedPatternData);
         serialized.imageIndex = images.length;
         images.push(png);
         if (expand > 0) {
           serialized.expandOffset = expand;
         }
         serialized.strokes = [];
-        if (enabledDropShadows.length > 0) {
-          serialized.effects = serialized.effects.filter(e => e.type !== 'drop');
-        }
-        logger.info(`Layer "${layer.name}": composited with ${enabledStrokes.length} strokes, ${enabledDropShadows.length} shadows, fillOpacity=${layerFillOpacity}, expand=${expand} (${serialized.width}x${serialized.height})`);
+        // 已合成到位图的 effects 从 IR 中去除，避免重复
+        serialized.effects = [];
+        logger.info(`Layer "${layer.name}": composited with ${effectBundle.strokes.length} strokes, ${effectBundle.dropShadows.length} shadows, fillOpacity=${layerFillOpacity}, expand=${expand} (${serialized.width}x${serialized.height})`);
       } else {
         const png = await imageDataToPng(effectiveImageData);
         serialized.imageIndex = images.length;
@@ -1127,26 +1884,18 @@ async function serializeLayer(
       const rawCanvasData = cctx.getImageData(0, 0, cvs.width, cvs.height);
       const maskedCanvasData = applyLayerMask(rawCanvasData, layer);
       const effectiveCanvasData = maskedCanvasData ?? rawCanvasData;
-
-      const enabledStrokes = getEnabledStrokes(layer);
-      const enabledDropShadowsC = getEnabledDropShadows(layer);
-      const layerFillOpacity = (layer as any).fillOpacity ?? 1;
-      const solidFill = getEnabledSolidFill(layer);
-      const gradOverlay = getEnabledGradientOverlay(layer);
-      const needsComposite = enabledStrokes.length > 0 || layerFillOpacity < 1 || !!solidFill || !!gradOverlay || enabledDropShadowsC.length > 0;
+      const needsComposite = hasAnyEffect(effectBundle) || !!patternOverlayMeta;
 
       if (needsComposite && cvs.width > 0 && cvs.height > 0) {
-        const { png, expand } = await compositeLayerEffects(effectiveCanvasData, enabledStrokes, layerFillOpacity, solidFill, gradOverlay, enabledDropShadowsC);
+        const { png, expand } = await compositeLayerEffects(effectiveCanvasData, layerFillOpacity, effectBundle, patternOverlayMeta, resolvedPatternData);
         serialized.imageIndex = images.length;
         images.push(png);
         if (expand > 0) {
           serialized.expandOffset = expand;
         }
         serialized.strokes = [];
-        if (enabledDropShadowsC.length > 0) {
-          serialized.effects = serialized.effects.filter(e => e.type !== 'drop');
-        }
-        logger.info(`Layer "${layer.name}": composited canvas with ${enabledStrokes.length} strokes, ${enabledDropShadowsC.length} shadows, fillOpacity=${layerFillOpacity}, expand=${expand} (${serialized.width}x${serialized.height})`);
+        serialized.effects = [];
+        logger.info(`Layer "${layer.name}": composited canvas with ${effectBundle.strokes.length} strokes, ${effectBundle.dropShadows.length} shadows, fillOpacity=${layerFillOpacity}, expand=${expand} (${serialized.width}x${serialized.height})`);
       } else {
         const png = maskedCanvasData ? await imageDataToPng(effectiveCanvasData) : await canvasToPng(cvs);
         serialized.imageIndex = images.length;
@@ -1156,6 +1905,7 @@ async function serializeLayer(
     } catch (e) {
       logger.warn(`Failed to encode canvas for "${layer.name}": ${e instanceof Error ? e.message : e}`);
     }
+  } else {
   }
 
   if (layer.children && layer.children.length > 0) {

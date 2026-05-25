@@ -62,21 +62,27 @@ function applyEffects(node: SceneNode, effects: IRShadow[]): void {
   (node as SceneNode & { effects: readonly Effect[] }).effects = figmaEffects;
 }
 
-function applyStrokes(node: SceneNode, strokes: IRStroke[]): void {
-  if (strokes.length === 0) return;
-  const stroke = strokes[0];
+function applySingleStroke(node: SceneNode, stroke: IRStroke): void {
+  if (!('strokes' in node)) return;
   const figmaStrokes: Paint[] = stroke.fills.map((s) => ({
     type: 'SOLID' as const,
     color: { r: s.color.r, g: s.color.g, b: s.color.b },
     opacity: s.opacity ?? s.color.a,
   }));
-  if ('strokes' in node) {
-    const gm = node as GeometryMixin;
-    gm.strokes = figmaStrokes;
-    gm.strokeWeight = stroke.weight;
-    gm.strokeAlign = stroke.align as 'INSIDE' | 'OUTSIDE' | 'CENTER';
-    try { (gm as { strokeJoin: StrokeJoin }).strokeJoin = 'ROUND'; } catch (_e) { /* ignore */ }
+  const gm = node as GeometryMixin;
+  gm.strokes = figmaStrokes;
+  gm.strokeWeight = stroke.weight;
+  gm.strokeAlign = stroke.align as 'INSIDE' | 'OUTSIDE' | 'CENTER';
+  try { (gm as { strokeJoin: StrokeJoin }).strokeJoin = 'ROUND'; } catch (_e) { /* ignore */ }
+}
+
+function applyStrokes(node: SceneNode, strokes: IRStroke[], onLog?: LogFn, nodeName?: string): void {
+  if (strokes.length === 0) return;
+  // 形状/frame 节点受 figma 单节点限制只能渲染一个 stroke
+  if (onLog && strokes.length > 1) {
+    onLog('warn', `Node "${nodeName ?? '?'}" has ${strokes.length} strokes; only strokes[0] applied (platform limitation)`);
   }
+  applySingleStroke(node, strokes[0]);
 }
 
 async function applyImageFill(node: RectangleNode | FrameNode, fill: IRImageFill, onLog: LogFn, name: string): Promise<void> {
@@ -127,13 +133,16 @@ async function applyFills(node: RectangleNode | FrameNode, fills: IRFill[], onLo
   }
 }
 
-async function renderTextNode(
+// 创建并样式化一个文本节点；strokeOverride 决定本节点承载的 stroke（undefined = 不画 stroke）
+async function createStyledTextNode(
   irNode: IRNode,
   parent: FrameNode | PageNode | SectionNode,
-  onLog: LogFn
+  onLog: LogFn,
+  strokeOverride: IRStroke | undefined,
+  nameSuffix: string
 ): Promise<TextNode> {
   const text = figma.createText();
-  text.name = irNode.name;
+  text.name = irNode.name + nameSuffix;
   text.visible = irNode.visible;
   if (irNode.opacity !== 1) text.opacity = irNode.opacity;
   text.blendMode = irNode.blendMode as BlendMode;
@@ -221,7 +230,9 @@ async function renderTextNode(
   }
 
   applyEffects(text, irNode.effects);
-  applyStrokes(text, irNode.strokes);
+  if (strokeOverride) {
+    applySingleStroke(text, strokeOverride);
+  }
 
   alignTextPosition(text, irNode, onLog);
   if (tp.rotation) {
@@ -229,6 +240,47 @@ async function renderTextNode(
   }
 
   return text;
+}
+
+async function renderTextNode(
+  irNode: IRNode,
+  parent: FrameNode | PageNode | SectionNode,
+  onLog: LogFn
+): Promise<TextNode> {
+  const strokes = irNode.strokes;
+
+  if (strokes.length <= 1) {
+    return createStyledTextNode(irNode, parent, onLog, strokes[0], '');
+  }
+
+  // 多 stroke：PSD 中 stroke[0] 在最上层。figma 单节点只能有一个
+  // strokeWeight/strokeAlign，所以拆成多个相同字符的文本副本叠加，每个
+  // 承载一个 stroke。
+  //
+  // 对齐策略：先创建顶层 (stroke[0]) 拿到对齐后的 text.x/text.y，再创建
+  // 底层副本时把同样的 x/y 强制套用到副本上，保证字符 baseline 完全重合
+  // （即使 figma 在不同 strokeWeight 下计算的 text.width/height 略有差异）。
+  const top = await createStyledTextNode(irNode, parent, onLog, strokes[0], '');
+  const sharedX = top.x;
+  const sharedY = top.y;
+
+  for (let i = 1; i < strokes.length; i++) {
+    const suffix = ` (stroke ${i + 1})`;
+    const clone = await createStyledTextNode(irNode, parent, onLog, strokes[i], suffix);
+    clone.x = sharedX;
+    clone.y = sharedY;
+    // 将副本移到顶层节点之前（更下层），保证 stroke[0] 在最上、stroke[N-1] 在最下
+    try {
+      const topIdx = parent.children.indexOf(top);
+      if (topIdx >= 0) {
+        parent.insertChild(topIdx, clone);
+      }
+    } catch (e) {
+      onLog('warn', `Failed to reorder multi-stroke text "${clone.name}": ${e instanceof Error ? e.message : e}`);
+    }
+  }
+
+  return top;
 }
 
 function alignTextPosition(text: TextNode, irNode: IRNode, onLog: LogFn): void {
@@ -300,7 +352,7 @@ async function renderNode(
         frame.y = irNode.y;
 
         applyEffects(frame, irNode.effects);
-        applyStrokes(frame, irNode.strokes);
+        applyStrokes(frame, irNode.strokes, onLog, irNode.name);
         applyCornerRadii(frame, irNode.cornerRadii);
 
         if (irNode.children) {
@@ -334,7 +386,7 @@ async function renderNode(
 
         await applyFills(rect, irNode.fills, onLog, irNode.name);
         applyEffects(rect, irNode.effects);
-        applyStrokes(rect, irNode.strokes);
+        applyStrokes(rect, irNode.strokes, onLog, irNode.name);
         applyCornerRadii(rect, irNode.cornerRadii);
 
         onNodeCreated();

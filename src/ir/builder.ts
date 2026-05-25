@@ -168,21 +168,27 @@ function convertEffects(effects: SerializedShadow[]): IRShadow[] {
 
 function convertStrokes(strokes: SerializedStroke[]): IRStroke[] {
   if (!strokes || strokes.length === 0) return [];
-  const fills: IRSolidFill[] = strokes.map((s) => ({
-    type: 'SOLID' as const,
-    color: { r: s.color.r, g: s.color.g, b: s.color.b, a: 1 },
-    opacity: s.color.a * s.opacity,
-  }));
+
   const posMap: Record<string, 'INSIDE' | 'OUTSIDE' | 'CENTER'> = {
     'outside': 'OUTSIDE',
     'inside': 'INSIDE',
     'center': 'CENTER',
   };
-  return [{
-    fills,
-    weight: strokes[0].width,
-    align: posMap[strokes[0].position] || 'OUTSIDE',
-  }];
+
+  // PSD 允许同一图层有多个 stroke，每个有独立的颜色/宽度/位置。
+  // mastergo/Figma 单节点的 strokeWeight/strokeAlign 只能有一个值，
+  // 所以 IR 层保留多个独立 IRStroke，由 renderer 决定如何呈现：
+  //   - 文本节点：克隆叠加，每个副本承载一个 stroke
+  //   - 形状节点：受平台限制，仅渲染第一个
+  return strokes.map((s) => ({
+    fills: [{
+      type: 'SOLID' as const,
+      color: { r: s.color.r, g: s.color.g, b: s.color.b, a: 1 },
+      opacity: s.color.a * s.opacity,
+    }],
+    weight: s.width,
+    align: posMap[s.position] || 'OUTSIDE',
+  }));
 }
 
 function convertCornerRadii(radii: SerializedCornerRadii | undefined): IRCornerRadii | undefined {
