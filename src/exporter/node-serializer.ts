@@ -458,13 +458,30 @@ async function serializeNode(
   let absY = node.absoluteTransform?.[1]?.[2] ?? node.y ?? 0;
 
   if (nodeType === 'text') {
+    // 检查节点是否有 anchor + psd_ty 元数据。如果有，buildLayer 会走 anchor+delta 路径
+    // （直接用原始 psd ty + 用户移动量），node.y 应保持 mastergo 原始值（不加 padding）。
+    // 如果没有元数据（旧节点 / 用户新建），走 fallback 路径 `ty = node.y + ascent`，
+    // 需要把 linePadding 加回让 node.y = 字符 cap-height top。
+    let hasAnchorMetadata = false;
     try {
-      const rb = node.absoluteRenderBounds;
-      const ab = node.absoluteBoundingBox;
-      if (rb && ab && Number.isFinite(rb.y) && Number.isFinite(ab.y)) {
-        absY = absY + (rb.y - ab.y);
+      if (typeof node.getPluginData === 'function') {
+        hasAnchorMetadata = !!node.getPluginData('psd_transform_ty') && !!node.getPluginData('psd_anchor_node_y');
       }
-    } catch { /* fall back to node.x/y */ }
+    } catch { /* ignore */ }
+
+    if (!hasAnchorMetadata) {
+      try {
+        if (typeof node.getPluginData === 'function') {
+          const raw = node.getPluginData('psd_line_padding_y');
+          if (raw) {
+            const v = parseFloat(raw);
+            if (Number.isFinite(v)) {
+              absY = absY + v;
+            }
+          }
+        }
+      } catch { /* ignore */ }
+    }
   }
 
   const relX = absX - parentX;
@@ -511,6 +528,49 @@ async function serializeNode(
         if (textIndexStr) {
           const v = parseInt(textIndexStr, 10);
           if (Number.isFinite(v)) data.textInfo.textIndex = v;
+        }
+        // PSD 原始 transform 的 sy（垂直缩放系数）
+        const tScaleStr = getData('psd_transform_scale');
+        if (tScaleStr) {
+          const v = parseFloat(tScaleStr);
+          if (Number.isFinite(v) && v > 0) data.textInfo.transformScale = v;
+        }
+        const tScaleXStr = getData('psd_transform_scale_x');
+        if (tScaleXStr) {
+          const v = parseFloat(tScaleXStr);
+          if (Number.isFinite(v) && v > 0) data.textInfo.transformScaleX = v;
+        }
+        // 精确还原：anchor + 原始 PSD transform.tx/ty
+        const anchorYStr = getData('psd_anchor_node_y');
+        if (anchorYStr) {
+          const v = parseFloat(anchorYStr);
+          if (Number.isFinite(v)) data.textInfo.anchorNodeY = v;
+        }
+        const anchorXStr = getData('psd_anchor_node_x');
+        if (anchorXStr) {
+          const v = parseFloat(anchorXStr);
+          if (Number.isFinite(v)) data.textInfo.anchorNodeX = v;
+        }
+        const psdTyStr = getData('psd_transform_ty');
+        if (psdTyStr) {
+          const v = parseFloat(psdTyStr);
+          if (Number.isFinite(v)) data.textInfo.transformTy = v;
+        }
+        const psdTxStr = getData('psd_transform_tx');
+        if (psdTxStr) {
+          const v = parseFloat(psdTxStr);
+          if (Number.isFinite(v)) data.textInfo.transformTx = v;
+        }
+        // 多 stroke 文本组标记（导入端在多 stroke 文本克隆时写入）
+        const msGroup = getData('psd_multi_stroke_group_id');
+        const msIdx = getData('psd_multi_stroke_index');
+        const msTotal = getData('psd_multi_stroke_total');
+        if (msGroup && msIdx) {
+          data.textInfo.multiStrokeGroupId = msGroup;
+          const idxN = parseInt(msIdx, 10);
+          if (Number.isFinite(idxN)) data.textInfo.multiStrokeIndex = idxN;
+          const totN = parseInt(msTotal, 10);
+          if (Number.isFinite(totN)) data.textInfo.multiStrokeTotal = totN;
         }
       } catch { /* ignore */ }
     }
@@ -572,7 +632,112 @@ async function serializeNode(
     data.imageBase64 = await exportNodeImage(node);
   }
 
+  // 读取 import 时通过 setPluginData 写入的原始 PSD effects 元数据
+  // (bevel/satin/glow/pattern/多 stroke 的 fillType=gradient 等),
+  // 让 figma/mastergo → PSD 回转时能还原 figma/mastergo 无法表达的高级效果。
+  try {
+    if (typeof node.getPluginData === 'function') {
+      const raw = node.getPluginData('psd_raw_effects');
+      if (raw) {
+        data.rawPsdEffects = raw;
+      }
+    }
+  } catch { /* ignore */ }
+
+  // 读取 psd_expand_offset：psd-parser 为了让 stroke 像素完整保留，在 import 时把
+  // 位图层向四周扩展了 expand 像素；export 时这里要把这个扩展还原回去，让 PSD layer 的 bbox
+  // 与原始一致（PSD effects 由 PS 重新计算 stroke 范围，不需要 expand）。
+  try {
+    if (typeof node.getPluginData === 'function') {
+      const expRaw = node.getPluginData('psd_expand_offset');
+      if (expRaw) {
+        const exp = parseInt(expRaw, 10);
+        if (Number.isFinite(exp) && exp > 0) {
+          data.x += exp;
+          data.y += exp;
+          data.width = Math.max(1, data.width - exp * 2);
+          data.height = Math.max(1, data.height - exp * 2);
+          data.psdExpandOffset = exp;
+        }
+      }
+    }
+  } catch { /* ignore */ }
+
+  // 读取 psd_vector_data：还原 PSD shape layer 的矢量形状（vectorMask/vectorFill/vectorOrigination）
+  // 让 PS appearance 面板能显示 Fill/Stroke/圆角/精确坐标。
+  try {
+    if (typeof node.getPluginData === 'function') {
+      const vec = node.getPluginData('psd_vector_data');
+      if (vec) {
+        data.rawPsdVectorData = vec;
+      }
+    }
+  } catch { /* ignore */ }
+
   return data;
+}
+
+/**
+ * 在导出树中识别并合并多 stroke 文本组的克隆节点。
+ *
+ * 在导入端 (mastergo/figma renderer) PSD 单文本多 stroke 被拆成多个文本节点：
+ *   - 主节点 (index=0)：承载 PSD stroke[0]（最上层）
+ *   - 副本 (index=1..N-1)：每个承载一个 stroke
+ *   - 所有节点共享 psd_multi_stroke_group_id 和 psd_multi_stroke_total
+ *
+ * 这里在递归的导出树中找到同组节点，按 index 排序，把所有 stroke 合并到主节点的
+ * data.strokes 数组中（PSD 顺序：stroke[0] 在最前），删除副本节点；
+ * 同时把主节点的 textInfo 的 multiStroke* 字段保留以便后续诊断。
+ */
+function mergeMultiStrokeTextNodes(nodes: ExportNodeData[], onLog: LogFn): void {
+  const groups = new Map<string, { parent: ExportNodeData | { children: ExportNodeData[] }; nodes: ExportNodeData[] }>();
+  const fakeRoot = { children: nodes };
+  collectMultiStrokeGroups(fakeRoot, groups);
+
+  let mergedCount = 0;
+  for (const [groupId, group] of groups) {
+    const sorted = [...group.nodes].sort((a, b) => (a.textInfo?.multiStrokeIndex ?? 0) - (b.textInfo?.multiStrokeIndex ?? 0));
+    const main = sorted[0];
+    if (!main) continue;
+    // 把所有副本的第一个 stroke 按 index 升序追加到主节点 strokes
+    // sorted[0] 自身的 strokes 已经在前，副本（sorted[1..]）的 strokes 追加在后
+    for (let i = 1; i < sorted.length; i++) {
+      const cloneStrokes = sorted[i].strokes ?? [];
+      for (const s of cloneStrokes) main.strokes.push(s);
+    }
+    // 从父节点 children 中删除副本
+    const parentChildren = (group.parent as { children: ExportNodeData[] }).children;
+    for (let i = 1; i < sorted.length; i++) {
+      const idx = parentChildren.indexOf(sorted[i]);
+      if (idx >= 0) parentChildren.splice(idx, 1);
+    }
+    mergedCount++;
+  }
+  if (mergedCount > 0) {
+    onLog('info', `Merged ${mergedCount} multi-stroke text group(s) before PSD export`);
+  }
+}
+
+function collectMultiStrokeGroups(
+  parent: { children?: ExportNodeData[] } | ExportNodeData,
+  groups: Map<string, { parent: ExportNodeData | { children: ExportNodeData[] }; nodes: ExportNodeData[] }>,
+): void {
+  const children = (parent as { children?: ExportNodeData[] }).children;
+  if (!children) return;
+  for (const child of children) {
+    const gid = child.textInfo?.multiStrokeGroupId;
+    if (gid && child.type === 'text') {
+      let bucket = groups.get(gid);
+      if (!bucket) {
+        bucket = { parent: parent as ExportNodeData | { children: ExportNodeData[] }, nodes: [] };
+        groups.set(gid, bucket);
+      }
+      bucket.nodes.push(child);
+    }
+    if (child.children && child.children.length > 0) {
+      collectMultiStrokeGroups(child, groups);
+    }
+  }
 }
 
 function findPsdEngineData(node: any): string | undefined {
@@ -648,6 +813,12 @@ export async function serializeSelection(
     const nodeData = await serializeNode(node, minX, minY, onLog, onProgress, processed, totalNodes);
     if (nodeData) nodes.push(nodeData);
   }
+
+  // 后处理：合并多 stroke 文本组的克隆节点。
+  // 导入端把 PSD 单文本多 stroke 拆成多个 mastergo/figma 文本节点 (主节点 + 副本)
+  // 并通过 psd_multi_stroke_group_id 标记同组。这里把它们合并回单 ExportNodeData，
+  // 主节点 (index=0) 承载所有 stroke，副本节点从导出树中移除，保持 PSD 文件结构与原始一致。
+  mergeMultiStrokeTextNodes(nodes, onLog);
 
   return {
     nodes,

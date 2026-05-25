@@ -209,9 +209,9 @@ async function createStyledTextNode(
         }
       }
 
-      if (range.letterSpacing !== 0) {
-        text.setRangeLetterSpacing(start, end, { value: range.letterSpacing, unit: 'PIXELS' });
-      }
+      // 无论 letterSpacing 是否为 0 都显式设置：避免节点保留字体级 default letterSpacing,
+      // 与 mastergo 端保持一致（platform parity）。
+      text.setRangeLetterSpacing(start, end, { value: range.letterSpacing, unit: 'PIXELS' });
     } catch (e) {
       onLog('warn', `Failed to apply text style range [${start}:${end}] for "${irNode.name}": ${e instanceof Error ? e.message : e}`);
     }
@@ -239,6 +239,40 @@ async function createStyledTextNode(
     text.rotation = tp.rotation;
   }
 
+  // 与 mastergo 端保持对等：把 PSD 转 figma 时丢失的关键元数据存到 plugin data
+  // 让 figma → PSD 导出时能精确还原位置/字号/transform 等。
+  if (tp.txOffsetX != null && Number.isFinite(tp.txOffsetX)) {
+    try { text.setPluginData('psd_tx_offset_x', String(tp.txOffsetX)); } catch { /* ignore */ }
+  }
+  if (tp.bounds) {
+    try { text.setPluginData('psd_bounds', JSON.stringify(tp.bounds)); } catch { /* ignore */ }
+  }
+  if (tp.boundingBox) {
+    try { text.setPluginData('psd_bounding_box', JSON.stringify(tp.boundingBox)); } catch { /* ignore */ }
+  }
+  if (tp.textIndex != null && Number.isFinite(tp.textIndex)) {
+    try { text.setPluginData('psd_text_index', String(tp.textIndex)); } catch { /* ignore */ }
+  }
+  if (tp.transformScale != null && Number.isFinite(tp.transformScale) && tp.transformScale !== 1) {
+    try { text.setPluginData('psd_transform_scale', String(tp.transformScale)); } catch { /* ignore */ }
+  }
+  if (tp.transformScaleX != null && Number.isFinite(tp.transformScaleX) && tp.transformScaleX !== 1) {
+    try { text.setPluginData('psd_transform_scale_x', String(tp.transformScaleX)); } catch { /* ignore */ }
+  }
+  // 文本层保存原始 PSD effects 元数据（含 disabled 配置）
+  if (irNode.rawPsdEffects) {
+    try { text.setPluginData('psd_raw_effects', irNode.rawPsdEffects); } catch { /* ignore */ }
+  }
+  // 保存 anchor + 原始 PSD transform.tx/ty 用于 export 时精确还原（避开亚像素精度损失）
+  try { text.setPluginData('psd_anchor_node_y', String(text.y)); } catch { /* ignore */ }
+  try { text.setPluginData('psd_anchor_node_x', String(text.x)); } catch { /* ignore */ }
+  if (tp.transformTy != null && Number.isFinite(tp.transformTy)) {
+    try { text.setPluginData('psd_transform_ty', String(tp.transformTy)); } catch { /* ignore */ }
+  }
+  if (tp.transformTx != null && Number.isFinite(tp.transformTx)) {
+    try { text.setPluginData('psd_transform_tx', String(tp.transformTx)); } catch { /* ignore */ }
+  }
+
   return text;
 }
 
@@ -260,15 +294,31 @@ async function renderTextNode(
   // 对齐策略：先创建顶层 (stroke[0]) 拿到对齐后的 text.x/text.y，再创建
   // 底层副本时把同样的 x/y 强制套用到副本上，保证字符 baseline 完全重合
   // （即使 figma 在不同 strokeWeight 下计算的 text.width/height 略有差异）。
+  //
+  // 另外给所有副本写入 psd_multi_stroke_group_id / index / total，
+  // 让 figma → PSD 导出时能识别同组节点并合并成单文本节点 + 多 stroke，
+  // 保持 PSD 文件结构与原始一致。
+  const groupId = `ms-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+  const totalStrokes = strokes.length;
   const top = await createStyledTextNode(irNode, parent, onLog, strokes[0], '');
   const sharedX = top.x;
   const sharedY = top.y;
+  try {
+    top.setPluginData('psd_multi_stroke_group_id', groupId);
+    top.setPluginData('psd_multi_stroke_index', '0');
+    top.setPluginData('psd_multi_stroke_total', String(totalStrokes));
+  } catch { /* ignore */ }
 
   for (let i = 1; i < strokes.length; i++) {
     const suffix = ` (stroke ${i + 1})`;
     const clone = await createStyledTextNode(irNode, parent, onLog, strokes[i], suffix);
     clone.x = sharedX;
     clone.y = sharedY;
+    try {
+      clone.setPluginData('psd_multi_stroke_group_id', groupId);
+      clone.setPluginData('psd_multi_stroke_index', String(i));
+      clone.setPluginData('psd_multi_stroke_total', String(totalStrokes));
+    } catch { /* ignore */ }
     // 将副本移到顶层节点之前（更下层），保证 stroke[0] 在最上、stroke[N-1] 在最下
     try {
       const topIdx = parent.children.indexOf(top);
@@ -305,6 +355,9 @@ function alignTextPosition(text: TextNode, irNode: IRNode, onLog: LogFn): void {
     text.y = psCenterY - text.height / 2;
     onLog('info', `Text "${irNode.name}" align (fallback): original(${irNode.x.toFixed(2)}, ${irNode.y.toFixed(2)}) -> final(${text.x.toFixed(2)}, ${text.y.toFixed(2)})`);
   }
+
+  // 与 mastergo 端保持对称：figma 端没有 absoluteRenderBounds 后处理，linePadding=0
+  try { text.setPluginData('psd_line_padding_y', '0'); } catch { /* ignore */ }
 }
 
 async function renderNode(
@@ -354,6 +407,9 @@ async function renderNode(
         applyEffects(frame, irNode.effects);
         applyStrokes(frame, irNode.strokes, onLog, irNode.name);
         applyCornerRadii(frame, irNode.cornerRadii);
+        if (irNode.rawPsdEffects) {
+          try { frame.setPluginData('psd_raw_effects', irNode.rawPsdEffects); } catch { /* ignore */ }
+        }
 
         if (irNode.children) {
           for (const child of irNode.children) {
@@ -388,6 +444,15 @@ async function renderNode(
         applyEffects(rect, irNode.effects);
         applyStrokes(rect, irNode.strokes, onLog, irNode.name);
         applyCornerRadii(rect, irNode.cornerRadii);
+        if (irNode.rawPsdEffects) {
+          try { rect.setPluginData('psd_raw_effects', irNode.rawPsdEffects); } catch { /* ignore */ }
+        }
+        if (irNode.psdExpandOffset != null && irNode.psdExpandOffset > 0) {
+          try { rect.setPluginData('psd_expand_offset', String(irNode.psdExpandOffset)); } catch { /* ignore */ }
+        }
+        if (irNode.rawPsdVectorData) {
+          try { rect.setPluginData('psd_vector_data', irNode.rawPsdVectorData); } catch { /* ignore */ }
+        }
 
         onNodeCreated();
         node = rect;

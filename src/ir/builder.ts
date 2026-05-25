@@ -291,6 +291,10 @@ function buildTextProps(layer: SerializedLayer): IRTextProps | undefined {
     bounds: td.bounds,
     boundingBox: td.boundingBox,
     textIndex: td.textIndex,
+    transformScale: td.transformScale,
+    transformScaleX: td.transformScaleX,
+    transformTx: td.transformTx,
+    transformTy: td.transformTy,
   };
 }
 
@@ -342,6 +346,7 @@ function buildGroupNode(
     strokes: convertStrokes(layer.strokes),
     cornerRadii: convertCornerRadii(layer.cornerRadii),
     children,
+    rawPsdEffects: layer.rawEffectsData,
   };
 }
 
@@ -368,6 +373,7 @@ function buildTextNode(
     effects: irEffects,
     strokes: irStrokes,
     textProps,
+    rawPsdEffects: layer.rawEffectsData,
   };
 }
 
@@ -398,6 +404,9 @@ function buildShapeNode(
     effects: convertEffects(layer.effects),
     strokes: convertStrokes(layer.strokes),
     cornerRadii: convertCornerRadii(layer.cornerRadii),
+    rawPsdEffects: layer.rawEffectsData,
+    psdExpandOffset: expand > 0 ? expand : undefined,
+    rawPsdVectorData: layer.rawVectorData,
   };
 }
 

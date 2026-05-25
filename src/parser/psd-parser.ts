@@ -70,8 +70,14 @@ function convertTextData(text: LayerTextData): SerializedTextData {
   const baseFillColor = base?.fillColor;
   const baseStrokeColor = base?.strokeColor;
 
+  // PSD transform 矩阵 = [a, b, c, d, tx, ty]，sx = sqrt(a² + c²), sy = sqrt(b² + d²)
+  // sx 和 sy 在非旋转情况下可以不同（如 Level 40 sx=1.0 sy=1.0021），
+  // 后面用 sy 缩放 fontSize（垂直字号），但 export 时需要还原 sx 让水平字符位置正确。
   const txScale = (text.transform && text.transform.length >= 4)
     ? Math.sqrt(text.transform[1] * text.transform[1] + text.transform[3] * text.transform[3])
+    : 1;
+  const txScaleX = (text.transform && text.transform.length >= 4)
+    ? Math.sqrt(text.transform[0] * text.transform[0] + text.transform[2] * text.transform[2])
     : 1;
 
   if (text.styleRuns && text.styleRuns.length > 0) {
@@ -186,7 +192,9 @@ function convertTextData(text: LayerTextData): SerializedTextData {
     }
   }
 
-  const result: SerializedTextData = { text: fullText, horizontalAlignment: alignment, styles, transformScale: txScale, rotation, docBoundsY, docBboxCenterX, txOffsetX, textIndex: text.index };
+  const psdTx = text.transform && text.transform.length >= 6 ? text.transform[4] : undefined;
+  const psdTy = text.transform && text.transform.length >= 6 ? text.transform[5] : undefined;
+  const result: SerializedTextData = { text: fullText, horizontalAlignment: alignment, styles, transformScale: txScale, transformScaleX: txScaleX, transformTx: psdTx, transformTy: psdTy, rotation, docBoundsY, docBboxCenterX, txOffsetX, textIndex: text.index };
 
   if (text.bounds) {
     result.bounds = {
@@ -1687,6 +1695,63 @@ async function compositeLayerEffects(
   return { png: new Uint8Array(buf), expand };
 }
 
+/**
+ * 把 ag-psd 的 `layer.effects` 序列化为可存储在 figma/mastergo plugin data
+ * 中的 JSON 字符串，用于 figma/mastergo → PSD 还原时不丢失任何效果信息。
+ *
+ * 处理几个非 JSON-friendly 的字段：
+ *   - `pattern.data: Uint8Array`：直接 JSON.stringify 会变成
+ *     `{ "0":1,"1":2,... }` 形式，把 200 KB 的字典膨胀到 2 MB 以上；
+ *     这里改为转 base64 字符串，按需在还原侧解码。
+ *   - 其它字段（color/size/distance/blendMode/...) 默认就能被 JSON 化。
+ *
+ * 注意：本函数只在 needsComposite 的图层上调用，调用点必须是位图/形状/智能对象
+ * 这类会把 effects rasterize 到位图的图层。文本图层走另一条路径（保留 IR.strokes/effects）。
+ */
+function serializeRawPsdEffects(layer: Layer, fillOpacity: number): string | undefined {
+  if (!layer.effects) return undefined;
+  try {
+    const safe: any = JSON.parse(JSON.stringify(layer.effects, (_k, v) => {
+      if (v instanceof Uint8Array || v instanceof Uint8ClampedArray) {
+        let bin = '';
+        for (let i = 0; i < v.length; i++) bin += String.fromCharCode(v[i]);
+        return { __binBase64: btoa(bin) };
+      }
+      return v;
+    }));
+    return JSON.stringify({ effects: safe, fillOpacity });
+  } catch (e) {
+    logger.warn(`Failed to serialize raw effects for "${layer.name}": ${e instanceof Error ? e.message : e}`);
+    return undefined;
+  }
+}
+
+/**
+ * 序列化 PSD 矢量形状数据（vectorMask + vectorFill + vectorOrigination）为 JSON，
+ * 供 figma/mastergo→PSD 回转时还原矢量形状的 Fill/Stroke/圆角/精确坐标。
+ * vectorMask 中的 Uint8Array 字段（如果有）也用 __binBase64 编码。
+ */
+function serializeRawVectorData(layer: Layer): string | undefined {
+  const vm = (layer as any).vectorMask;
+  const vf = (layer as any).vectorFill;
+  const vo = (layer as any).vectorOrigination;
+  if (!vm && !vf && !vo) return undefined;
+  try {
+    const safe = JSON.parse(JSON.stringify({ vectorMask: vm, vectorFill: vf, vectorOrigination: vo }, (_k, v) => {
+      if (v instanceof Uint8Array || v instanceof Uint8ClampedArray) {
+        let bin = '';
+        for (let i = 0; i < v.length; i++) bin += String.fromCharCode(v[i]);
+        return { __binBase64: btoa(bin) };
+      }
+      return v;
+    }));
+    return JSON.stringify(safe);
+  } catch (e) {
+    logger.warn(`Failed to serialize raw vector data for "${layer.name}": ${e instanceof Error ? e.message : e}`);
+    return undefined;
+  }
+}
+
 async function serializeLayer(
   layer: Layer,
   images: Uint8Array[],
@@ -1755,6 +1820,26 @@ async function serializeLayer(
     effects: convertEffects(layer.effects),
     strokes: convertStrokes(layer.effects),
   };
+
+  // 对所有有 effects 的图层（含 group 和 text）保留原始 effects 元数据，
+  // 让 figma/mastergo→PSD 回转时能精确还原 contour/antialiased/range 等高级字段
+  // （这些字段在简化的 SerializedShadow 中会丢失）。
+  // 文本图层也需要保留，让 PS 看到完整的 effects 字段（即使有 disabled 项）以保证渲染一致。
+  // 位图合成路径下方会重写这个字段（加上 fillOpacity 信息）。
+  if (layer.effects && (type === 'group' || type === 'text')) {
+    const layerFillOpacityForGroup = (layer as any).fillOpacity ?? 1;
+    const raw = serializeRawPsdEffects(layer, layerFillOpacityForGroup);
+    if (raw) {
+      serialized.rawEffectsData = raw;
+    }
+  }
+
+  // 矢量形状信息（vectorMask/vectorFill/vectorOrigination）— 让 PSD shape layer
+  // 在 figma/mastergo→PSD 回转时能还原 Fill/Stroke/圆角/精确坐标等矢量属性
+  const vectorRaw = serializeRawVectorData(layer);
+  if (vectorRaw) {
+    serialized.rawVectorData = vectorRaw;
+  }
 
 
   if (layer.vectorOrigination) {
@@ -1863,6 +1948,10 @@ async function serializeLayer(
         if (expand > 0) {
           serialized.expandOffset = expand;
         }
+        // 保留原始 PSD effects 元数据，以便 figma/mastergo→PSD 还原所有高级效果
+        // （bevel/satin/glow/pattern/多 stroke 的 fillType=gradient 等），
+        // 因为下面 effects/strokes 会被清空。
+        serialized.rawEffectsData = serializeRawPsdEffects(layer, layerFillOpacity);
         serialized.strokes = [];
         // 已合成到位图的 effects 从 IR 中去除，避免重复
         serialized.effects = [];
@@ -1893,6 +1982,7 @@ async function serializeLayer(
         if (expand > 0) {
           serialized.expandOffset = expand;
         }
+        serialized.rawEffectsData = serializeRawPsdEffects(layer, layerFillOpacity);
         serialized.strokes = [];
         serialized.effects = [];
         logger.info(`Layer "${layer.name}": composited canvas with ${effectBundle.strokes.length} strokes, ${effectBundle.dropShadows.length} shadows, fillOpacity=${layerFillOpacity}, expand=${expand} (${serialized.width}x${serialized.height})`);

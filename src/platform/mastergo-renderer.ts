@@ -236,9 +236,10 @@ async function createStyledTextNode(
         }
       }
 
-      if (range.letterSpacing !== 0) {
-        text.setRangeLetterSpacing(start, end, { value: range.letterSpacing, unit: 'PIXELS' });
-      }
+      // 无论 letterSpacing 是否为 0 都显式设置：mastergo 内部 default letterSpacing 在字体级
+      // 是非 0 值（如 PingFang -0.88px），不调用 setRangeLetterSpacing(0) 会让节点保留 default,
+      // 导致 export 时 PSD tracking 错误（如 0 变成 -27/-12）。
+      text.setRangeLetterSpacing(start, end, { value: range.letterSpacing, unit: 'PIXELS' });
     } catch (e) {
       onLog('warn', `Failed to apply text style range [${start}:${end}] for "${irNode.name}": ${e instanceof Error ? e.message : e}`);
     }
@@ -287,6 +288,31 @@ async function createStyledTextNode(
   if (tp.textIndex != null && Number.isFinite(tp.textIndex)) {
     try { text.setPluginData('psd_text_index', String(tp.textIndex)); } catch { /* ignore */ }
   }
+  if (tp.transformScale != null && Number.isFinite(tp.transformScale) && tp.transformScale !== 1) {
+    try { text.setPluginData('psd_transform_scale', String(tp.transformScale)); } catch { /* ignore */ }
+  }
+  if (tp.transformScaleX != null && Number.isFinite(tp.transformScaleX) && tp.transformScaleX !== 1) {
+    try { text.setPluginData('psd_transform_scale_x', String(tp.transformScaleX)); } catch { /* ignore */ }
+  }
+  // 文本层保存原始 PSD effects 元数据（含 disabled 配置），让 export 时 PS 读到完整 effects 状态，
+  // 不被简化版（仅 enabled）的 figma 提取覆盖。
+  if (irNode.rawPsdEffects) {
+    try { text.setPluginData('psd_raw_effects', irNode.rawPsdEffects); } catch { /* ignore */ }
+  }
+  // 保存 import 时的 anchor 信息：
+  //   anchor_node_y = text.y/x (mastergo 内部值，可能与理论值有亚像素精度差)
+  //   psd_ty/tx = 原始 PSD 的 transform.ty/tx
+  // export 时计算用户移动量 delta = current_node.y - anchor_node_y，
+  // 还原 ty = psd_ty + delta。这样未移动文本 export ty 完全等于原始 PSD ty，
+  // 避开 mastergo node.y 的亚像素精度损失（之前 ~0.0005 像素抖动来源）。
+  try { text.setPluginData('psd_anchor_node_y', String(text.y)); } catch { /* ignore */ }
+  try { text.setPluginData('psd_anchor_node_x', String(text.x)); } catch { /* ignore */ }
+  if (tp.transformTy != null && Number.isFinite(tp.transformTy)) {
+    try { text.setPluginData('psd_transform_ty', String(tp.transformTy)); } catch { /* ignore */ }
+  }
+  if (tp.transformTx != null && Number.isFinite(tp.transformTx)) {
+    try { text.setPluginData('psd_transform_tx', String(tp.transformTx)); } catch { /* ignore */ }
+  }
 
   return { node: text, linePadding };
 }
@@ -311,12 +337,28 @@ async function renderTextNode(
   // 而 absoluteRenderBounds 受 stroke 宽度影响，会让不同 stroke 副本的最终 text.y
   // 错位。所以先创建顶层 (stroke[0]) 节点拿到它的 linePadding，再用同一个 padding
   // 创建底层副本，保证字符 baseline 重合。
+  //
+  // 另外给所有副本写入 psd_multi_stroke_group_id / index / total，
+  // 让 mastergo → PSD 导出时能识别同组节点并合并成单文本节点 + 多 stroke，
+  // 保持 PSD 文件结构与原始一致。
+  const groupId = `ms-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+  const totalStrokes = strokes.length;
   const top = await createStyledTextNode(irNode, parent, onLog, strokes[0], '');
   const sharedPadding = top.linePadding;
+  try {
+    top.node.setPluginData('psd_multi_stroke_group_id', groupId);
+    top.node.setPluginData('psd_multi_stroke_index', '0');
+    top.node.setPluginData('psd_multi_stroke_total', String(totalStrokes));
+  } catch { /* ignore */ }
 
   for (let i = 1; i < strokes.length; i++) {
     const suffix = ` (stroke ${i + 1})`;
     const { node: clone } = await createStyledTextNode(irNode, parent, onLog, strokes[i], suffix, sharedPadding);
+    try {
+      clone.setPluginData('psd_multi_stroke_group_id', groupId);
+      clone.setPluginData('psd_multi_stroke_index', String(i));
+      clone.setPluginData('psd_multi_stroke_total', String(totalStrokes));
+    } catch { /* ignore */ }
     // 将副本移到顶层节点之前（更下层），保证 stroke[0] 在最上、stroke[N-1] 在最下
     try {
       const topIdx = parent.children.indexOf(top.node);
@@ -363,6 +405,8 @@ function alignTextPosition(text: any, irNode: IRNode, onLog: LogFn, linePaddingO
 
   if (linePaddingOverride != null && Number.isFinite(linePaddingOverride)) {
     text.y = targetY - linePaddingOverride;
+    // 把 linePadding 存到 plugin data，供 export 还原 PSD ty 时使用
+    try { text.setPluginData('psd_line_padding_y', String(linePaddingOverride)); } catch { /* ignore */ }
     return linePaddingOverride;
   }
 
@@ -375,6 +419,8 @@ function alignTextPosition(text: any, irNode: IRNode, onLog: LogFn, linePaddingO
       text.y = targetY - appliedPadding;
     }
   } catch { /* keep targetY */ }
+  // 把 linePadding 存到 plugin data，供 export 还原 PSD ty 时使用
+  try { text.setPluginData('psd_line_padding_y', String(appliedPadding)); } catch { /* ignore */ }
   return appliedPadding;
 }
 
@@ -431,6 +477,9 @@ async function renderNode(
         applyEffects(frame, irNode.effects);
         applyStrokes(frame, irNode.strokes, onLog, irNode.name);
         applyCornerRadii(frame, irNode.cornerRadii);
+        if (irNode.rawPsdEffects) {
+          try { frame.setPluginData('psd_raw_effects', irNode.rawPsdEffects); } catch { /* ignore */ }
+        }
 
         if (irNode.children) {
           for (const child of irNode.children) {
@@ -467,6 +516,15 @@ async function renderNode(
         applyEffects(rect, irNode.effects);
         applyStrokes(rect, irNode.strokes, onLog, irNode.name);
         applyCornerRadii(rect, irNode.cornerRadii);
+        if (irNode.rawPsdEffects) {
+          try { rect.setPluginData('psd_raw_effects', irNode.rawPsdEffects); } catch { /* ignore */ }
+        }
+        if (irNode.psdExpandOffset != null && irNode.psdExpandOffset > 0) {
+          try { rect.setPluginData('psd_expand_offset', String(irNode.psdExpandOffset)); } catch { /* ignore */ }
+        }
+        if (irNode.rawPsdVectorData) {
+          try { rect.setPluginData('psd_vector_data', irNode.rawPsdVectorData); } catch { /* ignore */ }
+        }
 
         onNodeCreated();
         onLog('info', `Created rect: "${irNode.name}" (${irNode.width}x${irNode.height})`);
