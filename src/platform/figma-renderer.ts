@@ -1,5 +1,5 @@
 import type { IRNode, IRFill, IRShadow, IRStroke, IRCornerRadii, IRTextProps, IRTextRange, IRGradientFill, IRSolidFill, IRImageFill } from '../ir/types';
-import type { PlatformRenderer, LogFn, ProgressFn } from './types';
+import type { PlatformRenderer, LogFn, ProgressFn, RenderOptions } from './types';
 import { countIRNodes } from '../ir/builder';
 
 const FALLBACK_FONT: FontName = { family: 'Inter', style: 'Regular' };
@@ -381,6 +381,10 @@ async function renderNode(
         parent.appendChild(section);
         section.resizeWithoutConstraints(irNode.width, irNode.height);
 
+        if (irNode.psdEngineData) {
+          try { section.setPluginData('psd_engine_data', irNode.psdEngineData); } catch { /* ignore */ }
+        }
+
         if (irNode.children) {
           for (const child of irNode.children) {
             await renderNode(child, section, onLog, onNodeCreated);
@@ -409,6 +413,9 @@ async function renderNode(
         applyCornerRadii(frame, irNode.cornerRadii);
         if (irNode.rawPsdEffects) {
           try { frame.setPluginData('psd_raw_effects', irNode.rawPsdEffects); } catch { /* ignore */ }
+        }
+        if (irNode.isRootFrame) {
+          try { frame.setPluginData('psd_root_frame', '1'); } catch { /* ignore */ }
         }
 
         if (irNode.children) {
@@ -468,7 +475,7 @@ async function renderNode(
 }
 
 export class FigmaRenderer implements PlatformRenderer {
-  async render(tree: IRNode, onProgress: ProgressFn, onLog: LogFn): Promise<void> {
+  async render(tree: IRNode, onProgress: ProgressFn, onLog: LogFn, options?: RenderOptions): Promise<void> {
     const page = figma.currentPage;
     const totalNodes = countIRNodes(tree);
     let processed = 0;
@@ -484,8 +491,23 @@ export class FigmaRenderer implements PlatformRenderer {
     const sectionNode = await renderNode(tree, page, onLog, onNodeCreated);
 
     if (sectionNode) {
+      // 多文件场景：把根 section 平移到 placement，避免堆在原点
+      const placement = options?.placement;
+      if (placement && (sectionNode.x !== placement.x || sectionNode.y !== placement.y)) {
+        try {
+          sectionNode.x = placement.x;
+          sectionNode.y = placement.y;
+        } catch (e) {
+          onLog('warn', `Failed to place section at (${placement.x}, ${placement.y}): ${e instanceof Error ? e.message : e}`);
+        }
+      }
+
       figma.currentPage.selection = [sectionNode];
-      figma.viewport.scrollAndZoomIntoView([sectionNode]);
+      // 仅在批次末尾聚焦视口，避免多文件互相把视口拽走
+      const isBatchTail = options?.isBatchTail !== false;
+      if (isBatchTail) {
+        figma.viewport.scrollAndZoomIntoView([sectionNode]);
+      }
     }
   }
 }

@@ -271,7 +271,9 @@ export interface ExportSelectionInfo {
 }
 
 export type PluginMessage =
-  | { type: 'import-psd'; data: SerializedPsd }
+  | { type: 'import-psd'; data: SerializedPsd; batchIndex?: number; batchTotal?: number }
+  | { type: 'import-psd-batch-start'; total: number }
+  | { type: 'import-psd-batch-end' }
   | { type: 'progress'; percent: number; message: string }
   | { type: 'error'; message: string }
   | { type: 'done' }

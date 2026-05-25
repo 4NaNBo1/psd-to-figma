@@ -757,31 +757,57 @@ function findPsdEngineData(node: any): string | undefined {
   return undefined;
 }
 
+// 识别 importer 凭空添加的「根外壳」节点：
+//   - Section：带 psd_engine_data plugin data（PSD 文件名画板）
+//   - Frame：带 psd_root_frame='1' plugin data（isRootFrame 提供画布裁切的容器）
+// 这两层在 PSD 顶层并不存在，导出时拍平到 children，让 PSD 顶层与原 PS 一致。
+function isImportWrapper(node: any): boolean {
+  if (!node || typeof node !== 'object') return false;
+  try {
+    if (typeof node.getPluginData !== 'function') return false;
+    if (node.type === 'SECTION' && node.getPluginData('psd_engine_data')) return true;
+    if (node.type === 'FRAME' && node.getPluginData('psd_root_frame') === '1') return true;
+  } catch { /* ignore */ }
+  return false;
+}
+
+function expandImportWrappers(selection: any[]): any[] {
+  const out: any[] = [];
+  for (const node of selection) {
+    if (isImportWrapper(node)) {
+      const children: any[] = Array.isArray(node.children) ? node.children : [];
+      if (children.length > 0) {
+        for (const child of expandImportWrappers(children)) {
+          out.push(child);
+        }
+      }
+    } else {
+      out.push(node);
+    }
+  }
+  return out;
+}
+
 export async function serializeSelection(
   onLog: LogFn,
   onProgress: ProgressFn,
 ): Promise<{ nodes: ExportNodeData[]; width: number; height: number; engineData?: string }> {
   const page = isMasterGo ? mg.document.currentPage : api.currentPage;
-  const selection = page.selection;
+  const rawSelection = page.selection;
 
-  if (!selection || selection.length === 0) {
+  if (!rawSelection || rawSelection.length === 0) {
     throw new Error('没有选中任何节点');
   }
 
-  let totalNodes = 0;
-  for (const node of selection) {
-    totalNodes += countNodes(node);
-  }
-  onLog('info', `Selection: ${selection.length} top-level nodes, ${totalNodes} total`);
-
-  // Look up the original PSD engineData stored on import (in selection subtree first, then parent chain).
+  // engineData 查找必须在「展开外壳」之前进行：psd_engine_data plugin data
+  // 写在 Section 节点本身，展开后 Section 不再进入序列化树，需要先把它读出来。
   let engineData: string | undefined;
-  for (const node of selection) {
+  for (const node of rawSelection) {
     engineData = findPsdEngineData(node);
     if (engineData) break;
   }
   if (!engineData) {
-    for (const node of selection) {
+    for (const node of rawSelection) {
       let cursor: any = node;
       while (cursor && typeof cursor === 'object') {
         try {
@@ -795,6 +821,24 @@ export async function serializeSelection(
       if (engineData) break;
     }
   }
+
+  // 展开 importer 凭空添加的根外壳（Section / isRootFrame Frame），让 PSD 顶层结构
+  // 与原始 PS 文件一致（不带这两层包裹）。展开后 totalNodes / bbox / serializeNode
+  // 都基于展开后的 selection 计算。
+  const selection = expandImportWrappers(rawSelection);
+  if (selection.length === 0) {
+    throw new Error('选中的节点展开后为空');
+  }
+  const expandedCount = selection.length - rawSelection.length;
+  if (expandedCount !== 0) {
+    onLog('info', `Expanded import wrappers: ${rawSelection.length} -> ${selection.length} top-level nodes`);
+  }
+
+  let totalNodes = 0;
+  for (const node of selection) {
+    totalNodes += countNodes(node);
+  }
+  onLog('info', `Selection: ${selection.length} top-level nodes, ${totalNodes} total`);
 
   const nodes: ExportNodeData[] = [];
   const processed = { count: 0 };

@@ -1,5 +1,5 @@
 import type { IRNode, IRFill, IRShadow, IRStroke, IRCornerRadii, IRTextProps, IRTextRange, IRGradientFill, IRSolidFill, IRImageFill } from '../ir/types';
-import type { PlatformRenderer, LogFn, ProgressFn } from './types';
+import type { PlatformRenderer, LogFn, ProgressFn, RenderOptions } from './types';
 import { countIRNodes } from '../ir/builder';
 
 declare const mg: any;
@@ -480,6 +480,9 @@ async function renderNode(
         if (irNode.rawPsdEffects) {
           try { frame.setPluginData('psd_raw_effects', irNode.rawPsdEffects); } catch { /* ignore */ }
         }
+        if (irNode.isRootFrame) {
+          try { frame.setPluginData('psd_root_frame', '1'); } catch { /* ignore */ }
+        }
 
         if (irNode.children) {
           for (const child of irNode.children) {
@@ -541,7 +544,7 @@ async function renderNode(
 }
 
 export class MasterGoRenderer implements PlatformRenderer {
-  async render(tree: IRNode, onProgress: ProgressFn, onLog: LogFn): Promise<void> {
+  async render(tree: IRNode, onProgress: ProgressFn, onLog: LogFn, options?: RenderOptions): Promise<void> {
     onLog('info', `MasterGoRenderer start: ${tree.type} "${tree.name}"`);
     const page = mg.document.currentPage;
     const totalNodes = countIRNodes(tree);
@@ -558,8 +561,31 @@ export class MasterGoRenderer implements PlatformRenderer {
     const sectionNode = await renderNode(tree, page, onLog, onNodeCreated);
 
     if (sectionNode) {
+      // 多文件场景：把根 section 平移到 placement，避免堆在原点
+      const placement = options?.placement;
+      if (placement && (sectionNode.x !== placement.x || sectionNode.y !== placement.y)) {
+        try {
+          sectionNode.x = placement.x;
+          sectionNode.y = placement.y;
+        } catch (e) {
+          onLog('warn', `Failed to place section at (${placement.x}, ${placement.y}): ${e instanceof Error ? e.message : e}`);
+        }
+      }
+
       mg.document.currentPage.selection = [sectionNode];
       onLog('info', 'Selection set');
+
+      // 仅在批次末尾聚焦视口（保持与 figma 端对等；MasterGo 若无等价 API 则跳过）
+      const isBatchTail = options?.isBatchTail !== false;
+      if (isBatchTail) {
+        try {
+          if (mg.viewport && typeof mg.viewport.scrollAndZoomIntoView === 'function') {
+            mg.viewport.scrollAndZoomIntoView([sectionNode]);
+          }
+        } catch (e) {
+          onLog('warn', `Failed to scroll viewport into section: ${e instanceof Error ? e.message : e}`);
+        }
+      }
     }
 
     mg.commitUndo();

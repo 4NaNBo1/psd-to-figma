@@ -156,6 +156,9 @@
       margin-top: 8px;
       text-align: center;
       min-height: 16px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
     }
 
     .error-area {
@@ -165,7 +168,9 @@
       text-align: center;
       min-height: 16px;
       visibility: hidden;
-      word-break: break-word;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
     }
 
     .error-area.visible { visibility: visible; }
@@ -236,6 +241,9 @@
     .selection-info .sel-text {
       font-size: 13px;
       color: #aaa;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
     }
 
     .selection-info .sel-names {
@@ -251,6 +259,9 @@
       font-size: 14px;
       font-weight: 500;
       color: #ddd;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
     }
 
     .filename-row {
@@ -323,10 +334,10 @@
       <div class="drop-zone" id="dropZone">
         <div class="icon">&#128193;</div>
         <div class="main-text">拖入 PSD 文件或点击选择</div>
-        <p>支持 .psd 格式 (RGB 模式)</p>
+        <p>支持 .psd 格式 (RGB 模式) · 可一次选/拖多个文件</p>
       </div>
 
-      <input type="file" id="fileInput" accept=".psd">
+      <input type="file" id="fileInput" accept=".psd" multiple>
 
       <div class="progress-area" id="progressArea">
         <div class="progress-bar-bg">
