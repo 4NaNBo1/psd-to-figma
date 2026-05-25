@@ -827,6 +827,36 @@ async function compositeLayerEffects(
     }
   }
 
+  // PSD 合成顺序：drop shadow（已画在 dstPixels 上）→ fill → stroke
+  // stroke 必须画在 fill 之上，否则 inside/center stroke 会被 fill 覆盖。
+  const hasFullCoverageOverlay = !!(solidFill && solidFill.opacity >= 1) ||
+    !!(gradientOverlay && gradientOverlay.opacity >= 1 &&
+       gradientOverlay.opacityStops.every(s => s.opacity >= 1));
+
+  for (let y = 0; y < srcH; y++) {
+    for (let x = 0; x < srcW; x++) {
+      const si = (y * srcW + x) * 4;
+      const di = ((y + expand) * dstW + (x + expand)) * 4;
+      const srcR = srcPixels[si], srcG = srcPixels[si + 1], srcB = srcPixels[si + 2];
+      const rawA = srcPixels[si + 3];
+      const srcA = hasFullCoverageOverlay ? rawA : Math.round(rawA * fillOpacity);
+      if (srcA <= 0) continue;
+      const dstA = dstPixels[di + 3];
+      if (dstA === 0) {
+        dstPixels[di] = srcR;
+        dstPixels[di + 1] = srcG;
+        dstPixels[di + 2] = srcB;
+        dstPixels[di + 3] = srcA;
+      } else {
+        const outA = srcA + dstA * (1 - srcA / 255);
+        dstPixels[di] = Math.round((srcR * srcA + dstPixels[di] * dstA * (1 - srcA / 255)) / outA);
+        dstPixels[di + 1] = Math.round((srcG * srcA + dstPixels[di + 1] * dstA * (1 - srcA / 255)) / outA);
+        dstPixels[di + 2] = Math.round((srcB * srcA + dstPixels[di + 2] * dstA * (1 - srcA / 255)) / outA);
+        dstPixels[di + 3] = Math.round(outA);
+      }
+    }
+  }
+
   for (const s of strokes) {
     const sw = s.size?.value ?? 0;
     if (sw <= 0) continue;
@@ -897,34 +927,6 @@ async function compositeLayerEffects(
         dstPixels[idx + 1] = Math.round((sg * a + dstPixels[idx + 1] * dstA * (1 - a / 255)) / outA);
         dstPixels[idx + 2] = Math.round((sb * a + dstPixels[idx + 2] * dstA * (1 - a / 255)) / outA);
         dstPixels[idx + 3] = Math.round(outA);
-      }
-    }
-  }
-
-  const hasFullCoverageOverlay = !!(solidFill && solidFill.opacity >= 1) ||
-    !!(gradientOverlay && gradientOverlay.opacity >= 1 &&
-       gradientOverlay.opacityStops.every(s => s.opacity >= 1));
-
-  for (let y = 0; y < srcH; y++) {
-    for (let x = 0; x < srcW; x++) {
-      const si = (y * srcW + x) * 4;
-      const di = ((y + expand) * dstW + (x + expand)) * 4;
-      const srcR = srcPixels[si], srcG = srcPixels[si + 1], srcB = srcPixels[si + 2];
-      const rawA = srcPixels[si + 3];
-      const srcA = hasFullCoverageOverlay ? rawA : Math.round(rawA * fillOpacity);
-      if (srcA <= 0) continue;
-      const dstA = dstPixels[di + 3];
-      if (dstA === 0) {
-        dstPixels[di] = srcR;
-        dstPixels[di + 1] = srcG;
-        dstPixels[di + 2] = srcB;
-        dstPixels[di + 3] = srcA;
-      } else {
-        const outA = srcA + dstA * (1 - srcA / 255);
-        dstPixels[di] = Math.round((srcR * srcA + dstPixels[di] * dstA * (1 - srcA / 255)) / outA);
-        dstPixels[di + 1] = Math.round((srcG * srcA + dstPixels[di + 1] * dstA * (1 - srcA / 255)) / outA);
-        dstPixels[di + 2] = Math.round((srcB * srcA + dstPixels[di + 2] * dstA * (1 - srcA / 255)) / outA);
-        dstPixels[di + 3] = Math.round(outA);
       }
     }
   }
