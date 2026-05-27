@@ -53,6 +53,11 @@ function base64ToUint8Array(base64: string): Uint8Array {
   return bytes;
 }
 
+function nodeIdToGuid(nodeId: string): string {
+  const hex = nodeId.replace(/[^0-9a-fA-F]/g, '').padEnd(32, '0').slice(0, 32);
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
+}
+
 function pngToCanvas(pngBytes: Uint8Array): Promise<HTMLCanvasElement> {
   return new Promise((resolve, reject) => {
     const blob = new Blob([pngBytes as BlobPart], { type: 'image/png' });
@@ -247,7 +252,10 @@ function buildEffects(node: ExportNodeData): {
   }
 
   const solidFills = node.fills.filter(f => f.type === 'SOLID' && f.visible && f.color);
-  if (solidFills.length > 0 && node.type !== 'text') {
+  // PSD 的 solidFill (Color Overlay) effect 会用纯色覆盖整个 layer 的内容，
+  // 对 group/frame 而言会覆盖 children 视觉。仅对 leaf 节点才使用此 effect。
+  const hasChildren = !!(node.children && node.children.length > 0);
+  if (solidFills.length > 0 && node.type !== 'text' && !hasChildren) {
     result.solidFill = solidFills.map(f => ({
       enabled: true,
       color: toRGBA(f.color!),
@@ -308,7 +316,7 @@ function buildEffects(node: ExportNodeData): {
   return Object.keys(result).length > 0 ? result : undefined;
 }
 
-async function buildLayer(node: ExportNodeData): Promise<Layer> {
+async function buildLayer(node: ExportNodeData, parentClipRect?: { x: number; y: number; width: number; height: number; cornerRadii?: { topLeft: number; topRight: number; bottomLeft: number; bottomRight: number } } | null): Promise<Layer> {
   let layerTop = Math.round(node.y);
   let layerLeft = Math.round(node.x);
   let layerBottom = Math.round(node.y + node.height);
@@ -411,30 +419,56 @@ async function buildLayer(node: ExportNodeData): Promise<Layer> {
   }
 
   const isTextLayer = !!(node.textInfo && node.textInfo.characters);
-  if (node.imageBase64) {
+  const hasPsdTextMetadata = isTextLayer && (node.textInfo!.bounds != null || node.textInfo!.boundingBox != null);
+  const isMultilineNoMeta = isTextLayer && !hasPsdTextMetadata && (() => {
+    const fs = node.textInfo!.styles?.[0]?.fontSize ?? 16;
+    const estCW = Math.max(1, fs * 0.6 * node.textInfo!.characters.length);
+    return estCW > node.width * 1.1;
+  })();
+  const shouldUseTextCanvas = isTextLayer && (hasPsdTextMetadata || isMultilineNoMeta);
+  if (node.imageBase64 && !(isTextLayer && !shouldUseTextCanvas)) {
     try {
       const pngBytes = base64ToUint8Array(node.imageBase64);
       const rawCanvas = await pngToCanvas(pngBytes);
       if (isTextLayer) {
-        // ag-psd 写 PSD 时用 canvas.width/height 重写 layer.right/bottom（忽略我们设的值）。
-        // 我们已根据 transform + boundingBox 算出准确的 layerLeft/Top/Right/Bottom（floor/ceil），
-        // 这里需要让 canvas 尺寸 = intendedW × intendedH，让 ag-psd 写出的 right/bottom 与我们设的一致。
-        // 策略：trim 字符像素 → 创建 intended 尺寸的新 canvas → 把字符像素 padding 到中心对应位置。
         const intendedW = Math.max(1, layerRight - layerLeft);
         const intendedH = Math.max(1, layerBottom - layerTop);
-        const trimmed = trimCanvasTransparent(rawCanvas).canvas;
-        if (trimmed.width === intendedW && trimmed.height === intendedH) {
-          layer.canvas = trimmed;
+        if (isMultilineNoMeta) {
+          // MasterGo exportAsync 返回的 PNG 基于 absoluteRenderBounds（实际字符墨水范围），
+          // 它的左上角 = absoluteRenderBounds.{x,y} = node.{x,y} + {dx,dy}
+          const rbo = node.textInfo?.renderBoundsOffset;
+          layer.canvas = rawCanvas;
+          if (rbo) {
+            const canvasLeft = Math.round(node.x + rbo.dx);
+            const canvasTop = Math.round(node.y + rbo.dy);
+            layerLeft = canvasLeft;
+            layerTop = canvasTop;
+            layerRight = canvasLeft + rawCanvas.width;
+            layerBottom = canvasTop + rawCanvas.height;
+            layer.left = layerLeft;
+            layer.top = layerTop;
+            layer.right = layerRight;
+            layer.bottom = layerBottom;
+          } else {
+            layerRight = layerLeft + rawCanvas.width;
+            layerBottom = layerTop + rawCanvas.height;
+            layer.right = layerRight;
+            layer.bottom = layerBottom;
+          }
         } else {
-          // 居中放置 trimmed 字符像素到 intended 尺寸 canvas
-          const padded = document.createElement('canvas');
-          padded.width = intendedW;
-          padded.height = intendedH;
-          const pctx = padded.getContext('2d')!;
-          const offsetX = Math.max(0, Math.floor((intendedW - trimmed.width) / 2));
-          const offsetY = Math.max(0, Math.floor((intendedH - trimmed.height) / 2));
-          pctx.drawImage(trimmed, offsetX, offsetY);
-          layer.canvas = padded;
+          const trimmed = trimCanvasTransparent(rawCanvas).canvas;
+          if (trimmed.width === intendedW && trimmed.height === intendedH) {
+            layer.canvas = trimmed;
+          } else {
+            const padded = document.createElement('canvas');
+            padded.width = intendedW;
+            padded.height = intendedH;
+            const pctx = padded.getContext('2d')!;
+            const offsetX = Math.max(0, Math.floor((intendedW - trimmed.width) / 2));
+            const offsetY = Math.max(0, Math.floor((intendedH - trimmed.height) / 2));
+            pctx.drawImage(trimmed, offsetX, offsetY);
+            layer.canvas = padded;
+          }
         }
       } else if (node.psdExpandOffset != null && node.psdExpandOffset > 0) {
         // Import 时为容纳 stroke 像素把位图扩展了 psdExpandOffset 像素，
@@ -453,6 +487,69 @@ async function buildLayer(node: ExportNodeData): Promise<Layer> {
         layer.canvas = rawCanvas;
       }
     } catch { /* leave without image data */ }
+  }
+
+  if (parentClipRect && layer.canvas) {
+    const clipLeft = parentClipRect.x;
+    const clipTop = parentClipRect.y;
+    const clipRight = parentClipRect.x + parentClipRect.width;
+    const clipBottom = parentClipRect.y + parentClipRect.height;
+    const canvasLeft = layerLeft;
+    const canvasTop = layerTop;
+    const canvasRight = layerLeft + layer.canvas.width;
+    const canvasBottom = layerTop + layer.canvas.height;
+    const needsClip = canvasLeft < clipLeft || canvasTop < clipTop ||
+                      canvasRight > clipRight || canvasBottom > clipBottom;
+    const cr = parentClipRect.cornerRadii;
+    const hasRoundedCorners = cr && (cr.topLeft > 0 || cr.topRight > 0 || cr.bottomLeft > 0 || cr.bottomRight > 0);
+    if (needsClip || hasRoundedCorners) {
+      const newLeft = Math.max(canvasLeft, clipLeft);
+      const newTop = Math.max(canvasTop, clipTop);
+      const newRight = Math.min(canvasRight, clipRight);
+      const newBottom = Math.min(canvasBottom, clipBottom);
+      const newW = Math.max(0, newRight - newLeft);
+      const newH = Math.max(0, newBottom - newTop);
+      if (newW > 0 && newH > 0) {
+        const clipped = document.createElement('canvas');
+        clipped.width = newW;
+        clipped.height = newH;
+        const cctx = clipped.getContext('2d')!;
+        if (hasRoundedCorners) {
+          const rx = newLeft - clipLeft;
+          const ry = newTop - clipTop;
+          const rw = parentClipRect.width;
+          const rh = parentClipRect.height;
+          const tl = cr!.topLeft, tr = cr!.topRight, bl = cr!.bottomLeft, br = cr!.bottomRight;
+          cctx.beginPath();
+          cctx.moveTo(-rx + tl, -ry);
+          cctx.lineTo(-rx + rw - tr, -ry);
+          cctx.arcTo(-rx + rw, -ry, -rx + rw, -ry + tr, tr);
+          cctx.lineTo(-rx + rw, -ry + rh - br);
+          cctx.arcTo(-rx + rw, -ry + rh, -rx + rw - br, -ry + rh, br);
+          cctx.lineTo(-rx + bl, -ry + rh);
+          cctx.arcTo(-rx, -ry + rh, -rx, -ry + rh - bl, bl);
+          cctx.lineTo(-rx, -ry + tl);
+          cctx.arcTo(-rx, -ry, -rx + tl, -ry, tl);
+          cctx.closePath();
+          cctx.clip();
+        }
+        const srcX = newLeft - canvasLeft;
+        const srcY = newTop - canvasTop;
+        cctx.drawImage(layer.canvas as any, srcX, srcY, newW, newH, 0, 0, newW, newH);
+        layer.canvas = clipped;
+        layerLeft = newLeft;
+        layerTop = newTop;
+        layerRight = newRight;
+        layerBottom = newBottom;
+        layer.left = newLeft;
+        layer.top = newTop;
+        layer.right = newRight;
+        layer.bottom = newBottom;
+      } else {
+        delete layer.canvas;
+        layer.hidden = true;
+      }
+    }
   }
 
   if (node.textInfo && node.textInfo.characters) {
@@ -600,49 +697,112 @@ async function buildLayer(node: ExportNodeData): Promise<Layer> {
         paragraphStyle: fullParagraphStyle,
       };
     } else {
-      const boxBoundsTop = ti.bounds?.top ?? -fontSize * 0.097;
-      const ty = node.y - boxBoundsTop;
-      const boundsBottom = ti.bounds?.bottom ?? node.height;
-      const boundsLeft = ti.bounds?.left ?? 0;
-      const boundsRight = ti.bounds?.right ?? node.width;
-      const bboxTop = ti.boundingBox?.top ?? -fontSize * 0.016;
-      const bboxBottom = ti.boundingBox?.bottom ?? fontSize * 1.97;
-      const bboxLeft = ti.boundingBox?.left ?? 0;
-      const bboxRight = ti.boundingBox?.right ?? node.width;
-      layer.text = {
-        text: ti.characters,
-        transform: [1, 0, 0, 1, node.x, ty],
-        orientation: 'horizontal',
-        antiAlias: 'sharp',
-        left: node.x,
-        top: ty,
-        right: node.x + node.width,
-        bottom: ty + node.height,
-        gridding: 'none',
-        shapeType: 'box',
-        boxBounds: [0, 0, node.width, node.height],
-        bounds: {
-          top: { units: 'Points' as any, value: boxBoundsTop },
-          left: { units: 'Points' as any, value: boundsLeft },
-          right: { units: 'Points' as any, value: boundsRight },
-          bottom: { units: 'Points' as any, value: boundsBottom },
-        },
-        boundingBox: {
-          top: { units: 'Points' as any, value: bboxTop },
-          left: { units: 'Points' as any, value: bboxLeft },
-          right: { units: 'Points' as any, value: bboxRight },
-          bottom: { units: 'Points' as any, value: bboxBottom },
-        },
-        style: baseStyle,
-        paragraphStyle: fullParagraphStyle,
-      };
+      const hasMetadata = ti.bounds != null || ti.boundingBox != null;
+      // 估算字符总宽度（CJK / 数字 / 拉丁混合按 fontSize * 0.6 估算单字符宽度）
+      const estCharWidth = Math.max(1, fontSize * 0.6 * ti.characters.length);
+      // 是否需要换行：估算总宽度超过文本框宽度（含 stretch 文本除外）
+      const needsWrap = !hasMetadata && estCharWidth > node.width * 1.1;
+      if (!hasMetadata && !needsWrap) {
+        // 单行文本：使用 point 文本（shapeType='point'）
+        // - 不依赖 boxBounds，避免 PS update 后基于 box 重算位置漂移
+        // - PS 对 point 文本按 paragraphStyle.justification 解读 transform.tx：
+        //   CENTER 时 tx 是字符水平中心；LEFT 时 tx 是字符左边；RIGHT 时 tx 是字符右边
+        let anchorX = node.x;
+        if (ti.alignment === 'CENTER') {
+          anchorX = node.x + node.width / 2;
+        } else if (ti.alignment === 'RIGHT') {
+          anchorX = node.x + node.width;
+        }
+        const halfW = estCharWidth / 2;
+        // MasterGo 中文本节点 wh 表示文本框可视尺寸，字符视觉垂直居中在 bbox 内。
+        // PSD point 文本 transform.ty 是 baseline 位置：
+        //   baseline = node.y + node.height/2 + fontSize*0.357
+        // 其中 0.357 来自 PSD 默认字体度量 (ascent≈0.857, descent≈0.143)：
+        //   字符高度 ≈ fontSize（cap top 到 baseline 之间），字符视觉中心到 baseline ≈ fontSize*0.357
+        const ascent = fontSize * 0.857;
+        const anchorY = node.y + node.height / 2 + fontSize * 0.357;
+        let boundsLeft = -halfW, boundsRight = halfW;
+        if (ti.alignment === 'LEFT' || ti.alignment === 'JUSTIFIED') {
+          boundsLeft = 0; boundsRight = estCharWidth;
+        } else if (ti.alignment === 'RIGHT') {
+          boundsLeft = -estCharWidth; boundsRight = 0;
+        }
+        layer.text = {
+          text: ti.characters,
+          transform: [1, 0, 0, 1, anchorX, anchorY],
+          orientation: 'horizontal',
+          antiAlias: 'sharp',
+          gridding: 'none',
+          shapeType: 'point',
+          pointBase: [0, 0],
+          left: 0,
+          top: 0,
+          right: 0,
+          bottom: 0,
+          bounds: {
+            top: { units: 'Points' as any, value: -fontSize * 0.857 },
+            left: { units: 'Points' as any, value: boundsLeft },
+            right: { units: 'Points' as any, value: boundsRight },
+            bottom: { units: 'Points' as any, value: fontSize * 0.514 },
+          },
+          boundingBox: {
+            top: { units: 'Points' as any, value: -fontSize * 0.776 },
+            left: { units: 'Points' as any, value: boundsLeft },
+            right: { units: 'Points' as any, value: boundsRight },
+            bottom: { units: 'Points' as any, value: fontSize * 0.240 },
+          },
+          style: baseStyle,
+          paragraphStyle: fullParagraphStyle,
+        };
+      } else if (!hasMetadata && needsWrap) {
+        // 多行文本：使用 MasterGo 渲染的 PNG canvas，跳过矢量 layer.text
+        // 避免 PS 字体不匹配（如 Noto Sans 缺少 Regular 字重）导致换行/行间距与 MasterGo 不一致
+      } else {
+        // 有 PSD 元数据时走原 box 文本路径（保留 PSD import 还原能力）
+        const boxBoundsTop = ti.bounds?.top ?? -fontSize * 0.097;
+        const ty = node.y - boxBoundsTop;
+        const boundsBottom = ti.bounds?.bottom ?? node.height;
+        const boundsLeft = ti.bounds?.left ?? 0;
+        const boundsRight = ti.bounds?.right ?? node.width;
+        const bboxTop = ti.boundingBox?.top ?? -fontSize * 0.016;
+        const bboxBottom = ti.boundingBox?.bottom ?? fontSize * 1.97;
+        const bboxLeft = ti.boundingBox?.left ?? 0;
+        const bboxRight = ti.boundingBox?.right ?? node.width;
+        layer.text = {
+          text: ti.characters,
+          transform: [1, 0, 0, 1, node.x, ty],
+          orientation: 'horizontal',
+          antiAlias: 'sharp',
+          left: node.x,
+          top: ty,
+          right: node.x + node.width,
+          bottom: ty + node.height,
+          gridding: 'none',
+          shapeType: 'box',
+          boxBounds: [0, 0, node.width, node.height],
+          bounds: {
+            top: { units: 'Points' as any, value: boxBoundsTop },
+            left: { units: 'Points' as any, value: boundsLeft },
+            right: { units: 'Points' as any, value: boundsRight },
+            bottom: { units: 'Points' as any, value: boundsBottom },
+          },
+          boundingBox: {
+            top: { units: 'Points' as any, value: bboxTop },
+            left: { units: 'Points' as any, value: bboxLeft },
+            right: { units: 'Points' as any, value: bboxRight },
+            bottom: { units: 'Points' as any, value: bboxBottom },
+          },
+          style: baseStyle,
+          paragraphStyle: fullParagraphStyle,
+        };
+      }
     }
 
-    if (ti.textIndex != null) {
+    if (ti.textIndex != null && layer.text) {
       layer.text.index = ti.textIndex;
     }
 
-    if (ti.styles.length > 1) {
+    if (ti.styles.length > 1 && layer.text) {
       // styleRuns 的 fontSize 也是 unscaled（与 baseStyle 一致），由 transform 的 sy 决定视觉字号
       const syForStyles = ti.transformScale != null && Number.isFinite(ti.transformScale) && ti.transformScale > 0
         ? ti.transformScale : 1;
@@ -670,10 +830,10 @@ async function buildLayer(node: ExportNodeData): Promise<Layer> {
 
   }
 
-  if (node.isInstance && node.imageBase64) {
-    const id = `smart-${node.id}`;
+  if (node.isInstance && node.imageBase64 && !(node.children && node.children.length > 0)) {
+    // 仅叶子 instance（无 children）作为 smart object，有 children 的展开为 group
     layer.placedLayer = {
-      id,
+      id: nodeIdToGuid(node.id),
       type: 'raster',
       transform: [
         node.x, node.y,
@@ -687,18 +847,23 @@ async function buildLayer(node: ExportNodeData): Promise<Layer> {
   }
 
   if (node.children && node.children.length > 0) {
+    // ag-psd 不允许同时有 canvas 和 children，展开为 group 时清除 canvas/placedLayer
+    if (layer.canvas) delete layer.canvas;
+    if (layer.placedLayer) delete layer.placedLayer;
+
+    // 如果当前 frame 设置了 clipsContent，把它作为 clip rect 传递给子节点
+    // （MasterGo frame.clipsContent 决定子节点是否被 frame bbox 裁剪，
+    //  PSD 没有 frame clip 概念，需要在生成 canvas 时手动裁剪）
+    const childClipRect = node.clipsContent
+      ? { x: node.x, y: node.y, width: node.width, height: node.height, cornerRadii: node.cornerRadii }
+      : (parentClipRect ?? null);
     layer.children = [];
     for (const child of node.children) {
-      layer.children.push(await buildLayer(child));
+      layer.children.push(await buildLayer(child, childClipRect));
     }
     layer.opened = true;
 
-    // PSD 标准：group layer 自身不渲染图像（PS 用 sectionDivider 标记 group 范围），
-    // group layer 的 top/left/right/bottom 字段在 PSD spec 中应为 [0,0,0,0]。
-    // ag-psd 在 getLayerChannels 中对没有 canvas/imageData 的 layer 会强制 right=left, bottom=top,
-    // 这就导致原本 [281,1258,797,1422] 被写成 [281,1258,281,1258]（零面积但 left/top 非零）。
-    // PS 看到 group 有 effects + 非 0 起点的零面积 bbox 时会报 "settings are invalid"。
-    // 与原始 PSD 一致（原始 group bbox=[0,0,0,0]）才能让 PS 正常读取。
+    // PSD 标准：group layer 自身不渲染图像，bbox 应为 [0,0,0,0]。
     layer.left = 0;
     layer.top = 0;
     layer.right = 0;
@@ -729,10 +894,31 @@ export async function buildAndDownloadPsd(
 
   onProgress(88, '生成 PSD 文件...');
 
+  // 手动按 layer 顺序叠加生成 composite，让 PS 打开时显示正确的预览
+  // ag-psd 不会从 layers 自动合成，必须显式提供
+  const compCanvas = document.createElement('canvas');
+  compCanvas.width = width;
+  compCanvas.height = height;
+  const compCtx = compCanvas.getContext('2d')!;
+  function paintLayerToComposite(layers: Layer[]): void {
+    for (const l of layers) {
+      if (l.hidden) continue;
+      if (l.children && l.children.length > 0) {
+        paintLayerToComposite(l.children);
+      } else if ((l as any).canvas && (l.left != null) && (l.top != null)) {
+        compCtx.globalAlpha = l.opacity ?? 1;
+        compCtx.drawImage((l as any).canvas, l.left, l.top);
+        compCtx.globalAlpha = 1;
+      }
+    }
+  }
+  paintLayerToComposite(children);
+
   const psd: Psd = {
     width,
     height,
     children,
+    canvas: compCanvas,
   };
 
   // Preserve the original PSD's engineData (Txt2 block, base64) so PS can correctly associate

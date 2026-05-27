@@ -210,6 +210,16 @@ export interface ExportTextInfo {
   multiStrokeIndex?: number;
   /** Total number of clones in the multi-stroke group. */
   multiStrokeTotal?: number;
+  /** Offset of absoluteRenderBounds vs absoluteBoundingBox for text PNG.
+   * Used to position MasterGo-rendered text PNG correctly within PSD layer bbox. */
+  renderBoundsOffset?: {
+    dx: number;
+    dy: number;
+    w: number;
+    h: number;
+    nodeW: number;
+    nodeH: number;
+  };
 }
 
 export interface ExportEffectInfo {

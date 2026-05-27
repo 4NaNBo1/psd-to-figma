@@ -428,6 +428,14 @@ function countNodes(node: any): number {
 
 const MAX_DEPTH = 50;
 
+// 读取节点的"可见"属性：兼容 MasterGo (`isVisible`) 和 Figma (`visible`)。
+// 两者都可能返回 undefined，此时按 true 处理（与 figma 默认值一致）。
+function getNodeVisible(node: any): boolean {
+  if (typeof node.isVisible === 'boolean') return node.isVisible;
+  if (typeof node.visible === 'boolean') return node.visible;
+  return true;
+}
+
 async function serializeNode(
   node: any,
   parentX: number,
@@ -437,6 +445,7 @@ async function serializeNode(
   processed: { count: number },
   total: number,
   depth: number = 0,
+  parentVisible: boolean = true,
 ): Promise<ExportNodeData | null> {
   if (!node || typeof node !== 'object') return null;
   if (depth > MAX_DEPTH) {
@@ -487,6 +496,11 @@ async function serializeNode(
   const relX = absX - parentX;
   const relY = absY - parentY;
 
+  // MasterGo 的可见性属性是 isVisible（Figma 是 visible）；隐藏父节点会让子树视觉上不可见
+  // 但子节点的 isVisible 仍为 true，导出时必须显式继承父级 visible，否则 PSD 中所有节点都会显示。
+  const selfVisible = getNodeVisible(node);
+  const effectiveVisible = selfVisible && parentVisible;
+
   const data: ExportNodeData = {
     id: node.id,
     name: node.name ?? 'Unnamed',
@@ -497,7 +511,7 @@ async function serializeNode(
     height: node.height ?? 0,
     opacity: node.opacity ?? 1,
     blendMode: node.blendMode ?? 'NORMAL',
-    visible: node.visible !== false,
+    visible: effectiveVisible,
     clipsContent: node.clipsContent === true,
     isMask: node.isMask === true,
     isInstance: nodeType === 'instance',
@@ -505,7 +519,6 @@ async function serializeNode(
     strokes: [],
     effects: [],
   };
-
   if (nodeType === 'text') {
     data.textInfo = extractTextInfo(node);
     if (data.textInfo) {
@@ -578,6 +591,20 @@ async function serializeNode(
     data.strokes = extractStrokes(node);
     data.effects = extractEffects(node);
     data.imageBase64 = await exportNodeImage(node, { withoutStrokesAndEffects: true });
+    try {
+      const abb = node.absoluteBoundingBox;
+      const arb = node.absoluteRenderBounds;
+      if (abb && arb && data.textInfo) {
+        data.textInfo.renderBoundsOffset = {
+          dx: arb.x - abb.x,
+          dy: arb.y - abb.y,
+          w: arb.width,
+          h: arb.height,
+          nodeW: abb.width,
+          nodeH: abb.height,
+        };
+      }
+    } catch { /* ignore */ }
     onLog('info', `Text "${node.name}": ${data.textInfo?.characters.length ?? 0} chars`);
   } else if (nodeType === 'instance') {
     data.fills = extractFills(node);
@@ -590,7 +617,9 @@ async function serializeNode(
     if ('children' in node && node.children && Array.isArray(node.children)) {
       data.children = [];
       for (const child of node.children) {
-        const childData = await serializeNode(child, absX, absY, onLog, onProgress, processed, total, depth + 1);
+        // 传画布原点（parentX/Y）保持不变，让所有节点的 data.x/y 都是相对画布原点的绝对偏移。
+        // PSD layer.left/top 要求绝对坐标，group bbox=[0,0,0,0] 不影响子节点位置。
+        const childData = await serializeNode(child, parentX, parentY, onLog, onProgress, processed, total, depth + 1, effectiveVisible);
         if (childData) data.children.push(childData);
       }
     }
@@ -603,7 +632,7 @@ async function serializeNode(
     if ('children' in node && node.children && Array.isArray(node.children)) {
       data.children = [];
       for (const child of node.children) {
-        const childData = await serializeNode(child, absX, absY, onLog, onProgress, processed, total, depth + 1);
+        const childData = await serializeNode(child, parentX, parentY, onLog, onProgress, processed, total, depth + 1, effectiveVisible);
         if (childData) data.children.push(childData);
       }
     }
