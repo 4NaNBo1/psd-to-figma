@@ -38,6 +38,226 @@ function toColor(c: Color | undefined): SerializedColor {
   return { r: 0, g: 0, b: 0, a: 1 };
 }
 
+// ── 调整图层像素处理 ──────────────────────────────────
+// PS 调整图层（hue/saturation, brightness/contrast, vibrance 等）通过 clipping
+// 蒙版修改基底图层的像素颜色。Figma/MasterGo 不支持调整图层，因此在解析时
+// 直接将调整效果应用到基底图层的 imageData 上。
+
+function rgbToHsl(r: number, g: number, b: number): [number, number, number] {
+  r /= 255; g /= 255; b /= 255;
+  const max = Math.max(r, g, b), min = Math.min(r, g, b);
+  const l = (max + min) / 2;
+  if (max === min) return [0, 0, l];
+  const d = max - min;
+  const s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
+  let h: number;
+  if (max === r) h = ((g - b) / d + (g < b ? 6 : 0)) / 6;
+  else if (max === g) h = ((b - r) / d + 2) / 6;
+  else h = ((r - g) / d + 4) / 6;
+  return [h, s, l];
+}
+
+function hslToRgb(h: number, s: number, l: number): [number, number, number] {
+  if (s === 0) { const v = Math.round(l * 255); return [v, v, v]; }
+  const hue2rgb = (p: number, q: number, t: number) => {
+    if (t < 0) t += 1; if (t > 1) t -= 1;
+    if (t < 1 / 6) return p + (q - p) * 6 * t;
+    if (t < 1 / 2) return q;
+    if (t < 2 / 3) return p + (q - p) * (2 / 3 - t) * 6;
+    return p;
+  };
+  const q = l < 0.5 ? l * (1 + s) : l + s - l * s;
+  const p = 2 * l - q;
+  return [
+    Math.round(hue2rgb(p, q, h + 1 / 3) * 255),
+    Math.round(hue2rgb(p, q, h) * 255),
+    Math.round(hue2rgb(p, q, h - 1 / 3) * 255),
+  ];
+}
+
+function applyHueSaturation(
+  data: Uint8ClampedArray | Uint8Array, w: number, h: number,
+  adj: { master?: { hue?: number; saturation?: number; lightness?: number } }
+): void {
+  const hueShift = ((adj.master?.hue ?? 0) / 360);
+  const satShift = (adj.master?.saturation ?? 0) / 100;
+  const lightShift = (adj.master?.lightness ?? 0) / 100;
+  if (hueShift === 0 && satShift === 0 && lightShift === 0) return;
+  for (let i = 0; i < w * h * 4; i += 4) {
+    if (data[i + 3] === 0) continue;
+    let [hv, sv, lv] = rgbToHsl(data[i], data[i + 1], data[i + 2]);
+    hv = ((hv + hueShift) % 1 + 1) % 1;
+    sv = Math.max(0, Math.min(1, sv + satShift));
+    lv = Math.max(0, Math.min(1, lv + lightShift));
+    const [nr, ng, nb] = hslToRgb(hv, sv, lv);
+    data[i] = nr; data[i + 1] = ng; data[i + 2] = nb;
+  }
+}
+
+function applyBrightnessContrast(
+  data: Uint8ClampedArray | Uint8Array, w: number, h: number,
+  adj: { brightness?: number; contrast?: number }
+): void {
+  const brightness = adj.brightness ?? 0;
+  const contrast = adj.contrast ?? 0;
+  if (brightness === 0 && contrast === 0) return;
+  const factor = (259 * (contrast + 255)) / (255 * (259 - contrast));
+  for (let i = 0; i < w * h * 4; i += 4) {
+    if (data[i + 3] === 0) continue;
+    for (let c = 0; c < 3; c++) {
+      let v = data[i + c] + brightness;
+      v = factor * (v - 128) + 128;
+      data[i + c] = Math.max(0, Math.min(255, Math.round(v)));
+    }
+  }
+}
+
+function applyVibrance(
+  data: Uint8ClampedArray | Uint8Array, w: number, h: number,
+  adj: { vibrance?: number; saturation?: number }
+): void {
+  const vib = (adj.vibrance ?? 0) / 100;
+  const sat = (adj.saturation ?? 0) / 100;
+  if (vib === 0 && sat === 0) return;
+  for (let i = 0; i < w * h * 4; i += 4) {
+    if (data[i + 3] === 0) continue;
+    let [hv, sv, lv] = rgbToHsl(data[i], data[i + 1], data[i + 2]);
+    if (sat !== 0) sv = Math.max(0, Math.min(1, sv + sat));
+    if (vib !== 0) {
+      const boost = vib * (1 - sv);
+      sv = Math.max(0, Math.min(1, sv + boost));
+    }
+    const [nr, ng, nb] = hslToRgb(hv, sv, lv);
+    data[i] = nr; data[i + 1] = ng; data[i + 2] = nb;
+  }
+}
+
+/**
+ * 提取调整图层 mask 在「基底层像素坐标系」下的逐像素 alpha 查询函数。
+ * 返回 null 表示无真实空间蒙版（应全图应用）。
+ * baseLeft/baseTop 为基底层文档坐标原点，用于把基底像素 (x,y) 映射到 mask 像素。
+ */
+function getMaskAlphaLookup(
+  mask: any, baseLeft: number, baseTop: number
+): ((x: number, y: number) => number) | null {
+  if (!mask || mask.disabled) return null;
+  const md = mask.imageData;
+  let maskPixels: Uint8ClampedArray | Uint8Array | Uint16Array | Float32Array | null = null;
+  let maskW = 0, maskH = 0;
+  if (md && md.width > 0 && md.height > 0) {
+    maskPixels = md.data;
+    maskW = md.width;
+    maskH = md.height;
+  } else if (mask.canvas && mask.canvas.width > 0) {
+    const cvs = mask.canvas as HTMLCanvasElement;
+    const mData = cvs.getContext('2d')!.getImageData(0, 0, cvs.width, cvs.height);
+    maskPixels = mData.data;
+    maskW = cvs.width;
+    maskH = cvs.height;
+  }
+  // 无像素数据 → 退化为全图（defaultColor），不是真实空间蒙版
+  if (!maskPixels || maskW === 0 || maskH === 0) return null;
+  const maskLeft = mask.left ?? 0;
+  const maskTop = mask.top ?? 0;
+  const defaultColor = mask.defaultColor ?? 255;
+  const stride = maskPixels.length === maskW * maskH ? 1 : 4;
+  return (x: number, y: number): number => {
+    const mx = baseLeft + x - maskLeft;
+    const my = baseTop + y - maskTop;
+    if (mx >= 0 && mx < maskW && my >= 0 && my < maskH) {
+      return Number(maskPixels![(my * maskW + mx) * stride]);
+    }
+    return defaultColor;
+  };
+}
+
+/**
+ * 把调整图层的真实空间蒙版序列化为紧凑结构（单通道 alpha base64 + 几何）。
+ * 无真实像素蒙版（空 mask / 全 defaultColor）返回 null，导出时不还原（与原始 no-op 等价）。
+ */
+function serializeAdjustmentMask(mask: any): {
+  left: number; top: number; width: number; height: number; defaultColor: number; dataB64: string;
+} | null {
+  if (!mask || mask.disabled) return null;
+  let pixels: Uint8ClampedArray | Uint8Array | Uint16Array | Float32Array | null = null;
+  let mW = 0, mH = 0;
+  if (mask.imageData && mask.imageData.width > 0 && mask.imageData.height > 0) {
+    pixels = mask.imageData.data;
+    mW = mask.imageData.width;
+    mH = mask.imageData.height;
+  } else if (mask.canvas && mask.canvas.width > 0) {
+    const cvs = mask.canvas as HTMLCanvasElement;
+    pixels = cvs.getContext('2d')!.getImageData(0, 0, cvs.width, cvs.height).data;
+    mW = cvs.width;
+    mH = cvs.height;
+  }
+  if (!pixels || mW === 0 || mH === 0) return null;
+  const stride = pixels.length === mW * mH ? 1 : 4;
+  // 抽取单通道 alpha
+  const single = new Uint8Array(mW * mH);
+  for (let i = 0; i < mW * mH; i++) single[i] = Math.max(0, Math.min(255, Math.round(Number(pixels[i * stride]))));
+  return {
+    left: mask.left ?? 0,
+    top: mask.top ?? 0,
+    width: mW,
+    height: mH,
+    defaultColor: mask.defaultColor ?? 255,
+    dataB64: uint8ArrayToBase64(single),
+  };
+}
+
+function applyAdjustmentLayers(baseLayer: Layer, clippedLayers: Layer[]): void {
+  if (!baseLayer.imageData || baseLayer.imageData.width === 0) return;
+  const data = baseLayer.imageData.data;
+  if (!(data instanceof Uint8ClampedArray) && !(data instanceof Uint8Array)) return;
+  const w = baseLayer.imageData.width;
+  const h = baseLayer.imageData.height;
+  const baseLeft = baseLayer.left ?? 0;
+  const baseTop = baseLayer.top ?? 0;
+
+  for (const clip of clippedLayers) {
+    const adj = (clip as any).adjustment;
+    if (!adj) continue;
+
+    const maskAlphaAt = getMaskAlphaLookup((clip as any).mask, baseLeft, baseTop);
+
+    // 有真实空间蒙版时：在副本上算出"全图应用"结果，再按 mask alpha 与原像素逐像素混合，
+    // 使调整只在蒙版生效区域生效（与 PS 行为一致）。无蒙版时直接原地全图应用（快路径）。
+    const target = maskAlphaAt ? new Uint8ClampedArray(data as Uint8ClampedArray) : (data as Uint8ClampedArray);
+    switch (adj.type) {
+      case 'hue/saturation':
+        applyHueSaturation(target, w, h, adj);
+        break;
+      case 'brightness/contrast':
+        applyBrightnessContrast(target, w, h, adj);
+        break;
+      case 'vibrance':
+        applyVibrance(target, w, h, adj);
+        break;
+    }
+
+    if (maskAlphaAt) {
+      for (let y = 0; y < h; y++) {
+        for (let x = 0; x < w; x++) {
+          const a = maskAlphaAt(x, y);
+          if (a >= 255) {
+            // 完全生效，直接拷贝（避免取整误差）
+            const i = (y * w + x) * 4;
+            data[i] = target[i]; data[i + 1] = target[i + 1]; data[i + 2] = target[i + 2];
+          } else if (a > 0) {
+            const i = (y * w + x) * 4;
+            const t = a / 255;
+            data[i] = Math.round(data[i] * (1 - t) + target[i] * t);
+            data[i + 1] = Math.round(data[i + 1] * (1 - t) + target[i + 1] * t);
+            data[i + 2] = Math.round(data[i + 2] * (1 - t) + target[i + 2] * t);
+          }
+          // a === 0：不应用，保持原像素
+        }
+      }
+    }
+  }
+}
+
 function determineLayerType(layer: Layer): LayerType {
   if (layer.children && layer.children.length > 0) return 'group';
   if (layer.text) return 'text';
@@ -1578,7 +1798,7 @@ async function compositeLayerEffects(
   // 3. 合成 fill（含 overlays/satin/bevel）到 dst
   const hasFullCoverageOverlay = !!(effects.solidFill && effects.solidFill.opacity >= 1) ||
     !!(effects.gradientOverlay && effects.gradientOverlay.opacity >= 1 &&
-       effects.gradientOverlay.opacityStops.every(s => s.opacity >= 1));
+      effects.gradientOverlay.opacityStops.every(s => s.opacity >= 1));
   for (let y = 0; y < srcH; y++) {
     for (let x = 0; x < srcW; x++) {
       const si = (y * srcW + x) * 4;
@@ -1752,6 +1972,36 @@ function serializeRawVectorData(layer: Layer): string | undefined {
   }
 }
 
+/**
+ * 把基底层「烘焙调整前的原始像素」按与正常图层相同的 mask + effects 合成路径编码为 base64 PNG。
+ * 用于 round-trip 导出：基底层用原始像素 + 加回调整图层，PS 应用一次 = 与原始 PSD 一致。
+ * 与 serializeLayer 主编码路径使用相同的 applyLayerMask / compositeLayerEffects，保证与烘焙版逐像素对齐（仅颜色不同）。
+ */
+async function encodeOriginalImageBase64(
+  origImageData: { data: Uint8ClampedArray; width: number; height: number },
+  layer: Layer,
+  fillOpacity: number,
+  effectBundle: LayerEffectBundle,
+  patternOverlayMeta: { id: string; scale: number; opacity: number; phaseX: number; phaseY: number } | null,
+  resolvedPatternData: { rgba: Uint8ClampedArray; w: number; h: number } | null,
+): Promise<string | undefined> {
+  try {
+    const masked = applyLayerMask(origImageData, layer);
+    const effective = masked ?? origImageData;
+    const needsComposite = hasAnyEffect(effectBundle) || !!patternOverlayMeta;
+    let png: Uint8Array;
+    if (needsComposite && origImageData.width > 0 && origImageData.height > 0) {
+      png = (await compositeLayerEffects(effective, fillOpacity, effectBundle, patternOverlayMeta, resolvedPatternData)).png;
+    } else {
+      png = await imageDataToPng(effective);
+    }
+    return uint8ArrayToBase64(png);
+  } catch (e) {
+    logger.warn(`Failed to encode original (pre-adjustment) image for "${layer.name}": ${e instanceof Error ? e.message : e}`);
+    return undefined;
+  }
+}
+
 async function serializeLayer(
   layer: Layer,
   images: Uint8Array[],
@@ -1761,7 +2011,14 @@ async function serializeLayer(
   parentTop: number,
   rootLeft?: number,
   rootTop?: number
-): Promise<SerializedLayer> {
+): Promise<SerializedLayer | null> {
+  // PS 调整图层（brightness/contrast, hue/saturation, vibrance 等）在 Figma/MasterGo
+  // 中无法表达。跳过序列化，避免它们作为空矩形出现在 clip group 中，
+  // 导致不必要的 clipping frame 裁剪掉基底图层的 shadow 等向外延伸效果。
+  if ((layer as any).adjustment) {
+    return null;
+  }
+
   const type = determineLayerType(layer);
 
   const bounds = getLayerBounds(layer);
@@ -1821,6 +2078,7 @@ async function serializeLayer(
     strokes: convertStrokes(layer.effects),
   };
 
+
   // 对所有有 effects 的图层（含 group 和 text）保留原始 effects 元数据，
   // 让 figma/mastergo→PSD 回转时能精确还原 contour/antialiased/range 等高级字段
   // （这些字段在简化的 SerializedShadow 中会丢失）。
@@ -1866,6 +2124,7 @@ async function serializeLayer(
     if (serialized.textData.docBoundsY != null) {
       serialized.textData.docBoundsY -= parentTop;
     }
+
 
     const solidFills = (layer.effects as any)?.solidFill;
     if (solidFills && serialized.textData) {
@@ -1948,12 +2207,8 @@ async function serializeLayer(
         if (expand > 0) {
           serialized.expandOffset = expand;
         }
-        // 保留原始 PSD effects 元数据，以便 figma/mastergo→PSD 还原所有高级效果
-        // （bevel/satin/glow/pattern/多 stroke 的 fillType=gradient 等），
-        // 因为下面 effects/strokes 会被清空。
         serialized.rawEffectsData = serializeRawPsdEffects(layer, layerFillOpacity);
         serialized.strokes = [];
-        // 已合成到位图的 effects 从 IR 中去除，避免重复
         serialized.effects = [];
         logger.info(`Layer "${layer.name}": composited with ${effectBundle.strokes.length} strokes, ${effectBundle.dropShadows.length} shadows, fillOpacity=${layerFillOpacity}, expand=${expand} (${serialized.width}x${serialized.height})`);
       } else {
@@ -1961,6 +2216,16 @@ async function serializeLayer(
         serialized.imageIndex = images.length;
         images.push(png);
         logger.info(`Layer "${layer.name}": encoded imageData (${effectiveImageData.width}x${effectiveImageData.height})`);
+      }
+
+      // round-trip：若该基底层有「烘焙调整前的原始像素」，额外编码原始 PNG 供导出还原。
+      const origData = (layer as any).__origImageDataBeforeAdjustment;
+      if (origData && origData.width > 0 && origData.height > 0) {
+        const origB64 = await encodeOriginalImageBase64(origData, layer, layerFillOpacity, effectBundle, patternOverlayMeta, resolvedPatternData);
+        if (origB64) {
+          serialized.rawPsdOriginalImage = origB64;
+          logger.info(`Layer "${layer.name}": saved pre-adjustment original image (${origData.width}x${origData.height}) for round-trip`);
+        }
       }
     } catch (e) {
       logger.warn(`Failed to encode imageData for "${layer.name}": ${e instanceof Error ? e.message : e}`);
@@ -1992,6 +2257,16 @@ async function serializeLayer(
         images.push(png);
         logger.info(`Layer "${layer.name}": encoded canvas${maskedCanvasData ? ' (masked)' : ''}`);
       }
+
+      // round-trip：若该基底层有「烘焙调整前的原始像素」，额外编码原始 PNG 供导出还原。
+      const origData = (layer as any).__origImageDataBeforeAdjustment;
+      if (origData && origData.width > 0 && origData.height > 0) {
+        const origB64 = await encodeOriginalImageBase64(origData, layer, layerFillOpacity, effectBundle, patternOverlayMeta, resolvedPatternData);
+        if (origB64) {
+          serialized.rawPsdOriginalImage = origB64;
+          logger.info(`Layer "${layer.name}": saved pre-adjustment original canvas (${origData.width}x${origData.height}) for round-trip`);
+        }
+      }
     } catch (e) {
       logger.warn(`Failed to encode canvas for "${layer.name}": ${e instanceof Error ? e.message : e}`);
     }
@@ -2002,10 +2277,75 @@ async function serializeLayer(
     serialized.children = [];
     const childParentLeft = isSubGroup ? parentLeft : absX;
     const childParentTop = isSubGroup ? parentTop : absY;
+
+    // 预处理：将 clipping 调整图层的色彩修改应用到基底图层的 imageData 上。
+    // PS 中调整图层通过 clipping 蒙版修改底层像素颜色（色相/饱和度/亮度等），
+    // Figma/MasterGo 无法表达这些调整，因此在解析阶段直接修改像素。
+    // 同时保存调整图层原始数据用于 round-trip 导出还原。
+    const baseAdjustmentsMap = new Map<Layer, string>();
+    for (let ci = 0; ci < layer.children.length; ci++) {
+      const base = layer.children[ci];
+      if (base.clipping) continue;
+      const adjustments: Layer[] = [];
+      for (let j = ci + 1; j < layer.children.length && layer.children[j].clipping; j++) {
+        if ((layer.children[j] as any).adjustment) {
+          adjustments.push(layer.children[j]);
+        }
+      }
+      if (adjustments.length > 0) {
+        // round-trip 方案：在烘焙调整效果到像素之前，克隆基底层原始像素。
+        // 导出时基底层用这份「未烘焙原始像素」+ 加回调整图层，PS 应用一次 = 与原始一致，
+        // 既保证视觉正确（不双重应用），又保留 PSD 调整图层结构。
+        const bdOrig: any = base.imageData;
+        if (bdOrig && bdOrig.data && bdOrig.width > 0 && bdOrig.height > 0) {
+          (base as any).__origImageDataBeforeAdjustment = {
+            data: new Uint8ClampedArray(bdOrig.data),
+            width: bdOrig.width,
+            height: bdOrig.height,
+          };
+        }
+        applyAdjustmentLayers(base, adjustments);
+        logger.info(`Applied ${adjustments.length} adjustment layers to "${base.name}": ${adjustments.map(a => (a as any).adjustment?.type).join(', ')}`);
+        baseAdjustmentsMap.set(base, JSON.stringify(
+          adjustments.map(a => ({
+            name: (a as any).name,
+            hidden: !!(a as any).hidden,
+            adjustment: (a as any).adjustment,
+            mask: serializeAdjustmentMask((a as any).mask),
+          }))
+        ));
+      }
+    }
+
     for (const child of layer.children) {
-      serialized.children.push(
-        await serializeLayer(child, images, onProgress, depth + 1, childParentLeft, childParentTop, effectiveRootLeft, effectiveRootTop)
-      );
+      const childSerialized = await serializeLayer(child, images, onProgress, depth + 1, childParentLeft, childParentTop, effectiveRootLeft, effectiveRootTop);
+      if (childSerialized) {
+        const adjJson = baseAdjustmentsMap.get(child);
+        if (adjJson) {
+          childSerialized.rawPsdAdjustments = adjJson;
+        }
+        serialized.children.push(childSerialized);
+      }
+    }
+
+    // PS 中 group 的 layer effects（stroke/shadow 等）会合成到整个 group 内容的
+    // 像素轮廓上。Figma/MasterGo 无法在 frame 上实现这种效果（frame stroke 只沿矩形边框）。
+    // 近似方案：将 group 的 enabled strokes/effects 下发给子节点。
+    if (isSubGroup && serialized.children.length > 0) {
+      const groupStrokes = serialized.strokes;
+      const groupEffects = serialized.effects;
+      if (groupStrokes.length > 0 || groupEffects.length > 0) {
+        for (const child of serialized.children) {
+          if (groupStrokes.length > 0) {
+            child.strokes = [...child.strokes, ...groupStrokes];
+          }
+          if (groupEffects.length > 0) {
+            child.effects = [...child.effects, ...groupEffects];
+          }
+        }
+        serialized.strokes = [];
+        serialized.effects = [];
+      }
     }
   }
 
@@ -2044,9 +2384,10 @@ export async function parsePsdFile(
         message: `Processing layer ${i + 1}/${total}: ${layerName}`,
       });
 
-      layers.push(
-        await serializeLayer(psd.children[i], images, onProgress, 0, 0, 0)
-      );
+      const serializedLayer = await serializeLayer(psd.children[i], images, onProgress, 0, 0, 0);
+      if (serializedLayer) {
+        layers.push(serializedLayer);
+      }
     }
   }
 

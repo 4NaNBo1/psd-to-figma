@@ -130,6 +130,18 @@ export interface SerializedLayer {
    * 矢量属性会丢失。保留这份数据让 figma/mastergo → PSD 回转时还原矢量形状。
    */
   rawVectorData?: string;
+  /**
+   * 原始 PSD 调整图层数据（clipping 在 base 层上的 adjustment layers）的 JSON 序列化。
+   * 导入时效果已烘焙到基底像素，此字段用于 round-trip 导出时还原调整图层。
+   */
+  rawPsdAdjustments?: string;
+  /**
+   * 基底层「烘焙调整前的原始像素」的 base64 PNG。
+   * 仅当该层带调整图层（rawPsdAdjustments）时存在。
+   * 导出时基底层用这份原始像素 + 加回调整图层，PS 应用一次 = 与原始一致，
+   * 避免「烘焙像素 + 再叠加调整图层」的双重应用（颜色偏移）。
+   */
+  rawPsdOriginalImage?: string;
 }
 
 export interface SerializedPsd {
@@ -273,6 +285,16 @@ export interface ExportNodeData {
    * appearance 面板的 Fill/Stroke/圆角等矢量属性。
    */
   rawPsdVectorData?: string;
+  /**
+   * 从节点 setPluginData('psd_adjustments', ...) 读出的原始 PSD 调整图层数据。
+   * 导出 PSD 时在 base 层之后还原为 clipping 调整图层。
+   */
+  rawPsdAdjustments?: string;
+  /**
+   * 从节点 setPluginData('psd_original_image', ...) 读出的基底层「烘焙调整前原始像素」base64 PNG。
+   * 导出时用它替换基底层位图，再加回调整图层，避免调整双重应用导致的颜色偏移。
+   */
+  rawPsdOriginalImage?: string;
 }
 
 export interface ExportSelectionInfo {

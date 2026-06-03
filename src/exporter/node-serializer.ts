@@ -106,7 +106,7 @@ function extractFills(node: any): ExportFillInfo[] {
         },
       }));
       if (fill.gradientTransform) {
-        const [[a, , ], [, , ]] = fill.gradientTransform;
+        const [[a, ,], [, ,]] = fill.gradientTransform;
         info.gradientAngle = Math.atan2(a, 1) * (180 / Math.PI);
       }
       info.opacity = fill.opacity ?? 1;
@@ -380,6 +380,16 @@ async function exportNodeImage(node: any, options?: { withoutStrokesAndEffects?:
     scale = MAX_IMAGE_DIMENSION / Math.max(w, h);
   }
 
+  // MasterGo/Figma 对不可见节点 exportAsync 可能返回空数据，
+  // 临时设为可见再导出，导出后恢复原始可见性。
+  let wasHidden = false;
+  const visibleProp = typeof node.isVisible === 'boolean' ? 'isVisible' : 'visible';
+  if (node[visibleProp] === false) {
+    wasHidden = true;
+    try { node[visibleProp] = true; } catch { /* ignore */ }
+    await yieldThread();
+  }
+
   // For text layers, temporarily disable strokes/effects to get a tight character-bounded image,
   // matching PSD's native text layer canvas size (which doesn't include stroke extension).
   let savedStrokes: any[] | undefined;
@@ -407,6 +417,9 @@ async function exportNodeImage(node: any, options?: { withoutStrokesAndEffects?:
   } catch {
     return undefined;
   } finally {
+    if (wasHidden) {
+      try { node[visibleProp] = false; } catch { /* ignore */ }
+    }
     if (savedStrokes !== undefined) {
       try { node.strokes = savedStrokes; } catch { /* ignore */ }
     }
@@ -574,6 +587,13 @@ async function serializeNode(
           const v = parseFloat(psdTxStr);
           if (Number.isFinite(v)) data.textInfo.transformTx = v;
         }
+        // 原始 PSD 旋转角（度）。用于 export 重建旋转 transform 与旋转后的 layer bbox，
+        // 避免旋转文本退化为轴对齐 bbox 被 PS 裁剪。
+        const rotStr = getData('psd_transform_rotation');
+        if (rotStr) {
+          const v = parseFloat(rotStr);
+          if (Number.isFinite(v)) data.textInfo.rotation = v;
+        }
         // 多 stroke 文本组标记（导入端在多 stroke 文本克隆时写入）
         const msGroup = getData('psd_multi_stroke_group_id');
         const msIdx = getData('psd_multi_stroke_index');
@@ -654,7 +674,7 @@ async function serializeNode(
     data.cornerRadii = extractCornerRadii(node);
 
     const hasImageFill = data.fills.some(f => f.type === 'IMAGE' && f.visible);
-    if (hasImageFill) {
+    if (hasImageFill || !effectiveVisible) {
       data.imageBase64 = await exportNodeImage(node);
     }
   } else {
@@ -699,6 +719,27 @@ async function serializeNode(
       const vec = node.getPluginData('psd_vector_data');
       if (vec) {
         data.rawPsdVectorData = vec;
+      }
+    }
+  } catch { /* ignore */ }
+
+  // 读取 psd_adjustments：还原 PSD 调整图层（brightness/contrast, hue/saturation 等）
+  try {
+    if (typeof node.getPluginData === 'function') {
+      const adj = node.getPluginData('psd_adjustments');
+      if (adj) {
+        data.rawPsdAdjustments = adj;
+      }
+    }
+  } catch { /* ignore */ }
+
+  // 读取 psd_original_image：基底层「烘焙调整前原始像素」，导出时用它替换基底位图
+  // 再加回调整图层，避免调整双重应用（颜色偏移）。
+  try {
+    if (typeof node.getPluginData === 'function') {
+      const orig = node.getPluginData('psd_original_image');
+      if (orig) {
+        data.rawPsdOriginalImage = orig;
       }
     }
   } catch { /* ignore */ }
@@ -854,6 +895,27 @@ export async function serializeSelection(
   // 展开 importer 凭空添加的根外壳（Section / isRootFrame Frame），让 PSD 顶层结构
   // 与原始 PS 文件一致（不带这两层包裹）。展开后 totalNodes / bbox / serializeNode
   // 都基于展开后的 selection 计算。
+  // 在展开之前记住 root frame 的画布尺寸（原始 PSD 的 width/height）。
+  let psdCanvasWidth = 0;
+  let psdCanvasHeight = 0;
+  for (const node of rawSelection) {
+    try {
+      if (typeof node.getPluginData === 'function') {
+        if (node.type === 'SECTION' && node.getPluginData('psd_engine_data')) {
+          const rootFrame = Array.isArray(node.children) ? node.children.find((c: any) =>
+            typeof c.getPluginData === 'function' && c.getPluginData('psd_root_frame') === '1'
+          ) : null;
+          if (rootFrame) {
+            psdCanvasWidth = rootFrame.width ?? 0;
+            psdCanvasHeight = rootFrame.height ?? 0;
+          }
+        } else if (node.type === 'FRAME' && node.getPluginData('psd_root_frame') === '1') {
+          psdCanvasWidth = node.width ?? 0;
+          psdCanvasHeight = node.height ?? 0;
+        }
+      }
+    } catch { /* ignore */ }
+  }
   const selection = expandImportWrappers(rawSelection);
   if (selection.length === 0) {
     throw new Error('选中的节点展开后为空');
@@ -895,8 +957,8 @@ export async function serializeSelection(
 
   return {
     nodes,
-    width: Math.max(1, Math.round(maxX - minX)),
-    height: Math.max(1, Math.round(maxY - minY)),
+    width: psdCanvasWidth > 0 ? Math.round(psdCanvasWidth) : Math.max(1, Math.round(maxX - minX)),
+    height: psdCanvasHeight > 0 ? Math.round(psdCanvasHeight) : Math.max(1, Math.round(maxY - minY)),
     engineData,
   };
 }

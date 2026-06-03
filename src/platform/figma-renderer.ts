@@ -366,10 +366,6 @@ async function renderNode(
   onLog: LogFn,
   onNodeCreated: () => void
 ): Promise<SceneNode | null> {
-  if (!irNode.visible) {
-    return null;
-  }
-
   try {
     let node: SceneNode;
 
@@ -459,6 +455,12 @@ async function renderNode(
         }
         if (irNode.rawPsdVectorData) {
           try { rect.setPluginData('psd_vector_data', irNode.rawPsdVectorData); } catch { /* ignore */ }
+        }
+        if (irNode.rawPsdAdjustments) {
+          try { rect.setPluginData('psd_adjustments', irNode.rawPsdAdjustments); } catch { /* ignore */ }
+        }
+        if (irNode.rawPsdOriginalImage) {
+          try { rect.setPluginData('psd_original_image', irNode.rawPsdOriginalImage); } catch { /* ignore */ }
         }
 
         onNodeCreated();

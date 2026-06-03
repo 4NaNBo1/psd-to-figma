@@ -168,7 +168,7 @@ async function createStyledTextNode(
 ): Promise<{ node: any; linePadding: number }> {
   const text = mg.createText();
   text.name = irNode.name + nameSuffix;
-  text.visible = irNode.visible;
+  text.isVisible = irNode.visible;
   if (irNode.opacity !== 1) text.opacity = irNode.opacity;
   text.blendMode = irNode.blendMode;
   parent.appendChild(text);
@@ -273,7 +273,11 @@ async function createStyledTextNode(
 
   const linePadding = alignTextPosition(text, irNode, onLog, linePaddingOverride);
   if (tp.rotation) {
-    text.rotation = tp.rotation;
+    // MasterGo: 正值=顺时针；Figma/PSD: 正值=逆时针 → 取反
+    text.rotation = -tp.rotation;
+    // 保存原始 PSD 旋转角（度，PS 约定：正=逆时针），供 export 还原旋转 transform 与旋转后的
+    // layer bbox。不保存会让旋转文本导出时退化为轴对齐 bbox，PS 中渲染会被裁剪。
+    try { text.setPluginData('psd_transform_rotation', String(tp.rotation)); } catch { /* ignore */ }
   }
 
   if (tp.txOffsetX != null && Number.isFinite(tp.txOffsetX)) {
@@ -430,10 +434,6 @@ async function renderNode(
   onLog: LogFn,
   onNodeCreated: () => void
 ): Promise<any> {
-  if (!irNode.visible) {
-    return null;
-  }
-
   try {
     let node: any;
 
@@ -467,7 +467,7 @@ async function renderNode(
         frame.clipsContent = irNode.clipsContent;
         await applyFills(frame, irNode.fills, onLog, irNode.name);
         frame.name = irNode.name;
-        frame.visible = irNode.visible;
+        frame.isVisible = irNode.visible;
         if (irNode.opacity !== 1) frame.opacity = irNode.opacity;
         frame.blendMode = irNode.blendMode;
         parent.appendChild(frame);
@@ -508,7 +508,7 @@ async function renderNode(
         const rect = mg.createRectangle();
         safeResize(rect, irNode.width, irNode.height);
         rect.name = irNode.name;
-        rect.visible = irNode.visible;
+        rect.isVisible = irNode.visible;
         if (irNode.opacity !== 1) rect.opacity = irNode.opacity;
         rect.blendMode = irNode.blendMode;
         parent.appendChild(rect);
@@ -527,6 +527,12 @@ async function renderNode(
         }
         if (irNode.rawPsdVectorData) {
           try { rect.setPluginData('psd_vector_data', irNode.rawPsdVectorData); } catch { /* ignore */ }
+        }
+        if (irNode.rawPsdAdjustments) {
+          try { rect.setPluginData('psd_adjustments', irNode.rawPsdAdjustments); } catch { /* ignore */ }
+        }
+        if (irNode.rawPsdOriginalImage) {
+          try { rect.setPluginData('psd_original_image', irNode.rawPsdOriginalImage); } catch { /* ignore */ }
         }
 
         onNodeCreated();

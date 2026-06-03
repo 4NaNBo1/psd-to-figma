@@ -142,4 +142,15 @@ export interface IRNode {
    * 还原 PS 中 appearance 面板的 Fill/Stroke/圆角/精确坐标等矢量属性。
    */
   rawPsdVectorData?: string;
+  /**
+   * 原始 PSD 调整图层数据的 JSON 序列化（clipping 在 base 层上的 adjustment layers）。
+   * 导入时效果已烘焙到基底像素，此字段仅用于 round-trip 导出还原。
+   * renderer 写入 setPluginData('psd_adjustments', ...)。
+   */
+  rawPsdAdjustments?: string;
+  /**
+   * 基底层「烘焙调整前原始像素」的 base64 PNG（仅带调整图层的基底层有）。
+   * renderer 写入 setPluginData('psd_original_image', ...)，导出时用于还原原始像素 + 加回调整图层。
+   */
+  rawPsdOriginalImage?: string;
 }

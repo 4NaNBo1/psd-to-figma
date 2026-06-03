@@ -407,6 +407,8 @@ function buildShapeNode(
     rawPsdEffects: layer.rawEffectsData,
     psdExpandOffset: expand > 0 ? expand : undefined,
     rawPsdVectorData: layer.rawVectorData,
+    rawPsdAdjustments: layer.rawPsdAdjustments,
+    rawPsdOriginalImage: layer.rawPsdOriginalImage,
   };
 }
 
@@ -431,10 +433,11 @@ function buildChildrenWithClipping(
       const baseNode = buildLayerNode(child, images, depth);
       const clipChildren: IRNode[] = [baseNode];
 
+      const baseExpand = child.expandOffset ?? 0;
       for (const clippedLayer of clippedLayers) {
         const clippedNode = buildLayerNode(clippedLayer, images, depth);
-        clippedNode.x = clippedLayer.x - child.x;
-        clippedNode.y = clippedLayer.y - child.y;
+        clippedNode.x = clippedLayer.x - child.x + baseExpand;
+        clippedNode.y = clippedLayer.y - child.y + baseExpand;
         clipChildren.push(clippedNode);
       }
 

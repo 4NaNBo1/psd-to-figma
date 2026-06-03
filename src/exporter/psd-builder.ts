@@ -316,7 +316,7 @@ function buildEffects(node: ExportNodeData): {
   return Object.keys(result).length > 0 ? result : undefined;
 }
 
-async function buildLayer(node: ExportNodeData, parentClipRect?: { x: number; y: number; width: number; height: number; cornerRadii?: { topLeft: number; topRight: number; bottomLeft: number; bottomRight: number } } | null): Promise<Layer> {
+async function buildLayer(node: ExportNodeData, parentClipRect?: { x: number; y: number; width: number; height: number; cornerRadii?: { topLeft: number; topRight: number; bottomLeft: number; bottomRight: number } } | null): Promise<Layer | Layer[]> {
   let layerTop = Math.round(node.y);
   let layerLeft = Math.round(node.x);
   let layerBottom = Math.round(node.y + node.height);
@@ -361,10 +361,33 @@ async function buildLayer(node: ExportNodeData, parentClipRect?: { x: number; y:
     // PSD layer.bbox 标准：包含整个字符像素覆盖区。top/left 用 floor、right/bottom 用 ceil
     // 把浮点值整数化到包含原始浮点范围的最小整数 bbox（与原始 PSD 行为一致）。
     if (isPointText) {
-      layerTop = Math.floor(effTy + bboxForLayer.top * sy);
-      layerBottom = Math.ceil(effTy + bboxForLayer.bottom * sy);
-      layerLeft = Math.floor(effTxBase + bboxForLayer.left * sx);
-      layerRight = Math.ceil(effTxBase + bboxForLayer.right * sx);
+      // 旋转还原：原始 transform = [sx·cosθ, sx·sinθ, -sy·sinθ, sy·cosθ, tx, ty]，θ=-rotation。
+      // 把 boundingBox 四角经此矩阵变换到文档坐标，取 AABB 作为 layer bbox。
+      // 旋转时若仍用轴对齐 bbox（sx·left ... sy·bottom），bbox 会小于旋转后的实际像素范围，
+      // 导致 PS 渲染裁剪。无旋转时（θ=0）此公式退化为原来的轴对齐结果。
+      const rotDeg = tiForBbox.rotation != null && Number.isFinite(tiForBbox.rotation) ? tiForBbox.rotation : 0;
+      const theta = (-rotDeg * Math.PI) / 180;
+      const cosT = Math.cos(theta);
+      const sinT = Math.sin(theta);
+      const mA = sx * cosT, mB = sx * sinT, mC = -sx * sinT, mD = sy * cosT;
+      const bbL = bboxForLayer.left, bbR = bboxForLayer.right;
+      const bbT = bboxForLayer.top, bbB = bboxForLayer.bottom;
+      const corners: Array<[number, number]> = [
+        [bbL, bbT], [bbR, bbT], [bbR, bbB], [bbL, bbB],
+      ];
+      let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+      for (const [u, v] of corners) {
+        const dx = effTxBase + mA * u + mC * v;
+        const dy = effTy + mB * u + mD * v;
+        if (dx < minX) minX = dx;
+        if (dx > maxX) maxX = dx;
+        if (dy < minY) minY = dy;
+        if (dy > maxY) maxY = dy;
+      }
+      layerTop = Math.floor(minY);
+      layerBottom = Math.ceil(maxY);
+      layerLeft = Math.floor(minX);
+      layerRight = Math.ceil(maxX);
     } else {
       // box text: 用 bounds.top 算 ty (与原代码一致)
       const ty = node.y - (tiForBbox.bounds?.top ?? -fontSize * 0.097) * sy;
@@ -426,9 +449,12 @@ async function buildLayer(node: ExportNodeData, parentClipRect?: { x: number; y:
     return estCW > node.width * 1.1;
   })();
   const shouldUseTextCanvas = isTextLayer && (hasPsdTextMetadata || isMultilineNoMeta);
-  if (node.imageBase64 && !(isTextLayer && !shouldUseTextCanvas)) {
+  // round-trip：基底层若带「烘焙调整前原始像素」，用它替换烘焙后的位图。
+  // 这样导出时基底层是原始颜色，配合下方加回的调整图层，PS 应用一次 = 与原始 PSD 一致。
+  const effectiveImageBase64 = node.rawPsdOriginalImage ?? node.imageBase64;
+  if (effectiveImageBase64 && !(isTextLayer && !shouldUseTextCanvas)) {
     try {
-      const pngBytes = base64ToUint8Array(node.imageBase64);
+      const pngBytes = base64ToUint8Array(effectiveImageBase64);
       const rawCanvas = await pngToCanvas(pngBytes);
       if (isTextLayer) {
         const intendedW = Math.max(1, layerRight - layerLeft);
@@ -489,6 +515,15 @@ async function buildLayer(node: ExportNodeData, parentClipRect?: { x: number; y:
     } catch { /* leave without image data */ }
   }
 
+  // 隐藏节点若 exportAsync 失败（没有 canvas），创建与原始尺寸一致的透明 placeholder
+  // ag-psd 会用 canvas.width/height 重写 right/bottom，所以必须匹配原始尺寸。
+  if (!layer.canvas && layer.hidden && node.width > 0 && node.height > 0) {
+    const placeholder = document.createElement('canvas');
+    placeholder.width = Math.round(node.width);
+    placeholder.height = Math.round(node.height);
+    layer.canvas = placeholder;
+  }
+
   if (parentClipRect && layer.canvas) {
     const clipLeft = parentClipRect.x;
     const clipTop = parentClipRect.y;
@@ -499,7 +534,7 @@ async function buildLayer(node: ExportNodeData, parentClipRect?: { x: number; y:
     const canvasRight = layerLeft + layer.canvas.width;
     const canvasBottom = layerTop + layer.canvas.height;
     const needsClip = canvasLeft < clipLeft || canvasTop < clipTop ||
-                      canvasRight > clipRight || canvasBottom > clipBottom;
+      canvasRight > clipRight || canvasBottom > clipBottom;
     const cr = parentClipRect.cornerRadii;
     const hasRoundedCorners = cr && (cr.topLeft > 0 || cr.topRight > 0 || cr.bottomLeft > 0 || cr.bottomRight > 0);
     if (needsClip || hasRoundedCorners) {
@@ -669,9 +704,24 @@ async function buildLayer(node: ExportNodeData, parentClipRect?: { x: number; y:
       // 字号、transform 在文本 style 里以 unscaled 形式给出；PSD transform 的 sy 应用缩放
       const unscaledBaseStyle = baseStyle ? { ...baseStyle, fontSize: fontSizeUnscaled } : undefined;
 
+      // 旋转还原：原始 PSD transform = [sx·cosθ, sx·sinθ, -sx·sinθ, sy·cosθ, tx, ty]。
+      // import 时 rotation = atan2(c, a) ≈ -θ（PS 约定正=逆时针），故 θ = -rotation。
+      // 注意 b 与 c 都用 sx（PS 标准：单一旋转角，缩放沿轴；|b|=|c|=sx·sinθ），
+      // d 用 sy。若 c 误用 sy 会有约 0.2% 偏差，导致字符位置轻微偏移。
+      // 不还原旋转会让 transform 退化为 [sx,0,0,sy]，PS 中文本不旋转且 layer bbox（轴对齐）
+      // 比旋转后的实际像素范围小，导致渲染被裁剪。
+      const rotDeg = ti.rotation != null && Number.isFinite(ti.rotation) ? ti.rotation : 0;
+      const theta = (-rotDeg * Math.PI) / 180;
+      const cosT = Math.cos(theta);
+      const sinT = Math.sin(theta);
+      const mA = sx * cosT;
+      const mB = sx * sinT;
+      const mC = -sx * sinT;
+      const mD = sy * cosT;
+
       layer.text = {
         text: ti.characters,
-        transform: [sx, 0, 0, sy, txAdjusted, ty],
+        transform: [mA, mB, mC, mD, txAdjusted, ty],
         orientation: 'horizontal',
         antiAlias: 'sharp',
         gridding: 'none',
@@ -847,19 +897,35 @@ async function buildLayer(node: ExportNodeData, parentClipRect?: { x: number; y:
   }
 
   if (node.children && node.children.length > 0) {
+    const isClipGroup = node.name.endsWith('(clip group)');
+
+    if (isClipGroup) {
+      // clip group 在 PSD 中不是 folder，而是 base 层 + 带 clipping 标记的平铺层。
+      // 返回子层数组，由调用方展开插入父层。
+      const flatLayers: Layer[] = [];
+      for (let i = 0; i < node.children.length; i++) {
+        const result = await buildLayer(node.children[i], null);
+        const childLayers = Array.isArray(result) ? result : [result];
+        for (const cl of childLayers) {
+          if (i > 0) cl.clipping = true;
+          flatLayers.push(cl);
+        }
+      }
+      return flatLayers;
+    }
+
     // ag-psd 不允许同时有 canvas 和 children，展开为 group 时清除 canvas/placedLayer
     if (layer.canvas) delete layer.canvas;
     if (layer.placedLayer) delete layer.placedLayer;
 
-    // 如果当前 frame 设置了 clipsContent，把它作为 clip rect 传递给子节点
-    // （MasterGo frame.clipsContent 决定子节点是否被 frame bbox 裁剪，
-    //  PSD 没有 frame clip 概念，需要在生成 canvas 时手动裁剪）
-    const childClipRect = node.clipsContent
-      ? { x: node.x, y: node.y, width: node.width, height: node.height, cornerRadii: node.cornerRadii }
-      : (parentClipRect ?? null);
     layer.children = [];
     for (const child of node.children) {
-      layer.children.push(await buildLayer(child, childClipRect));
+      const result = await buildLayer(child, null);
+      if (Array.isArray(result)) {
+        layer.children.push(...result);
+      } else {
+        layer.children.push(result);
+      }
     }
     layer.opened = true;
 
@@ -868,6 +934,66 @@ async function buildLayer(node: ExportNodeData, parentClipRect?: { x: number; y:
     layer.top = 0;
     layer.right = 0;
     layer.bottom = 0;
+  }
+
+  // 如果 base 层有关联的 PSD 调整图层数据，在其后插入调整图层（带 clipping 标记）
+  if (node.rawPsdAdjustments) {
+    try {
+      type AdjMaskData = { left: number; top: number; width: number; height: number; defaultColor: number; dataB64: string };
+      const adjList: Array<{ name: string; hidden: boolean; adjustment: any; mask?: AdjMaskData | null }> = JSON.parse(node.rawPsdAdjustments);
+      // 基底层已用「烘焙调整前原始像素」(rawPsdOriginalImage)，因此把所有调整图层
+      // 原样加回（带 clipping 标记），PS 应用一次 = 与原始 PSD 完全一致，
+      // 图层面板结构也与原始一致。
+      // 若没有原始像素兜底（旧数据/编码失败），基底像素是烘焙过的，重叠加会双重应用，
+      // 此时跳过已烘焙类型以优先保证视觉正确。
+      const BAKED_ADJUSTMENT_TYPES = new Set(['hue/saturation', 'brightness/contrast', 'vibrance']);
+      const hasOriginalPixels = !!node.rawPsdOriginalImage;
+      const layers: Layer[] = [layer];
+      for (const adj of adjList) {
+        if (!hasOriginalPixels && adj.adjustment && BAKED_ADJUSTMENT_TYPES.has(adj.adjustment.type)) continue;
+        const adjLayer: Layer = {
+          name: adj.name,
+          left: 0,
+          top: 0,
+          right: 0,
+          bottom: 0,
+          hidden: adj.hidden,
+          clipping: true,
+          adjustment: adj.adjustment,
+        };
+        // 还原调整图层的真实空间蒙版（PS 中调整通过蒙版局部生效）。
+        if (adj.mask && adj.mask.width > 0 && adj.mask.height > 0 && adj.mask.dataB64) {
+          try {
+            const single = base64ToUint8Array(adj.mask.dataB64);
+            const mw = adj.mask.width, mh = adj.mask.height;
+            const mcanvas = document.createElement('canvas');
+            mcanvas.width = mw;
+            mcanvas.height = mh;
+            const mctx = mcanvas.getContext('2d')!;
+            const mimg = mctx.createImageData(mw, mh);
+            // PSD 蒙版为灰度：写入 RGB=alpha 值、A=255，ag-psd 据此回写单通道蒙版。
+            for (let i = 0; i < mw * mh; i++) {
+              const v = single[i];
+              mimg.data[i * 4] = v;
+              mimg.data[i * 4 + 1] = v;
+              mimg.data[i * 4 + 2] = v;
+              mimg.data[i * 4 + 3] = 255;
+            }
+            mctx.putImageData(mimg, 0, 0);
+            (adjLayer as any).mask = {
+              left: adj.mask.left,
+              top: adj.mask.top,
+              right: adj.mask.left + mw,
+              bottom: adj.mask.top + mh,
+              defaultColor: adj.mask.defaultColor,
+              canvas: mcanvas,
+            };
+          } catch { /* mask restore failed, leave without mask */ }
+        }
+        layers.push(adjLayer);
+      }
+      return layers;
+    } catch { /* parse error, skip */ }
   }
 
   return layer;
@@ -889,7 +1015,12 @@ export async function buildAndDownloadPsd(
       65 + Math.round(((i + 1) / nodes.length) * 20),
       `构建图层 ${i + 1}/${nodes.length}: ${nodes[i].name}`,
     );
-    children.push(await buildLayer(nodes[i]));
+    const result = await buildLayer(nodes[i]);
+    if (Array.isArray(result)) {
+      children.push(...result);
+    } else {
+      children.push(result);
+    }
   }
 
   onProgress(88, '生成 PSD 文件...');
