@@ -305,6 +305,12 @@ async function createStyledTextNode(
   if (tp.transformScaleX != null && Number.isFinite(tp.transformScaleX) && tp.transformScaleX !== 1) {
     try { text.setPluginData('psd_transform_scale_x', String(tp.transformScaleX)); } catch { /* ignore */ }
   }
+  // PSD 文本弯曲（warp）：MasterGo 不支持可编辑文本的弧形弯曲，画布上无法还原其外观。
+  // 保存原始 warp 数据用于导出 PSD 时写回 layer.text.warp（往返保真），并提示用户。
+  if (tp.warp && tp.warp.style && tp.warp.style !== 'none') {
+    try { text.setPluginData('psd_warp', JSON.stringify(tp.warp)); } catch { /* ignore */ }
+    onLog('warn', `Text "${irNode.name}" has PSD warp (${tp.warp.style}); MasterGo cannot render curved text — appearance is flattened, but warp is preserved for PSD export`);
+  }
   // 文本层保存原始 PSD effects 元数据（含 disabled 配置），让 export 时 PS 读到完整 effects 状态，
   // 不被简化版（仅 enabled）的 figma 提取覆盖。
   if (irNode.rawPsdEffects) {

@@ -75,6 +75,16 @@ export interface IRTextBounds {
   bottom: number;
 }
 
+/** PSD 文本弯曲变形数据（见 SerializedWarp）。仅用于导出往返保真。 */
+export interface IRWarp {
+  style: string;
+  value?: number;
+  values?: number[];
+  perspective?: number;
+  perspectiveOther?: number;
+  rotate?: string;
+}
+
 export interface IRTextProps {
   characters: string;
   alignment: 'LEFT' | 'CENTER' | 'RIGHT' | 'JUSTIFIED';
@@ -103,6 +113,9 @@ export interface IRTextProps {
   transformTx?: number;
   /** PSD 原始 transform.ty（垂直基线位置），用于精确还原。 */
   transformTy?: number;
+  /** PSD 文本弯曲（warp）变形。Figma/MasterGo 不支持可编辑弧形弯曲，渲染时仅存入
+   * 节点 pluginData，导出 PSD 时写回 layer.text.warp 以实现往返保真。 */
+  warp?: IRWarp;
 }
 
 export interface IRNode {

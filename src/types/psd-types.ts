@@ -64,6 +64,21 @@ export interface PsdTextBounds {
   bottom: number;
 }
 
+/**
+ * PSD 文本弯曲（warp）变形数据。Figma/MasterGo 都不支持可编辑文本的弧形弯曲，
+ * 因此该数据仅用于往返保真：导入时随节点保存（pluginData），导出 PSD 时写回
+ * layer.text.warp，使 PS 重新打开时弯曲效果完整恢复。
+ * 字段对应 ag-psd 的 Warp 接口（style/value/perspective/...）。
+ */
+export interface SerializedWarp {
+  style: string;
+  value?: number;
+  values?: number[];
+  perspective?: number;
+  perspectiveOther?: number;
+  rotate?: string;
+}
+
 export interface SerializedTextData {
   text: string;
   horizontalAlignment: string;
@@ -91,6 +106,8 @@ export interface SerializedTextData {
   gradientOverlay?: SerializedGradientOverlay;
   shapeType?: 'point' | 'box';
   boxBounds?: { width: number; height: number };
+  /** PSD 文本弯曲（warp）变形。保存用于导出往返，详见 SerializedWarp。 */
+  warp?: SerializedWarp;
 }
 
 export interface SerializedCornerRadii {
@@ -217,6 +234,8 @@ export interface ExportTextInfo {
   transformTx?: number;
   /** Original PSD transform.ty, used for sub-pixel exact restoration at export. */
   transformTy?: number;
+  /** PSD 文本弯曲（warp）变形。从节点 pluginData 读回，导出时写回 layer.text.warp。 */
+  warp?: SerializedWarp;
   /** mastergo/figma node.x at import time (anchor). Combined with transformTx,
    * export ty/tx = original_psd_ty/tx + (current node - anchor), avoiding sub-pixel precision loss. */
   anchorNodeX?: number;

@@ -859,6 +859,19 @@ async function buildLayer(node: ExportNodeData, parentClipRect?: { x: number; y:
       layer.text.index = ti.textIndex;
     }
 
+    // PSD 文本弯曲（warp）往返还原：Figma/MasterGo 画布上无法表达弧形弯曲，
+    // 但导入时已把原始 warp 存入节点 pluginData，这里写回 layer.text.warp，
+    // 使 PS 重新打开导出的 PSD 时弯曲效果完整恢复。
+    if (ti.warp && ti.warp.style && ti.warp.style !== 'none' && layer.text) {
+      const w: any = { style: ti.warp.style };
+      if (typeof ti.warp.value === 'number') w.value = ti.warp.value;
+      if (Array.isArray(ti.warp.values)) w.values = ti.warp.values.slice();
+      if (typeof ti.warp.perspective === 'number') w.perspective = ti.warp.perspective;
+      if (typeof ti.warp.perspectiveOther === 'number') w.perspectiveOther = ti.warp.perspectiveOther;
+      w.rotate = ti.warp.rotate === 'vertical' ? 'vertical' : 'horizontal';
+      layer.text.warp = w;
+    }
+
     if (ti.styles.length > 1 && layer.text) {
       // styleRuns 的 fontSize 也是 unscaled（与 baseStyle 一致），由 transform 的 sy 决定视觉字号
       const syForStyles = ti.transformScale != null && Number.isFinite(ti.transformScale) && ti.transformScale > 0

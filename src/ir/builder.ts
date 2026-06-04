@@ -299,6 +299,7 @@ function buildTextProps(layer: SerializedLayer): IRTextProps | undefined {
     transformScaleX: td.transformScaleX,
     transformTx: td.transformTx,
     transformTy: td.transformTy,
+    warp: td.warp,
   };
 }
 

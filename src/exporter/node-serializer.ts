@@ -586,6 +586,14 @@ async function serializeNode(
           const v = parseFloat(tScaleXStr);
           if (Number.isFinite(v) && v > 0) data.textInfo.transformScaleX = v;
         }
+        // PSD 文本弯曲（warp）：导入时存入的原始 warp，导出 PSD 时写回 layer.text.warp。
+        const warpStr = getData('psd_warp');
+        if (warpStr) {
+          try {
+            const w = JSON.parse(warpStr);
+            if (w && typeof w.style === 'string' && w.style !== 'none') data.textInfo.warp = w;
+          } catch { /* ignore */ }
+        }
         // 精确还原：anchor + 原始 PSD transform.tx/ty
         const anchorYStr = getData('psd_anchor_node_y');
         if (anchorYStr) {

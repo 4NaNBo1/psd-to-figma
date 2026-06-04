@@ -7,6 +7,7 @@ import type {
   SerializedTextStyle,
   SerializedColor,
   SerializedTextCase,
+  SerializedWarp,
   LayerType,
 } from '../types/psd-types';
 import { convertEffects, convertStrokes } from '../converter/effect-converter';
@@ -458,6 +459,19 @@ function convertTextData(text: LayerTextData): SerializedTextData {
   if (text.shapeType === 'box' && text.boxBounds && text.boxBounds.length >= 4) {
     const [left, top, right, bottom] = text.boxBounds;
     result.boxBounds = { width: (right - left) * txScale, height: (bottom - top) * txScale };
+  }
+
+  // PSD 文本弯曲（warp）：Figma/MasterGo 不支持可编辑文本弧形弯曲，但保存原始
+  // warp 数据以便导出 PSD 时写回 layer.text.warp，实现往返保真。style='none' 视为无弯曲。
+  if (text.warp && text.warp.style && text.warp.style !== 'none') {
+    const w = text.warp;
+    const warp: SerializedWarp = { style: w.style as string };
+    if (typeof w.value === 'number') warp.value = w.value;
+    if (Array.isArray(w.values)) warp.values = w.values.slice();
+    if (typeof w.perspective === 'number') warp.perspective = w.perspective;
+    if (typeof w.perspectiveOther === 'number') warp.perspectiveOther = w.perspectiveOther;
+    if (w.rotate) warp.rotate = w.rotate as string;
+    result.warp = warp;
   }
 
   return result;
