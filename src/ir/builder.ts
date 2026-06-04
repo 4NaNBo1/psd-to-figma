@@ -235,7 +235,7 @@ function buildTextProps(layer: SerializedLayer): IRTextProps | undefined {
   const ranges: IRTextRange[] = td.styles.map((style) => {
     const parsed = parseFontName(style.fontFamily);
     const c = style.color;
-    return {
+    const range: IRTextRange = {
       start: style.start,
       end: style.end,
       fontFamily: parsed.family,
@@ -249,6 +249,10 @@ function buildTextProps(layer: SerializedLayer): IRTextProps | undefined {
         opacity: c.a,
       }],
     };
+    if (style.textCase) {
+      range.textCase = style.textCase;
+    }
+    return range;
   });
 
   let gradientOverlay: IRGradientFill | undefined;

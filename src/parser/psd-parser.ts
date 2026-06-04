@@ -6,6 +6,7 @@ import type {
   SerializedTextData,
   SerializedTextStyle,
   SerializedColor,
+  SerializedTextCase,
   LayerType,
 } from '../types/psd-types';
 import { convertEffects, convertStrokes } from '../converter/effect-converter';
@@ -266,6 +267,14 @@ function determineLayerType(layer: Layer): LayerType {
   return 'image';
 }
 
+// PSD fontCaps: 0=normal, 1=small caps, 2=all caps. Map to our text case.
+// undefined return means ORIGINAL (omit the field to keep payload small).
+function mapFontCaps(fontCaps: number | undefined): SerializedTextCase | undefined {
+  if (fontCaps === 2) return 'UPPER';
+  if (fontCaps === 1) return 'SMALL_CAPS';
+  return undefined;
+}
+
 function convertTextData(text: LayerTextData): SerializedTextData {
   const styles: SerializedTextStyle[] = [];
   const fullText = text.text ?? '';
@@ -289,6 +298,7 @@ function convertTextData(text: LayerTextData): SerializedTextData {
   const baseAutoLeading = base?.autoLeading ?? false;
   const baseFillColor = base?.fillColor;
   const baseStrokeColor = base?.strokeColor;
+  const baseFontCaps = base?.fontCaps;
 
   // PSD transform 矩阵 = [a, b, c, d, tx, ty]，sx = sqrt(a² + c²), sy = sqrt(b² + d²)
   // sx 和 sy 在非旋转情况下可以不同（如 Level 40 sx=1.0 sy=1.0021），
@@ -315,6 +325,7 @@ function convertTextData(text: LayerTextData): SerializedTextData {
       const autoLeading = s.autoLeading ?? baseAutoLeading;
       const fillColor = s.fillColor ?? baseFillColor;
       const strokeColor = s.strokeColor ?? baseStrokeColor;
+      const fontCaps = s.fontCaps ?? baseFontCaps;
 
       const scaledFontSize = fontSize * txScale;
       let resolvedLeading: number | null;
@@ -335,6 +346,10 @@ function convertTextData(text: LayerTextData): SerializedTextData {
       };
       if (strokeColor) {
         style.strokeColor = toColor(strokeColor);
+      }
+      const textCase = mapFontCaps(fontCaps);
+      if (textCase) {
+        style.textCase = textCase;
       }
       styles.push(style);
       offset = end;
@@ -359,6 +374,10 @@ function convertTextData(text: LayerTextData): SerializedTextData {
     };
     if (baseStrokeColor) {
       style.strokeColor = toColor(baseStrokeColor);
+    }
+    const textCase = mapFontCaps(baseFontCaps);
+    if (textCase) {
+      style.textCase = textCase;
     }
     styles.push(style);
   }

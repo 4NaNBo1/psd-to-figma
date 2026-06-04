@@ -212,6 +212,12 @@ async function createStyledTextNode(
       // 无论 letterSpacing 是否为 0 都显式设置：避免节点保留字体级 default letterSpacing,
       // 与 mastergo 端保持一致（platform parity）。
       text.setRangeLetterSpacing(start, end, { value: range.letterSpacing, unit: 'PIXELS' });
+
+      // PSD fontCaps（全大写/小型大写）：PSD 把原始字符存为混合大小写，靠 fontCaps 显示为大写。
+      // figma TextCase 支持 SMALL_CAPS，故保留原始语义（与 mastergo 行为差异：mastergo 无 SMALL_CAPS 降级为 UPPER）。
+      if (range.textCase && range.textCase !== 'ORIGINAL') {
+        text.setRangeTextCase(start, end, range.textCase);
+      }
     } catch (e) {
       onLog('warn', `Failed to apply text style range [${start}:${end}] for "${irNode.name}": ${e instanceof Error ? e.message : e}`);
     }

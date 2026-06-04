@@ -240,6 +240,13 @@ async function createStyledTextNode(
       // 是非 0 值（如 PingFang -0.88px），不调用 setRangeLetterSpacing(0) 会让节点保留 default,
       // 导致 export 时 PSD tracking 错误（如 0 变成 -27/-12）。
       text.setRangeLetterSpacing(start, end, { value: range.letterSpacing, unit: 'PIXELS' });
+
+      // PSD fontCaps（全大写/小型大写）：PSD 把原始字符存为混合大小写，靠 fontCaps 显示为大写。
+      // mastergo TextCase 仅支持 ORIGINAL/UPPER/LOWER/TITLE（无 SMALL_CAPS），
+      // 故 SMALL_CAPS 降级为 UPPER（视觉近似）。
+      if (range.textCase && range.textCase !== 'ORIGINAL') {
+        text.setRangeTextCase(start, end, 'UPPER');
+      }
     } catch (e) {
       onLog('warn', `Failed to apply text style range [${start}:${end}] for "${irNode.name}": ${e instanceof Error ? e.message : e}`);
     }

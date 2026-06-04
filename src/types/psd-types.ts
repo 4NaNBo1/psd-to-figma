@@ -27,6 +27,9 @@ export interface SerializedStroke {
   visible: boolean;
 }
 
+/** PSD fontCaps mapping: 0=normal, 1=small caps, 2=all caps. */
+export type SerializedTextCase = 'ORIGINAL' | 'UPPER' | 'SMALL_CAPS';
+
 export interface SerializedTextStyle {
   fontFamily: string;
   fontStyle: string;
@@ -35,6 +38,8 @@ export interface SerializedTextStyle {
   strokeColor?: SerializedColor;
   letterSpacing: number;
   lineHeight: number | null;
+  /** PSD fontCaps: 0→ORIGINAL, 1→SMALL_CAPS, 2→UPPER. Omitted = ORIGINAL. */
+  textCase?: SerializedTextCase;
   start: number;
   end: number;
 }
@@ -184,6 +189,8 @@ export interface ExportTextStyleRange {
   color: SerializedColor;
   letterSpacing: number;
   lineHeight: number | null;
+  /** Text case read back from the node. Restored to PSD fontCaps on export. */
+  textCase?: SerializedTextCase;
 }
 
 export interface ExportTextInfo {

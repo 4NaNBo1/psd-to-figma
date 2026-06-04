@@ -8,7 +8,16 @@ import type {
   ExportTextStyleRange,
   SerializedColor,
   SerializedCornerRadii,
+  SerializedTextCase,
 } from '../types/psd-types';
+
+// Normalize platform TextCase ('UPPER'/'SMALL_CAPS'/'SMALL_CAPS_FORCED'/...) to our export case.
+// figma TITLE/LOWER 与 PSD fontCaps 无对应（PSD fontCaps 只有 normal/small/all caps），按 ORIGINAL 处理。
+function normalizeTextCase(tc: any): SerializedTextCase | undefined {
+  if (tc === 'UPPER') return 'UPPER';
+  if (tc === 'SMALL_CAPS' || tc === 'SMALL_CAPS_FORCED') return 'SMALL_CAPS';
+  return undefined;
+}
 
 declare const mg: any;
 const isMasterGo = typeof mg !== 'undefined';
@@ -186,10 +195,12 @@ function extractCornerRadii(node: any): SerializedCornerRadii | undefined {
 function getCharStyle(node: any, idx: number): {
   family: string; style: string; size: number;
   color: SerializedColor; letterSpacing: number; lineHeight: number | null;
+  textCase?: SerializedTextCase;
 } {
   let family = 'Arial', style = 'Regular', size = 16;
   let color: SerializedColor = { r: 0, g: 0, b: 0, a: 1 };
   let letterSpacing = 0, lineHeight: number | null = null;
+  let textCase: SerializedTextCase | undefined;
 
   try {
     const fn = node.getRangeFontName(idx, idx + 1);
@@ -214,8 +225,13 @@ function getCharStyle(node: any, idx: number): {
     if (lh && lh.unit === 'PIXELS') lineHeight = lh.value;
     else if (lh && lh.unit === 'PERCENT') lineHeight = (lh.value / 100) * size;
   } catch { /* default */ }
+  try {
+    if (typeof node.getRangeTextCase === 'function') {
+      textCase = normalizeTextCase(node.getRangeTextCase(idx, idx + 1));
+    }
+  } catch { /* default */ }
 
-  return { family, style, size, color, letterSpacing, lineHeight };
+  return { family, style, size, color, letterSpacing, lineHeight, textCase };
 }
 
 function stylesEqual(
@@ -225,7 +241,8 @@ function stylesEqual(
   return a.family === b.family && a.style === b.style && a.size === b.size &&
     a.color.r === b.color.r && a.color.g === b.color.g &&
     a.color.b === b.color.b && a.color.a === b.color.a &&
-    a.letterSpacing === b.letterSpacing && a.lineHeight === b.lineHeight;
+    a.letterSpacing === b.letterSpacing && a.lineHeight === b.lineHeight &&
+    a.textCase === b.textCase;
 }
 
 function extractTextInfo(node: any): ExportTextInfo | undefined {
@@ -269,6 +286,7 @@ function extractTextInfo(node: any): ExportTextInfo | undefined {
         if (ts.lineHeight.unit === 'PIXELS') lineHeight = ts.lineHeight.value;
         else if (ts.lineHeight.unit === 'PERCENT') lineHeight = (ts.lineHeight.value / 100) * (ts.fontSize ?? 16);
       }
+      const segTextCase = normalizeTextCase(ts.textCase);
       return {
         start: seg.start ?? 0,
         end: seg.end ?? len,
@@ -278,6 +296,7 @@ function extractTextInfo(node: any): ExportTextInfo | undefined {
         color,
         letterSpacing,
         lineHeight,
+        ...(segTextCase ? { textCase: segTextCase } : {}),
       };
     });
     return { characters, alignment, styles, textAutoResize: node.textAutoResize };
@@ -344,6 +363,7 @@ function extractTextInfo(node: any): ExportTextInfo | undefined {
       fontFamily: runStyle.family, fontStyle: runStyle.style,
       fontSize: runStyle.size, color: runStyle.color,
       letterSpacing: runStyle.letterSpacing, lineHeight: runStyle.lineHeight,
+      ...(runStyle.textCase ? { textCase: runStyle.textCase } : {}),
     });
     pos = runEnd;
   }

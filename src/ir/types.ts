@@ -52,6 +52,9 @@ export interface IRCornerRadii {
   bottomRight: number;
 }
 
+/** Text case for a range. Maps from PSD fontCaps (0/1/2). */
+export type IRTextCase = 'ORIGINAL' | 'UPPER' | 'SMALL_CAPS';
+
 export interface IRTextRange {
   start: number;
   end: number;
@@ -61,6 +64,8 @@ export interface IRTextRange {
   lineHeight: number | null;
   letterSpacing: number;
   fills: IRFill[];
+  /** All-caps / small-caps display. Omitted = ORIGINAL. */
+  textCase?: IRTextCase;
 }
 
 export interface IRTextBounds {

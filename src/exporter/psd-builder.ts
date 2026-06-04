@@ -37,6 +37,13 @@ function toRGBA(c: SerializedColor): { r: number; g: number; b: number; a: numbe
   };
 }
 
+// Restore export TextCase to PSD fontCaps: UPPER→2 (all caps), SMALL_CAPS→1, else 0.
+function textCaseToFontCaps(tc: string | undefined): number {
+  if (tc === 'UPPER') return 2;
+  if (tc === 'SMALL_CAPS') return 1;
+  return 0;
+}
+
 function toPostScriptName(family: string, style: string): string {
   const cleanFamily = family.replace(/\s+/g, '');
   if (!style || style === 'Regular') return cleanFamily;
@@ -619,7 +626,7 @@ async function buildLayer(node: ExportNodeData, parentClipRect?: { x: number; y:
       autoKerning: true,
       kerning: 0,
       baselineShift: 0,
-      fontCaps: 0,
+      fontCaps: textCaseToFontCaps(firstStyle.textCase),
       fontBaseline: 0,
       underline: false,
       strikethrough: false,
@@ -873,6 +880,7 @@ async function buildLayer(node: ExportNodeData, parentClipRect?: { x: number; y:
             autoKerning: true,
             fauxBold: s.fontStyle === 'Bold' || s.fontStyle === 'Bold Italic',
             fauxItalic: s.fontStyle === 'Italic' || s.fontStyle === 'Bold Italic',
+            fontCaps: textCaseToFontCaps(s.textCase),
           },
         };
       });
