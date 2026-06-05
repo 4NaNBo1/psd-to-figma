@@ -438,7 +438,26 @@ function buildChildrenWithClipping(
 
     if (clippedLayers.length > 0) {
       const baseNode = buildLayerNode(child, images, depth);
-      const clipChildren: IRNode[] = [baseNode];
+
+      // PS 剪贴蒙版语义：基底层既要「显示自身内容」，又要用其 alpha 形状「裁剪被剪贴层」。
+      // 单节点设 isMask 无法兼顾——MasterGo 的 alpha 蒙版只取 mask 的透明度通道、丢弃
+      // 自身填充颜色（如实心 #ffffe7 底会消失）；若改用轮廓蒙版自身虽显示，却按节点矩形
+      // 裁剪、丢失图片 alpha 的不规则形状（如圆角卡片）。因此拆成两份各司其职：
+      //   - baseDisplay：归零定位、正常显示，承载基底层颜色/效果，保证 #ffffe7 这类底色可见；
+      //   - baseMask：基底副本，仅作 alpha 蒙版（isMask），按图片 alpha 形状裁剪后续被剪贴层。
+      // 蒙版只裁排在它「之后」的兄弟，故 baseDisplay 在前不受裁剪。
+      const baseDisplay: IRNode = { ...baseNode, x: 0, y: 0 };
+      const baseMask: IRNode = {
+        ...baseNode,
+        x: 0,
+        y: 0,
+        name: baseNode.name + ' (mask)',
+        isMask: true,
+        // 蒙版只需提供形状 alpha，剥离效果/描边避免干扰（填充保留以提供 alpha 形状）。
+        effects: [],
+        strokes: [],
+      };
+      const clipChildren: IRNode[] = [baseDisplay, baseMask];
 
       const baseExpand = child.expandOffset ?? 0;
       for (const clippedLayer of clippedLayers) {
@@ -458,16 +477,14 @@ function buildChildrenWithClipping(
         opacity: 1,
         blendMode: 'PASS_THROUGH',
         visible: true,
-        clipsContent: true,
+        // 裁剪交给 baseMask 的 alpha 蒙版，frame 仅作容器，不再叠加 bbox 矩形裁剪。
+        clipsContent: false,
         fills: [],
         effects: [],
         strokes: [],
         cornerRadii: baseNode.cornerRadii,
         children: clipChildren,
       };
-
-      // Base node position is relative to clip frame
-      clipChildren[0] = { ...baseNode, x: 0, y: 0 };
 
       result.push(clipFrame);
       i = j;

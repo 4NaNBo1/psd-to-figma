@@ -499,6 +499,19 @@ async function renderNode(
       }
     }
 
+    // PSD 剪贴蒙版的基底副本（baseMask）：设为 ALPHA 蒙版，按图片 alpha 形状裁剪
+    // clip group 内排在其后的被剪贴兄弟节点（保留圆角等不规则形状）。基底自身的显示
+    // 由前面的 baseDisplay 承载（与 MasterGo 端 isMaskVisible=false 语义对齐）。
+    if (irNode.isMask && node) {
+      try {
+        const m = node as SceneNode & { isMask: boolean; maskType: MaskType };
+        m.isMask = true;
+        m.maskType = 'ALPHA';
+      } catch (e) {
+        onLog('warn', `Failed to set mask on "${irNode.name}": ${e instanceof Error ? e.message : e}`);
+      }
+    }
+
     return node;
   } catch (e) {
     onLog('error', `Failed to create node "${irNode.name}" (${irNode.type}): ${e instanceof Error ? e.message : e}`);
