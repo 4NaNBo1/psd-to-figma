@@ -347,6 +347,24 @@ async function renderTextNode(
 
 function alignTextPosition(text: TextNode, irNode: IRNode, onLog: LogFn): void {
   const tp = irNode.textProps!;
+
+  // 旋转文本：目标是让节点视觉中心落在 PSD 旋转后 boundingBox 中心 (docRotatedCenterX/Y)。
+  // 平台差异——Figma 的 rotation 绕「节点左上角」旋转（与 MasterGo 绕中心不同），故不能直接
+  // 把中心设为 x/y。设左上角 P，旋转后视觉中心 = P + R(θ)·(w/2, h/2)，令其 = 目标中心反推 P。
+  // θ 用 Figma 屏幕系角度（=后续 text.rotation 设的 tp.rotation，正=逆时针，屏幕 Y 向下故矩阵取负 sin）。
+  if (tp.rotation && tp.docRotatedCenterX != null && tp.docRotatedCenterY != null) {
+    const w = text.width, h = text.height;
+    const rad = (tp.rotation * Math.PI) / 180;
+    const cos = Math.cos(rad), sin = Math.sin(rad);
+    // Figma 屏幕系（Y 向下）旋转矩阵：[[cos, sin], [-sin, cos]]，正角=逆时针视觉
+    const offX = cos * (w / 2) + sin * (h / 2);
+    const offY = -sin * (w / 2) + cos * (h / 2);
+    text.x = tp.docRotatedCenterX - offX;
+    text.y = tp.docRotatedCenterY - offY;
+    try { text.setPluginData('psd_line_padding_y', '0'); } catch { /* ignore */ }
+    return;
+  }
+
   const hasPrecise = tp.docBoundsY != null || tp.docBboxCenterX != null;
 
   if (hasPrecise) {

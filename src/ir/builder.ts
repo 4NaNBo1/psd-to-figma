@@ -292,6 +292,8 @@ function buildTextProps(layer: SerializedLayer): IRTextProps | undefined {
     docBoundsY: td.docBoundsY,
     docBboxCenterX: td.docBboxCenterX,
     txOffsetX: td.txOffsetX,
+    docRotatedCenterX: td.docRotatedCenterX,
+    docRotatedCenterY: td.docRotatedCenterY,
     bounds: td.bounds,
     boundingBox: td.boundingBox,
     textIndex: td.textIndex,

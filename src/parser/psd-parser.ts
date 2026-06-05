@@ -386,6 +386,8 @@ function convertTextData(text: LayerTextData): SerializedTextData {
   let docBoundsY: number | undefined;
   let docBboxCenterX: number | undefined;
   let txOffsetX: number | undefined;
+  let docRotatedCenterX: number | undefined;
+  let docRotatedCenterY: number | undefined;
 
   if (text.transform && text.transform.length >= 6) {
     const [a, b, c, d, tx, ty] = text.transform;
@@ -394,18 +396,32 @@ function convertTextData(text: LayerTextData): SerializedTextData {
     const isRotated = Math.abs(b) > 0.001 || Math.abs(c) > 0.001;
 
     if (isRotated) {
+      // 旋转文本：MasterGo/Figma 的 rotation 绕「节点中心」旋转（实测确认，非左上角）。
+      // 故渲染器需要旋转后 boundingBox 中心的画布绝对坐标：transform 作用于 boundingBox
+      // 几何中心 ((left+right)/2, (top+bottom)/2)。渲染时令节点中心落在此点，绕中心旋转后
+      // 视觉中心不变，从而对齐 PSD。docBboxCenterX/docBoundsY 仍保留供 export 与回退路径使用。
       if (text.boundingBox) {
         const bbL = text.boundingBox.left.value;
         const bbR = text.boundingBox.right.value;
         const bbT = text.boundingBox.top.value;
+        const bbB = text.boundingBox.bottom.value;
+        const cx = (bbL + bbR) / 2;
+        const cy = (bbT + bbB) / 2;
         docBboxCenterX = (a * bbL + c * bbT + tx + a * bbR + c * bbT + tx) / 2;
         docBoundsY = b * bbL + d * bbT + ty;
+        docRotatedCenterX = a * cx + c * cy + tx;
+        docRotatedCenterY = b * cx + d * cy + ty;
       } else if (text.bounds) {
         const bT = text.bounds.top.value;
         const bL = text.bounds.left.value;
         const bR = text.bounds.right.value;
+        const bB = text.bounds.bottom.value;
+        const cx = (bL + bR) / 2;
+        const cy = (bT + bB) / 2;
         docBboxCenterX = (a * bL + c * bT + tx + a * bR + c * bT + tx) / 2;
         docBoundsY = b * bL + d * bT + ty;
+        docRotatedCenterX = a * cx + c * cy + tx;
+        docRotatedCenterY = b * cx + d * cy + ty;
       }
     } else {
       if (text.bounds) {
@@ -434,7 +450,7 @@ function convertTextData(text: LayerTextData): SerializedTextData {
 
   const psdTx = text.transform && text.transform.length >= 6 ? text.transform[4] : undefined;
   const psdTy = text.transform && text.transform.length >= 6 ? text.transform[5] : undefined;
-  const result: SerializedTextData = { text: fullText, horizontalAlignment: alignment, styles, transformScale: txScale, transformScaleX: txScaleX, transformTx: psdTx, transformTy: psdTy, rotation, docBoundsY, docBboxCenterX, txOffsetX, textIndex: text.index };
+  const result: SerializedTextData = { text: fullText, horizontalAlignment: alignment, styles, transformScale: txScale, transformScaleX: txScaleX, transformTx: psdTx, transformTy: psdTy, rotation, docBoundsY, docBboxCenterX, txOffsetX, docRotatedCenterX, docRotatedCenterY, textIndex: text.index };
 
   if (text.bounds) {
     result.bounds = {

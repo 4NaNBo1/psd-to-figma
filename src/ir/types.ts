@@ -99,6 +99,10 @@ export interface IRTextProps {
   docBoundsY?: number;
   docBboxCenterX?: number;
   txOffsetX?: number;
+  /** 旋转文本专用：旋转后 boundingBox 中心的画布坐标。平台 rotation 绕节点中心旋转，
+   * 渲染时令节点中心落在此点（text.x = cx − w/2, text.y = cy − h/2），绕中心旋转后视觉中心不变。 */
+  docRotatedCenterX?: number;
+  docRotatedCenterY?: number;
   bounds?: IRTextBounds;
   boundingBox?: IRTextBounds;
   textIndex?: number;

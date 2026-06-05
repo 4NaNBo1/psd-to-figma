@@ -395,6 +395,17 @@ async function renderTextNode(
 // （否则 mastergo 的 absoluteRenderBounds 会因 stroke 宽度不同而产生位置偏差）。
 function alignTextPosition(text: any, irNode: IRNode, onLog: LogFn, linePaddingOverride?: number): number {
   const tp = irNode.textProps!;
+
+  // 旋转文本：MasterGo rotation 绕节点中心旋转（实测确认）。令节点中心落在 PSD 旋转后
+  // boundingBox 中心（docRotatedCenterX/Y），即 text.x = cx − w/2、text.y = cy − h/2，
+  // 之后绕中心旋转视觉中心不变即对齐。不套用居中/linePadding 逻辑（那是为轴对齐文本设计的）。
+  if (tp.rotation && tp.docRotatedCenterX != null && tp.docRotatedCenterY != null) {
+    text.x = tp.docRotatedCenterX - text.width / 2;
+    text.y = tp.docRotatedCenterY - text.height / 2;
+    try { text.setPluginData('psd_line_padding_y', '0'); } catch { /* ignore */ }
+    return 0;
+  }
+
   const hasPrecise = tp.docBoundsY != null || tp.docBboxCenterX != null;
 
   let targetX: number, targetY: number;

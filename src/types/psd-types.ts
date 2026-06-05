@@ -97,6 +97,11 @@ export interface SerializedTextData {
   docBoundsY?: number;
   docBboxCenterX?: number;
   txOffsetX?: number;
+  /** 旋转文本专用：boundingBox 几何中心经 transform 映射到画布后的坐标（= 旋转后 bbox 中心）。
+   * Figma/MasterGo 的 rotation 绕「节点中心」旋转（实测确认），渲染时令节点中心落在此点，
+   * 绕中心旋转后视觉中心不变即对齐 PSD。仅旋转文本输出。 */
+  docRotatedCenterX?: number;
+  docRotatedCenterY?: number;
   /** Original PSD bounds (font-metric-derived character bbox relative to transform) */
   bounds?: PsdTextBounds;
   /** Original PSD boundingBox (actual character pixel bbox relative to transform) */
