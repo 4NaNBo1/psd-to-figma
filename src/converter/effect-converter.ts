@@ -33,7 +33,10 @@ function convertShadow(
   shadow: LayerEffectShadow,
   type: 'drop' | 'inner'
 ): SerializedShadow | null {
-  if (!shadow.enabled && shadow.present !== true) return null;
+  // PS 中被禁用（眼睛关闭）的阴影不进入 IR：避免下发给 MasterGo 后被错误显示
+  // （MasterGo 不严格尊重 effect 的 visible:false）。round-trip 导出不受影响：
+  // 导出端按 visible 过滤，原始 effects 由 plugin data 还原。
+  if (!shadow.enabled) return null;
 
   const angle = ((shadow.angle ?? 120) * Math.PI) / 180;
   const distance = resolveUnitsValue(shadow.distance);

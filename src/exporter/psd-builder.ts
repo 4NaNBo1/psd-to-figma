@@ -955,6 +955,43 @@ async function buildLayer(node: ExportNodeData, parentClipRect?: { x: number; y:
     layer.top = 0;
     layer.right = 0;
     layer.bottom = 0;
+
+    // 还原组的矩形图层蒙版（滚动视口裁剪）：白色实心矩形 = 可见区域，框外按
+    // defaultColor（通常 0=透明）裁掉。node.x/node.y 是组的绝对画布坐标，
+    // groupMaskRect 的 left/top 相对组 frame（导入时恒为 0）。mask 独立于 layer
+    // bbox，上面把 bbox 清零不影响它。
+    if (node.rawPsdGroupMask) {
+      try {
+        const gm = JSON.parse(node.rawPsdGroupMask) as {
+          left: number; top: number; width: number; height: number; defaultColor: number;
+        };
+        const mw = Math.round(gm.width), mh = Math.round(gm.height);
+        if (mw > 0 && mh > 0) {
+          const absLeft = Math.round(node.x + gm.left);
+          const absTop = Math.round(node.y + gm.top);
+          const mcanvas = document.createElement('canvas');
+          mcanvas.width = mw;
+          mcanvas.height = mh;
+          const mctx = mcanvas.getContext('2d')!;
+          const mimg = mctx.createImageData(mw, mh);
+          for (let i = 0; i < mw * mh; i++) {
+            mimg.data[i * 4] = 255;
+            mimg.data[i * 4 + 1] = 255;
+            mimg.data[i * 4 + 2] = 255;
+            mimg.data[i * 4 + 3] = 255;
+          }
+          mctx.putImageData(mimg, 0, 0);
+          (layer as any).mask = {
+            left: absLeft,
+            top: absTop,
+            right: absLeft + mw,
+            bottom: absTop + mh,
+            defaultColor: gm.defaultColor ?? 0,
+            canvas: mcanvas,
+          };
+        }
+      } catch { /* group mask restore failed, leave without mask */ }
+    }
   }
 
   // 如果 base 层有关联的 PSD 调整图层数据，在其后插入调整图层（带 clipping 标记）

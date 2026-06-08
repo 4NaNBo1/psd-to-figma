@@ -440,6 +440,9 @@ async function renderNode(
         if (irNode.rawPsdEffects) {
           try { frame.setPluginData('psd_raw_effects', irNode.rawPsdEffects); } catch { /* ignore */ }
         }
+        if (irNode.psdGroupMask) {
+          try { frame.setPluginData('psd_group_mask', irNode.psdGroupMask); } catch { /* ignore */ }
+        }
         if (irNode.isRootFrame) {
           try { frame.setPluginData('psd_root_frame', '1'); } catch { /* ignore */ }
         }

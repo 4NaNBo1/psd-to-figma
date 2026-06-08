@@ -1,8 +1,40 @@
 diff --git a/node_modules/ag-psd/dist/additionalInfo.js b/node_modules/ag-psd/dist/additionalInfo.js
-index 2e62b06..041b2e8 100644
+index 2e62b06..99526c8 100644
 --- a/node_modules/ag-psd/dist/additionalInfo.js
 +++ b/node_modules/ag-psd/dist/additionalInfo.js
-@@ -3419,7 +3419,6 @@ addHandler('lfx2', function (target) { return target.effects !== undefined && !h
+@@ -2131,15 +2131,24 @@ else {
+     addHandler('Patt', // TODO: handle also Pat2 & Pat3
+     function (// TODO: handle also Pat2 & Pat3
+     target) { return !target; }, function (reader, target, left) {
++        // Patch: 启用 pattern 资源解析（原版直接 skip，导致 patternOverlay 拿不到像素数据）。
++        // 循环读取 Patt 块内的多个 pattern，填充 target.patterns；单个 pattern 解析失败时
++        // 跳过剩余字节，避免中断整个 PSD 解析。
+         if (!left())
+             return;
+-        (0, psdReader_1.skipBytes)(reader, left());
+-        return; // not supported yet
+-        target;
+-        psdReader_1.readPattern;
+-        // if (!target.patterns) target.patterns = [];
+-        // target.patterns.push(readPattern(reader));
+-        // skipBytes(reader, left());
++        if (!target.patterns)
++            target.patterns = [];
++        try {
++            while (left() > 0) {
++                target.patterns.push((0, psdReader_1.readPattern)(reader));
++            }
++        }
++        catch (e) {
++            if (reader.logMissingFeatures)
++                console.log('Patt parse stopped:', e && e.message);
++        }
++        if (left() > 0)
++            (0, psdReader_1.skipBytes)(reader, left());
+     }, function (_writer, _target) {
+     });
+ }
+@@ -3419,7 +3428,6 @@ addHandler('lfx2', function (target) { return target.effects !== undefined && !h
      if (version !== 0)
          throw new Error("Invalid lfx2 version");
      var desc = (0, descriptor_1.readVersionAndDescriptor)(reader);

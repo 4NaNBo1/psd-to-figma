@@ -772,6 +772,16 @@ async function serializeNode(
     }
   } catch { /* ignore */ }
 
+  // 读取 psd_group_mask：组的矩形图层蒙版（滚动视口裁剪），导出时在组 layer 上重建。
+  try {
+    if (typeof node.getPluginData === 'function') {
+      const gm = node.getPluginData('psd_group_mask');
+      if (gm) {
+        data.rawPsdGroupMask = gm;
+      }
+    }
+  } catch { /* ignore */ }
+
   return data;
 }
 

@@ -19,6 +19,11 @@ export interface ParseProgress {
   message: string;
 }
 
+// PSD 全局 pattern 资源表（Patt 块，已通过 ag-psd patch 启用解析）。
+// patternOverlay 只引用 pattern id，像素数据存在这里 / layer.patterns 中。
+// 在 parsePsdFile 入口设置，供 resolvePatternData 跨递归层级取用。
+let globalPsdPatterns: { id: string; bounds: { w: number; h: number }; data: Uint8Array }[] | undefined;
+
 function toColor(c: Color | undefined): SerializedColor {
   if (!c) return { r: 0, g: 0, b: 0, a: 1 };
   if ('r' in c && 'a' in c) {
@@ -691,6 +696,33 @@ function computeGroupBounds(layer: Layer): { left: number; top: number; right: n
   return { left: acc.minL, top: acc.minT, right: acc.maxR, bottom: acc.maxB };
 }
 
+/**
+ * 提取「组上的矩形图层蒙版」的画布绝对坐标框。
+ * PSD 中组的 layer mask（带像素、未禁用）常用于裁剪溢出内容（如滚动视口）。
+ * Figma/MasterGo 用 frame 的 clipsContent + 蒙版框尺寸表达这种矩形裁剪。
+ * 用户场景中该蒙版为规则矩形，故直接取蒙版 bbox，不校验像素是否实心。
+ * 返回 null：无蒙版 / 蒙版禁用 / 无像素来源 / 面积为 0。
+ */
+function getGroupMaskRect(
+  layer: Layer
+): { left: number; top: number; right: number; bottom: number; defaultColor: number } | null {
+  const mask = layer.mask;
+  if (!mask || mask.disabled) return null;
+
+  const hasImageData = !!(mask.imageData && mask.imageData.width > 0 && mask.imageData.height > 0);
+  const cvs = mask.canvas as HTMLCanvasElement | undefined;
+  const hasCanvas = !!(cvs && cvs.width > 0 && cvs.height > 0);
+  if (!hasImageData && !hasCanvas) return null;
+
+  const left = mask.left ?? 0;
+  const top = mask.top ?? 0;
+  const right = mask.right ?? left;
+  const bottom = mask.bottom ?? top;
+  if (right - left <= 0 || bottom - top <= 0) return null;
+
+  return { left, top, right, bottom, defaultColor: mask.defaultColor ?? 255 };
+}
+
 function getArtboardBounds(layer: Layer): { left: number; top: number; right: number; bottom: number } | null {
   const artboard = (layer as Record<string, unknown>)['artboard'] as
     { rect?: { top: number; left: number; bottom: number; right: number } } | undefined;
@@ -870,6 +902,18 @@ interface PatternOverlayInfo {
   opacity: number;
   phaseX: number;
   phaseY: number;
+  /** PSD 原始 blendMode 字符串（如 'soft light' / 'multiply' / 'normal'）。缺省按 normal 处理。 */
+  blendMode?: string;
+}
+
+/** patternOverlay 的轻量元数据（像素数据延迟解析时使用）。 */
+interface PatternOverlayMeta {
+  id: string;
+  scale: number;
+  opacity: number;
+  phaseX: number;
+  phaseY: number;
+  blendMode?: string;
 }
 
 /**
@@ -920,7 +964,7 @@ async function resolvePatternData(
   return { rgba, w, h };
 }
 
-function getPatternOverlayMeta(layer: Layer): { id: string; scale: number; opacity: number; phaseX: number; phaseY: number } | null {
+function getPatternOverlayMeta(layer: Layer): PatternOverlayMeta | null {
   if (!layer.effects || layer.effects.disabled || !layer.effects.patternOverlay) return null;
   const p: any = layer.effects.patternOverlay;
   if (!p.enabled || !p.pattern?.id) return null;
@@ -930,6 +974,7 @@ function getPatternOverlayMeta(layer: Layer): { id: string; scale: number; opaci
     opacity: p.opacity ?? 1,
     phaseX: p.phase?.x ?? 0,
     phaseY: p.phase?.y ?? 0,
+    blendMode: p.blendMode,
   };
 }
 
@@ -1200,6 +1245,42 @@ function applyGradientOverlayToPixels(
  * 在 RGBA pixels（与图层同尺寸）上铺设 pattern，乘以原 alpha 掩膜来确定影响范围。
  * 用 phaseX/phaseY 决定 pattern 的原点偏移。
  */
+/**
+ * 单通道混合（base 为下层/图层本体，blend 为上层 overlay），输入输出均为 0..255。
+ * 仅实现 PSD 图层样式 overlay 常见的几种模式，其余回退 normal（直接取 blend）。
+ */
+function blendChannel(mode: string | undefined, base: number, blend: number): number {
+  const b = base / 255;
+  const s = blend / 255;
+  let r: number;
+  switch (mode) {
+    case 'multiply':
+      r = b * s; break;
+    case 'screen':
+      r = b + s - b * s; break;
+    case 'overlay':
+      r = b <= 0.5 ? 2 * b * s : 1 - 2 * (1 - b) * (1 - s); break;
+    case 'soft light':
+      // W3C/PS soft light 公式
+      r = s <= 0.5
+        ? b - (1 - 2 * s) * b * (1 - b)
+        : b + (2 * s - 1) * ((b <= 0.25 ? ((16 * b - 12) * b + 4) * b : Math.sqrt(b)) - b);
+      break;
+    case 'hard light':
+      r = s <= 0.5 ? 2 * b * s : 1 - 2 * (1 - b) * (1 - s); break;
+    case 'darken':
+      r = Math.min(b, s); break;
+    case 'lighten':
+      r = Math.max(b, s); break;
+    case 'linear dodge':
+      r = Math.min(1, b + s); break;
+    case 'normal':
+    default:
+      r = s; break;
+  }
+  return Math.round(Math.max(0, Math.min(1, r)) * 255);
+}
+
 function applyPatternOverlayToPixels(
   pixels: Uint8ClampedArray,
   w: number, h: number,
@@ -1211,6 +1292,7 @@ function applyPatternOverlayToPixels(
   const scale = pat.scale > 0 ? pat.scale : 1;
   const effW = Math.max(1, pw * scale);
   const effH = Math.max(1, ph * scale);
+  const mode = pat.blendMode;
 
   for (let y = 0; y < h; y++) {
     for (let x = 0; x < w; x++) {
@@ -1230,14 +1312,18 @@ function applyPatternOverlayToPixels(
       const pa = pat.rgba[pi + 3];
       const opac = (pa / 255) * pat.opacity;
       if (opac <= 0) continue;
+      // 先按 blendMode 把 pattern 混到本体 RGB，再用 overlay 不透明度在「混合结果」与「本体」之间插值。
+      const br = blendChannel(mode, pixels[idx], pr);
+      const bg = blendChannel(mode, pixels[idx + 1], pg);
+      const bb = blendChannel(mode, pixels[idx + 2], pb);
       if (opac >= 1) {
-        pixels[idx] = pr;
-        pixels[idx + 1] = pg;
-        pixels[idx + 2] = pb;
+        pixels[idx] = br;
+        pixels[idx + 1] = bg;
+        pixels[idx + 2] = bb;
       } else {
-        pixels[idx] = Math.round(pixels[idx] * (1 - opac) + pr * opac);
-        pixels[idx + 1] = Math.round(pixels[idx + 1] * (1 - opac) + pg * opac);
-        pixels[idx + 2] = Math.round(pixels[idx + 2] * (1 - opac) + pb * opac);
+        pixels[idx] = Math.round(pixels[idx] * (1 - opac) + br * opac);
+        pixels[idx + 1] = Math.round(pixels[idx + 1] * (1 - opac) + bg * opac);
+        pixels[idx + 2] = Math.round(pixels[idx + 2] * (1 - opac) + bb * opac);
       }
     }
   }
@@ -1745,12 +1831,23 @@ async function compositeLayerEffects(
   imageData: { data: Uint8ClampedArray | Uint8Array | Uint16Array | Float32Array; width: number; height: number },
   fillOpacity: number,
   effects: LayerEffectBundle,
-  patternOverlayMeta: { id: string; scale: number; opacity: number; phaseX: number; phaseY: number } | null,
+  patternOverlayMeta: PatternOverlayMeta | null,
   resolvedPattern: { rgba: Uint8ClampedArray; w: number; h: number } | null,
-): Promise<{ png: Uint8Array; expand: number }> {
+): Promise<{ png: Uint8Array; expand: number; overlayBlendMode?: string }> {
   const srcW = imageData.width;
   const srcH = imageData.height;
   const strokes = effects.strokes;
+
+  // 「纹理接管」场景：fillOpacity≈0（图层本体填充透明）但存在不透明 patternOverlay。
+  // PS 语义：本体实色不显示，可见的只有 pattern 纹理，且 pattern 以其 blendMode 相对
+  // 下层（而非本体实色）混合。因此此时应让 pattern 像素本身（按 normal）成为输出 RGB，
+  // 再把 pattern 的 blendMode 提升到节点级，由平台对下层做混合。
+  const hasOpaquePattern =
+    (!!effects.patternOverlay && effects.patternOverlay.opacity >= 1) ||
+    (!!patternOverlayMeta && !!resolvedPattern && patternOverlayMeta.opacity >= 1);
+  const patternTakesOver = fillOpacity <= 0.01 && hasOpaquePattern;
+  const patternRawBlendMode = effects.patternOverlay?.blendMode ?? patternOverlayMeta?.blendMode;
+  const overlayBlendMode = patternTakesOver ? patternRawBlendMode : undefined;
 
   // 计算总 expand：strokes + dropShadows + outerGlow + bevel(outer)
   const strokeExpand = computeStrokeExpansion(strokes);
@@ -1776,8 +1873,10 @@ async function compositeLayerEffects(
   const origAlpha = extractAlpha(srcPixels, srcW, srcH);
 
   // 在 src 空间应用各 overlay（顺序：Pattern → Gradient → Color → Satin）
+  // 纹理接管时 pattern 用 normal 直接成为输出 RGB（blendMode 提升到节点级，见 overlayBlendMode）。
+  const patternApplyBlend = patternTakesOver ? 'normal' : patternRawBlendMode;
   if (effects.patternOverlay) {
-    applyPatternOverlayToPixels(srcPixels, srcW, srcH, effects.patternOverlay);
+    applyPatternOverlayToPixels(srcPixels, srcW, srcH, { ...effects.patternOverlay, blendMode: patternApplyBlend });
   } else if (patternOverlayMeta && resolvedPattern) {
     applyPatternOverlayToPixels(srcPixels, srcW, srcH, {
       rgba: resolvedPattern.rgba,
@@ -1787,6 +1886,7 @@ async function compositeLayerEffects(
       opacity: patternOverlayMeta.opacity,
       phaseX: patternOverlayMeta.phaseX,
       phaseY: patternOverlayMeta.phaseY,
+      blendMode: patternApplyBlend,
     });
   }
   if (effects.gradientOverlay) {
@@ -1845,9 +1945,14 @@ async function compositeLayerEffects(
   }
 
   // 3. 合成 fill（含 overlays/satin/bevel）到 dst
+  // PS 语义：fillOpacity 只影响图层本体像素，不影响图层样式（pattern/gradient/color overlay 等）。
+  // 当存在不透明的 overlay 覆盖整层时，可见 RGB 完全来自 overlay，alpha 应保持原图 alpha
+  // 而非乘以 fillOpacity，否则 fillOpacity=0 会把 overlay 也一起消除（典型：fillOpacity=0 + patternOverlay）。
   const hasFullCoverageOverlay = !!(effects.solidFill && effects.solidFill.opacity >= 1) ||
     !!(effects.gradientOverlay && effects.gradientOverlay.opacity >= 1 &&
-      effects.gradientOverlay.opacityStops.every(s => s.opacity >= 1));
+      effects.gradientOverlay.opacityStops.every(s => s.opacity >= 1)) ||
+    !!(effects.patternOverlay && effects.patternOverlay.opacity >= 1) ||
+    !!(patternOverlayMeta && resolvedPattern && patternOverlayMeta.opacity >= 1);
   for (let y = 0; y < srcH; y++) {
     for (let x = 0; x < srcW; x++) {
       const si = (y * srcW + x) * 4;
@@ -1961,7 +2066,7 @@ async function compositeLayerEffects(
     dstCanvas.toBlob(b => b ? resolve(b) : reject(new Error('Failed to encode composite PNG')), 'image/png');
   });
   const buf = await blob.arrayBuffer();
-  return { png: new Uint8Array(buf), expand };
+  return { png: new Uint8Array(buf), expand, overlayBlendMode };
 }
 
 /**
@@ -2031,7 +2136,7 @@ async function encodeOriginalImageBase64(
   layer: Layer,
   fillOpacity: number,
   effectBundle: LayerEffectBundle,
-  patternOverlayMeta: { id: string; scale: number; opacity: number; phaseX: number; phaseY: number } | null,
+  patternOverlayMeta: PatternOverlayMeta | null,
   resolvedPatternData: { rgba: Uint8ClampedArray; w: number; h: number } | null,
 ): Promise<string | undefined> {
   try {
@@ -2074,6 +2179,10 @@ async function serializeLayer(
   let absX: number, absY: number, width: number, height: number;
 
   let isArtboard = false;
+  // 组上的矩形图层蒙版（滚动视口裁剪）：若存在，frame 用蒙版框做坐标/尺寸，
+  // 并让该组退出 isSubGroup（subGroup 走 0.01 尺寸 + 坐标透传，无法承载裁剪框）。
+  const groupMask = type === 'group' ? getGroupMaskRect(layer) : null;
+
   if (type === 'group') {
     const ab = getArtboardBounds(layer);
     isArtboard = !!ab;
@@ -2082,6 +2191,11 @@ async function serializeLayer(
       absY = ab.top;
       width = ab.right - ab.left;
       height = ab.bottom - ab.top;
+    } else if (groupMask) {
+      absX = groupMask.left;
+      absY = groupMask.top;
+      width = groupMask.right - groupMask.left;
+      height = groupMask.bottom - groupMask.top;
     } else {
       absX = bounds.left;
       absY = bounds.top;
@@ -2096,7 +2210,8 @@ async function serializeLayer(
     height = bounds.bottom - bounds.top;
   }
 
-  const isSubGroup = type === 'group' && depth > 0 && !isArtboard;
+  // 带矩形蒙版的组退出 subGroup，成为真实尺寸的裁剪 frame；其余组判定逻辑不变。
+  const isSubGroup = type === 'group' && depth > 0 && !isArtboard && !groupMask;
   const effectiveRootLeft = rootLeft ?? absX;
   const effectiveRootTop = rootTop ?? absY;
 
@@ -2126,6 +2241,17 @@ async function serializeLayer(
     effects: convertEffects(layer.effects),
     strokes: convertStrokes(layer.effects),
   };
+
+  // 组矩形蒙版：frame 已落在蒙版框原点，蒙版相对 frame 是满框矩形（left/top 恒 0）。
+  if (groupMask) {
+    serialized.groupMaskRect = {
+      left: 0,
+      top: 0,
+      width: Math.max(0, width),
+      height: Math.max(0, height),
+      defaultColor: groupMask.defaultColor,
+    };
+  }
 
 
   // 对所有有 effects 的图层（含 group 和 text）保留原始 effects 元数据，
@@ -2239,7 +2365,7 @@ async function serializeLayer(
   const patternOverlayMeta = getPatternOverlayMeta(layer);
   let resolvedPatternData: { rgba: Uint8ClampedArray; w: number; h: number } | null = null;
   if (patternOverlayMeta) {
-    resolvedPatternData = await resolvePatternData(patternOverlayMeta.id, layer, undefined);
+    resolvedPatternData = await resolvePatternData(patternOverlayMeta.id, layer, globalPsdPatterns);
   }
 
   if (serialized.type !== 'text' && layer.imageData && layer.imageData.width > 0 && layer.imageData.height > 0) {
@@ -2250,16 +2376,21 @@ async function serializeLayer(
       const needsComposite = hasAnyEffect(effectBundle) || !!patternOverlayMeta;
 
       if (needsComposite) {
-        const { png, expand } = await compositeLayerEffects(effectiveImageData, layerFillOpacity, effectBundle, patternOverlayMeta, resolvedPatternData);
+        const { png, expand, overlayBlendMode } = await compositeLayerEffects(effectiveImageData, layerFillOpacity, effectBundle, patternOverlayMeta, resolvedPatternData);
         serialized.imageIndex = images.length;
         images.push(png);
         if (expand > 0) {
           serialized.expandOffset = expand;
         }
+        // 纹理接管（fillOpacity≈0 + 不透明 overlay）：把 overlay 的混合模式提升到节点级，
+        // 使栅格化后的纹理相对下层正确混合（如绒布柔光纹理）。
+        if (overlayBlendMode) {
+          serialized.blendMode = convertBlendMode(overlayBlendMode);
+        }
         serialized.rawEffectsData = serializeRawPsdEffects(layer, layerFillOpacity);
         serialized.strokes = [];
         serialized.effects = [];
-        logger.info(`Layer "${layer.name}": composited with ${effectBundle.strokes.length} strokes, ${effectBundle.dropShadows.length} shadows, fillOpacity=${layerFillOpacity}, expand=${expand} (${serialized.width}x${serialized.height})`);
+        logger.info(`Layer "${layer.name}": composited with ${effectBundle.strokes.length} strokes, ${effectBundle.dropShadows.length} shadows, fillOpacity=${layerFillOpacity}, overlayBlend=${overlayBlendMode ?? 'none'}, expand=${expand} (${serialized.width}x${serialized.height})`);
       } else {
         const png = await imageDataToPng(effectiveImageData);
         serialized.imageIndex = images.length;
@@ -2290,16 +2421,20 @@ async function serializeLayer(
       const needsComposite = hasAnyEffect(effectBundle) || !!patternOverlayMeta;
 
       if (needsComposite && cvs.width > 0 && cvs.height > 0) {
-        const { png, expand } = await compositeLayerEffects(effectiveCanvasData, layerFillOpacity, effectBundle, patternOverlayMeta, resolvedPatternData);
+        const { png, expand, overlayBlendMode } = await compositeLayerEffects(effectiveCanvasData, layerFillOpacity, effectBundle, patternOverlayMeta, resolvedPatternData);
         serialized.imageIndex = images.length;
         images.push(png);
         if (expand > 0) {
           serialized.expandOffset = expand;
         }
+        // 纹理接管（fillOpacity≈0 + 不透明 overlay）：overlay 混合模式提升到节点级。
+        if (overlayBlendMode) {
+          serialized.blendMode = convertBlendMode(overlayBlendMode);
+        }
         serialized.rawEffectsData = serializeRawPsdEffects(layer, layerFillOpacity);
         serialized.strokes = [];
         serialized.effects = [];
-        logger.info(`Layer "${layer.name}": composited canvas with ${effectBundle.strokes.length} strokes, ${effectBundle.dropShadows.length} shadows, fillOpacity=${layerFillOpacity}, expand=${expand} (${serialized.width}x${serialized.height})`);
+        logger.info(`Layer "${layer.name}": composited canvas with ${effectBundle.strokes.length} strokes, ${effectBundle.dropShadows.length} shadows, fillOpacity=${layerFillOpacity}, overlayBlend=${overlayBlendMode ?? 'none'}, expand=${expand} (${serialized.width}x${serialized.height})`);
       } else {
         const png = maskedCanvasData ? await imageDataToPng(effectiveCanvasData) : await canvasToPng(cvs);
         serialized.imageIndex = images.length;
@@ -2415,7 +2550,8 @@ export async function parsePsdFile(
     logMissingFeatures: false,
   });
 
-  logger.info(`PSD structure parsed: ${psd.width}x${psd.height}, ${psd.children?.length ?? 0} top-level layers`);
+  globalPsdPatterns = (psd as any).patterns as typeof globalPsdPatterns;
+  logger.info(`PSD structure parsed: ${psd.width}x${psd.height}, ${psd.children?.length ?? 0} top-level layers, ${globalPsdPatterns?.length ?? 0} global patterns`);
   onProgress({ percent: 20, message: 'PSD structure parsed. Processing layers...' });
 
   const images: Uint8Array[] = [];

@@ -163,6 +163,13 @@ export interface SerializedLayer {
    */
   rawPsdAdjustments?: string;
   /**
+   * 组的矩形图层蒙版（layer mask）信息，坐标相对组 frame 原点。
+   * PSD 中组上的矩形蒙版用于裁剪溢出内容（滚动视口）。Figma/MasterGo 用
+   * frame 的 clipsContent + 蒙版框尺寸表达；此字段透传给 renderer 写入
+   * pluginData，round-trip 导出时重建组的矩形 layer mask。
+   */
+  groupMaskRect?: { left: number; top: number; width: number; height: number; defaultColor: number };
+  /**
    * 基底层「烘焙调整前的原始像素」的 base64 PNG。
    * 仅当该层带调整图层（rawPsdAdjustments）时存在。
    * 导出时基底层用这份原始像素 + 加回调整图层，PS 应用一次 = 与原始一致，
@@ -326,6 +333,12 @@ export interface ExportNodeData {
    * 导出时用它替换基底层位图，再加回调整图层，避免调整双重应用导致的颜色偏移。
    */
   rawPsdOriginalImage?: string;
+  /**
+   * 从节点 setPluginData('psd_group_mask', ...) 读出的组矩形图层蒙版数据 JSON
+   * （{left,top,width,height,defaultColor}，坐标相对组 frame）。
+   * 导出 PSD 时在组 layer 上重建矩形 layer mask，还原 PS 中的滚动视口裁剪。
+   */
+  rawPsdGroupMask?: string;
 }
 
 export interface ExportSelectionInfo {

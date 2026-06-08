@@ -354,6 +354,7 @@ function buildGroupNode(
     cornerRadii: convertCornerRadii(layer.cornerRadii),
     children,
     rawPsdEffects: layer.rawEffectsData,
+    psdGroupMask: layer.groupMaskRect ? JSON.stringify(layer.groupMaskRect) : undefined,
   };
 }
 

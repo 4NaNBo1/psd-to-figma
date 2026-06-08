@@ -178,4 +178,10 @@ export interface IRNode {
    * renderer 写入 setPluginData('psd_original_image', ...)，导出时用于还原原始像素 + 加回调整图层。
    */
   rawPsdOriginalImage?: string;
+  /**
+   * 组的矩形图层蒙版数据 JSON（{left,top,width,height,defaultColor}，坐标相对组 frame）。
+   * frame 节点用 clipsContent + 蒙版框尺寸表达裁剪；renderer 写入
+   * setPluginData('psd_group_mask', ...)，round-trip 导出时重建组的矩形 layer mask。
+   */
+  psdGroupMask?: string;
 }
