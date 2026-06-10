@@ -113,6 +113,12 @@ export interface SerializedTextData {
   boxBounds?: { width: number; height: number };
   /** PSD 文本弯曲（warp）变形。保存用于导出往返，详见 SerializedWarp。 */
   warp?: SerializedWarp;
+  /** round-trip 兜底：原始 PSD 文本图层的栅格像素（PS 渲染的字形位图，base64 PNG）+ 原始文档坐标 bounds。
+   * MasterGo 与 PS 同名字体（如 Asap SemiBold）字形度量不同，exportAsync 重渲染像素会偏小/偏移导致
+   * PS 中文本被裁剪；导出时若文本未被编辑则优先用这份原始像素，保证像素级保真。 */
+  rawImage?: { base64: string; left: number; top: number; width: number; height: number };
+  /** 原始 PSD 文本内容，用于导出时判断用户是否在平台改过文字（改过则原始像素失效，回退重渲染）。 */
+  originalText?: string;
 }
 
 export interface SerializedCornerRadii {
@@ -143,6 +149,17 @@ export interface SerializedLayer {
   strokes: SerializedStroke[];
   cornerRadii?: SerializedCornerRadii;
   expandOffset?: number;
+  /**
+   * 标记：本层的 effects 含「从父组下放来的」effect（见 psd-parser 的 isSubGroup 下放逻辑）。
+   * PS 中 pass-through 组的 layer effects 会作用于组合轮廓，Figma/MasterGo 的 frame 在
+   * pass-through 下不渲染 frame 自身的 effect，故导入时把组 effect 复制给子层做近似显示。
+   * 但组 effect 已由组自身的 rawEffectsData 完整 round-trip，下放到子层的副本在导出时是
+   * 冗余的——若子层没有自己的 rawEffectsData 兜底，会被当成子层自有 effect 错误写回 PSD
+   * （产生伪投影）。此标记透传到导出端，用于剔除这些下放副本。
+   */
+  inheritedGroupEffects?: boolean;
+  /** 同 inheritedGroupEffects，针对从父组下放来的 strokes。 */
+  inheritedGroupStrokes?: boolean;
   /**
    * 原始 PSD `layer.effects` 与 `layer.fillOpacity` 的 JSON 序列化数据。
    * 当图层的 effects 已被合成（rasterize）到位图中、`effects`/`strokes` 被清空时，
@@ -176,6 +193,39 @@ export interface SerializedLayer {
    * 避免「烘焙像素 + 再叠加调整图层」的双重应用（颜色偏移）。
    */
   rawPsdOriginalImage?: string;
+  /**
+   * 「patternOverlay 烘焙之前」的原始像素 base64 PNG。
+   * 仅当该层是「纯 patternOverlay 场景」（唯一启用的 effect 是 patternOverlay）时存在。
+   * 导出时该层用这份烤前像素 + 保留 patternOverlay effect + 写回 pattern 资源块，
+   * PS 应用一次 pattern = 与原始一致，避免「烤后像素 + 再叠加 pattern」的双重应用。
+   */
+  rawPsdPrePatternImage?: string;
+  /**
+   * 普通光栅层的 layer mask 数据（几何 + 单通道 alpha base64）。
+   * left/top 为相对层 bbox 左上的偏移（非文档绝对），导出端叠加图层最终坐标还原绝对位置。
+   * 导入时 mask 已烘焙进像素 alpha；此字段配合 rawLayerMaskImage 用于 round-trip 导出
+   * 还原为可编辑的独立 layer mask。仅普通像素层（非 group / 非调整基底 / 非纯 pattern）赋值。
+   */
+  rawLayerMask?: { left: number; top: number; width: number; height: number; defaultColor: number; dataB64: string };
+  /**
+   * 「烘焙 layer mask 之前」的原始像素 base64 PNG（与主像素同款 composite，仅未乘 mask alpha）。
+   * 导出时用它作 canvas + 还原 rawLayerMask 为 layer.mask，PS 渲染 canvas×mask = 原始效果，避免双重裁剪。
+   */
+  rawLayerMaskImage?: string;
+}
+
+/**
+ * PSD 全局 pattern 资源（Patt 块），用于 round-trip 导出时写回 psd.patterns。
+ * 对齐 ag-psd 的 PatternInfo（data 走 base64 传输）。
+ */
+export interface SerializedPattern {
+  id: string;
+  name: string;
+  x: number;
+  y: number;
+  bounds: { x: number; y: number; w: number; h: number };
+  /** pattern 像素 RGBA（Uint8Array, length=w*h*4）的 base64。*/
+  dataB64: string;
 }
 
 export interface SerializedPsd {
@@ -186,6 +236,8 @@ export interface SerializedPsd {
   images: string[];
   /** Original PSD top-level engineData (Txt2 block, base64). Used to preserve text engine data on roundtrip. */
   engineData?: string;
+  /** PSD 全局 pattern 资源表（patternOverlay 引用的像素数据）。round-trip 导出时写回 psd.patterns。*/
+  psdPatterns?: SerializedPattern[];
 }
 
 // --- Export types (design tool -> PSD) ---
@@ -270,6 +322,11 @@ export interface ExportTextInfo {
     nodeW: number;
     nodeH: number;
   };
+  /** round-trip 兜底：原始 PSD 文本栅格像素（base64 PNG）+ 原始文档坐标 bounds。从节点 pluginData
+   * 读回，导出时优先写回图层像素，规避 MasterGo 字形度量差异导致的裁剪。仅文本未被编辑时存在。 */
+  rawImage?: { base64: string; left: number; top: number; width: number; height: number };
+  /** 原始 PSD 文本内容，导出端用于判断是否编辑过（此字段校验通过后才填 rawImage）。 */
+  originalText?: string;
 }
 
 export interface ExportEffectInfo {
@@ -280,6 +337,9 @@ export interface ExportEffectInfo {
   blur: number;
   spread: number;
   visible: boolean;
+  /** 平台节点 effect 的混合模式（'NORMAL'/'MULTIPLY'/...）。导出时映射回 PSD blendMode，
+   * 避免一律硬编码成 multiply 丢失原始（如 normal）混合模式。 */
+  blendMode?: string;
 }
 
 export interface ExportNodeData {
@@ -334,11 +394,34 @@ export interface ExportNodeData {
    */
   rawPsdOriginalImage?: string;
   /**
+   * 从节点 setPluginData('psd_pre_pattern_image', ...) 读出的「patternOverlay 烘焙前原始像素」base64 PNG。
+   * 导出时用它替换图层位图 + 保留 patternOverlay effect + 写回 pattern 资源，避免 pattern 双重应用。
+   */
+  rawPsdPrePatternImage?: string;
+  /**
    * 从节点 setPluginData('psd_group_mask', ...) 读出的组矩形图层蒙版数据 JSON
    * （{left,top,width,height,defaultColor}，坐标相对组 frame）。
    * 导出 PSD 时在组 layer 上重建矩形 layer mask，还原 PS 中的滚动视口裁剪。
    */
   rawPsdGroupMask?: string;
+  /**
+   * 从节点 setPluginData('psd_layer_mask', ...) 读出的普通层 layer mask 数据 JSON
+   * （{left,top,width,height,defaultColor,dataB64}，left/top 为相对层 bbox 偏移）。
+   * 导出时叠加图层最终坐标，在该层上重建可编辑 layer mask。
+   */
+  rawPsdLayerMask?: string;
+  /**
+   * 从节点 setPluginData('psd_layer_mask_image', ...) 读出的「烘焙 mask 前原始像素」base64 PNG。
+   * 导出时用它作 canvas，配合 rawPsdLayerMask 还原 layer.mask，避免 mask 双重裁剪。
+   */
+  rawPsdLayerMaskImage?: string;
+  /**
+   * 从节点 setPluginData('psd_inherited_group_fx', ...) 读出的标记：本层 effects 含父组下放副本。
+   * 导出时若本层无 rawPsdEffects 兜底，则丢弃节点上的 dropShadow/innerShadow（视为下放伪影）。
+   */
+  inheritedGroupEffects?: boolean;
+  /** 从节点 setPluginData('psd_inherited_group_stroke', ...) 读出的标记：本层 strokes 含父组下放副本。 */
+  inheritedGroupStrokes?: boolean;
 }
 
 export interface ExportSelectionInfo {
@@ -358,5 +441,5 @@ export type PluginMessage =
   | { type: 'selection-changed'; data: ExportSelectionInfo }
   | { type: 'export-psd'; fileName: string }
   | { type: 'export-progress'; percent: number; message: string }
-  | { type: 'export-psd-data'; nodes: ExportNodeData[]; width: number; height: number }
+  | { type: 'export-psd-data'; nodes: ExportNodeData[]; width: number; height: number; engineData?: string; patterns?: string }
   | { type: 'export-psd-error'; message: string };

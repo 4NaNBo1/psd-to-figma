@@ -120,6 +120,11 @@ export interface IRTextProps {
   /** PSD 文本弯曲（warp）变形。Figma/MasterGo 不支持可编辑弧形弯曲，渲染时仅存入
    * 节点 pluginData，导出 PSD 时写回 layer.text.warp 以实现往返保真。 */
   warp?: IRWarp;
+  /** round-trip 兜底：原始 PSD 文本栅格像素（base64 PNG）+ 原始文档坐标 bounds。渲染时存入节点
+   * pluginData，导出时在文本未被编辑的前提下优先写回，规避平台字形度量差异导致的导出裁剪。 */
+  rawImage?: { base64: string; left: number; top: number; width: number; height: number };
+  /** 原始 PSD 文本内容，用于导出端判断是否被编辑过。 */
+  originalText?: string;
 }
 
 export interface IRNode {
@@ -148,6 +153,8 @@ export interface IRNode {
   isRootFrame?: boolean;
   /** Set on the root section: original PSD top-level engineData (base64 Txt2 block) */
   psdEngineData?: string;
+  /** Set on the root section: PSD 全局 pattern 资源表的 JSON 序列化。round-trip 导出写回 psd.patterns。*/
+  psdPatterns?: string;
   /**
    * 原始 PSD `layer.effects` 与 `layer.fillOpacity` 的 JSON 序列化数据。
    * 仅在位图/形状/智能对象图层 effects 被 rasterize 到 fill 时设置，
@@ -179,9 +186,32 @@ export interface IRNode {
    */
   rawPsdOriginalImage?: string;
   /**
+   * 「patternOverlay 烘焙之前」的原始像素 base64 PNG（仅纯 patternOverlay 场景）。
+   * renderer 写入 setPluginData('psd_pre_pattern_image', ...)，导出时用它 + 保留 patternOverlay
+   * effect + 写回 pattern 资源，避免「烤后像素 + 再叠加 pattern」双重应用。
+   */
+  rawPsdPrePatternImage?: string;
+  /**
    * 组的矩形图层蒙版数据 JSON（{left,top,width,height,defaultColor}，坐标相对组 frame）。
    * frame 节点用 clipsContent + 蒙版框尺寸表达裁剪；renderer 写入
    * setPluginData('psd_group_mask', ...)，round-trip 导出时重建组的矩形 layer mask。
    */
   psdGroupMask?: string;
+  /**
+   * 普通光栅层的 layer mask 数据 JSON（{left,top,width,height,defaultColor,dataB64}）。
+   * renderer 写入 setPluginData('psd_layer_mask', ...)，round-trip 导出时重建可编辑 layer mask。
+   */
+  psdLayerMask?: string;
+  /**
+   * 「烘焙 layer mask 前」的原始像素 base64 PNG。renderer 写入
+   * setPluginData('psd_layer_mask_image', ...)，导出时用它作 canvas + 还原 layer.mask，避免双重裁剪。
+   */
+  rawPsdLayerMaskImage?: string;
+  /**
+   * 标记：本节点 effects 含「从父组下放来的」effect（见 SerializedLayer.inheritedGroupEffects）。
+   * renderer 写入 setPluginData('psd_inherited_group_fx', '1')，导出端据此剔除下放的伪投影。
+   */
+  inheritedGroupEffects?: boolean;
+  /** 同上，针对从父组下放来的 strokes。renderer 写入 setPluginData('psd_inherited_group_stroke', '1')。 */
+  inheritedGroupStrokes?: boolean;
 }

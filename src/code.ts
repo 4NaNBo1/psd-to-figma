@@ -153,6 +153,7 @@ api.ui.onmessage = async (rawMsg: any) => {
         width: result.width,
         height: result.height,
         engineData: result.engineData,
+        patterns: result.patterns,
       } as PluginMessage);
     } catch (err) {
       const message = err instanceof Error ? err.message : '导出失败';

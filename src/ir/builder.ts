@@ -302,6 +302,8 @@ function buildTextProps(layer: SerializedLayer): IRTextProps | undefined {
     transformTx: td.transformTx,
     transformTy: td.transformTy,
     warp: td.warp,
+    rawImage: td.rawImage,
+    originalText: td.originalText,
   };
 }
 
@@ -355,6 +357,8 @@ function buildGroupNode(
     children,
     rawPsdEffects: layer.rawEffectsData,
     psdGroupMask: layer.groupMaskRect ? JSON.stringify(layer.groupMaskRect) : undefined,
+    inheritedGroupEffects: layer.inheritedGroupEffects,
+    inheritedGroupStrokes: layer.inheritedGroupStrokes,
   };
 }
 
@@ -382,6 +386,8 @@ function buildTextNode(
     strokes: irStrokes,
     textProps,
     rawPsdEffects: layer.rawEffectsData,
+    inheritedGroupEffects: layer.inheritedGroupEffects,
+    inheritedGroupStrokes: layer.inheritedGroupStrokes,
   };
 }
 
@@ -417,6 +423,11 @@ function buildShapeNode(
     rawPsdVectorData: layer.rawVectorData,
     rawPsdAdjustments: layer.rawPsdAdjustments,
     rawPsdOriginalImage: layer.rawPsdOriginalImage,
+    rawPsdPrePatternImage: layer.rawPsdPrePatternImage,
+    psdLayerMask: layer.rawLayerMask ? JSON.stringify(layer.rawLayerMask) : undefined,
+    rawPsdLayerMaskImage: layer.rawLayerMaskImage,
+    inheritedGroupEffects: layer.inheritedGroupEffects,
+    inheritedGroupStrokes: layer.inheritedGroupStrokes,
   };
 }
 
@@ -535,6 +546,7 @@ export function buildIRTree(psd: SerializedPsd): IRNode {
     strokes: [],
     children: [rootFrame],
     psdEngineData: psd.engineData,
+    psdPatterns: psd.psdPatterns ? JSON.stringify(psd.psdPatterns) : undefined,
   };
 
   return section;

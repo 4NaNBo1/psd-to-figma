@@ -60,6 +60,29 @@ function base64ToUint8Array(base64: string): Uint8Array {
   return bytes;
 }
 
+/**
+ * 解码 node-serializer 传来的 psd_patterns JSON（SerializedPattern[]），还原为
+ * ag-psd PatternInfo[]（data 从 base64 还原为 Uint8Array）。供写回 psd.patterns。
+ */
+function decodePsdPatterns(json: string | undefined): { id: string; name: string; x: number; y: number; bounds: { x: number; y: number; w: number; h: number }; data: Uint8Array }[] | null {
+  if (!json) return null;
+  try {
+    const arr = JSON.parse(json);
+    if (!Array.isArray(arr)) return null;
+    const out = arr.map((p: any) => ({
+      id: p.id,
+      name: p.name ?? '',
+      x: p.x ?? 0,
+      y: p.y ?? 0,
+      bounds: { x: p.bounds?.x ?? 0, y: p.bounds?.y ?? 0, w: p.bounds.w, h: p.bounds.h },
+      data: base64ToUint8Array(p.dataB64),
+    }));
+    return out.length ? out : null;
+  } catch {
+    return null;
+  }
+}
+
 function nodeIdToGuid(nodeId: string): string {
   const hex = nodeId.replace(/[^0-9a-fA-F]/g, '').padEnd(32, '0').slice(0, 32);
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
@@ -166,7 +189,7 @@ function decodeRawPsdEffects(raw: string): { effects: any; fillOpacity?: number 
  * 还原 PSD 矢量形状数据（vectorMask/vectorFill/vectorOrigination）。
  * 配合 `serializeRawVectorData` 写入端使用。
  */
-function decodeRawPsdVectorData(raw: string): { vectorMask?: any; vectorFill?: any; vectorOrigination?: any } | null {
+function decodeRawPsdVectorData(raw: string): { vectorMask?: any; vectorFill?: any; vectorOrigination?: any; vectorStroke?: any } | null {
   try {
     const parsed = JSON.parse(raw);
     if (!parsed || typeof parsed !== 'object') return null;
@@ -174,7 +197,62 @@ function decodeRawPsdVectorData(raw: string): { vectorMask?: any; vectorFill?: a
   } catch { return null; }
 }
 
-function buildEffects(node: ExportNodeData): {
+/**
+ * 由平台节点提取到的简化阴影（仅 color/offset/blur/spread）生成一个 PSD 合法的
+ * dropShadow/innerShadow 描述。必须补齐 contour/present/showInDialog/useGlobalLight/
+ * antialiased/layerConceals 等字段：缺少 contour curve 时 PS 打开会报
+ * “settings in the file are invalid”。
+ * 仅在 rawEffects 底子没有对应阴影（即设计工具新加的阴影）时调用。
+ */
+function makeShadow(e: { color: { r: number; g: number; b: number; a: number }; offsetX: number; offsetY: number; blur: number; spread: number; blendMode?: string }): LayerEffectShadow {
+  return {
+    enabled: true,
+    present: true,
+    showInDialog: true,
+    color: toRGBA(e.color),
+    opacity: e.color.a,
+    useGlobalLight: false,
+    // 与导入端 effect-converter 对称：导入用 offsetX=cos(angle)*d、offsetY=sin(angle)*d，
+    // 故导出须用 angle=atan2(offsetY, offsetX)。原先用 -offsetY 会把 PSD 90° round-trip 成 -90°（投影方向翻转）。
+    angle: Math.round(Math.atan2(e.offsetY, e.offsetX) * (180 / Math.PI)),
+    distance: { units: 'Pixels' as const, value: Math.round(Math.sqrt(e.offsetX ** 2 + e.offsetY ** 2)) },
+    size: { units: 'Pixels' as const, value: Math.round(e.blur) },
+    choke: { units: 'Pixels' as const, value: Math.round(e.spread) },
+    // 用节点 effect 的真实混合模式，缺失时回退 multiply（PS 投影默认）。原先一律硬编码 multiply 会把 normal 等丢失。
+    blendMode: (e.blendMode ? toBlendMode(e.blendMode) : 'multiply') as BlendMode,
+    noise: 0,
+    antialiased: false,
+    contour: { name: '线性', curve: [{ x: 0, y: 0 }, { x: 255, y: 255 }] },
+    layerConceals: true,
+  } as LayerEffectShadow;
+}
+
+/**
+ * 过滤 result.patternOverlay：
+ *   1. pattern.id 不在「实际可写回的 pattern 资源集合」内的引用一律剔除——
+ *      否则 PS 打开找不到 pattern 资源会报 program error（悬空引用，常见于 disabled 引用）。
+ *   2. 「纯 patternOverlay 烤前像素」场景(usedPrePattern) 保留 enabled 引用；
+ *      否则（烤后像素）剔除 enabled 引用，避免「烤后像素 + 再叠加 pattern」双重叠加。
+ * patternOverlay 在 ag-psd 中是单对象（非数组），单对象为主、数组兜底。
+ */
+function filterPatternOverlay(result: any, node: ExportNodeData, availablePatternIds?: Set<string>): void {
+  if (!result.patternOverlay) return;
+  const ids = availablePatternIds ?? new Set<string>();
+  const usedPrePattern = !!node.rawPsdPrePatternImage;
+  const arr = Array.isArray(result.patternOverlay) ? result.patternOverlay : [result.patternOverlay];
+  const kept = arr.filter((po: any) => {
+    const id = po?.pattern?.id;
+    if (!id || !ids.has(id)) return false;
+    return po.enabled === false || usedPrePattern;
+  });
+  if (kept.length === 0) {
+    delete result.patternOverlay;
+  } else {
+    result.patternOverlay = Array.isArray(result.patternOverlay) ? kept : kept[0];
+  }
+}
+
+function buildEffects(node: ExportNodeData, availablePatternIds?: Set<string>): {
   dropShadow?: LayerEffectShadow[];
   innerShadow?: LayerEffectShadow[];
   solidFill?: LayerEffectSolidFill[];
@@ -225,37 +303,38 @@ function buildEffects(node: ExportNodeData): {
   const isContainerNode = !!(node.children && node.children.length > 0);
   const isTextWithRaw = node.type === 'text' && !!rawEffects;
   if ((isContainerNode || isTextWithRaw) && rawEffects) {
+    // ag-psd 把 bevel 写到 group（section divider）上会产生 PS 无法解析的块，PS 打开报
+    // "program error reading layers"（数据驱动定位：原始/导出 bevel 数据逐字段一致，且同一 bevel
+    // 写在普通图层上正常、仅写在 group 上触发；实测也仅 bevel 触发，其它图层样式在 group 上均正常）。
+    // 这些 group bevel 绝大多数是 enabled:false 的禁用样式槽、不可见，剔除对画面零影响。
+    // 仅容器节点剔除；普通图层/文本的 bevel 写入正常，予以保留。
+    if (isContainerNode && result.bevel) delete result.bevel;
     return Object.keys(result).length > 0 ? result : undefined;
   }
 
   // figma/mastergo 上能提取到的字段优先覆盖（用户在设计工具上的编辑生效）。
   // 这些字段未被提取到时（即 figma/mastergo 上空），保留原始数据（如果有）。
-  const drops = node.effects.filter(e => e.type === 'DROP_SHADOW' && e.visible);
-  if (drops.length > 0) {
-    result.dropShadow = drops.map(e => ({
-      enabled: true,
-      color: toRGBA(e.color),
-      opacity: e.color.a,
-      angle: Math.round(Math.atan2(-e.offsetY, e.offsetX) * (180 / Math.PI)),
-      distance: { units: 'Pixels' as const, value: Math.round(Math.sqrt(e.offsetX ** 2 + e.offsetY ** 2)) },
-      size: { units: 'Pixels' as const, value: Math.round(e.blur) },
-      choke: { units: 'Pixels' as const, value: Math.round(e.spread) },
-      blendMode: 'multiply' as BlendMode,
-    }));
+  //
+  // 关键约束（防 round-trip 伪投影 + settings invalid）：
+  //   1. 若 rawEffects 底子里已有 dropShadow，**信任底子**，不用平台节点的简化投影覆盖。
+  //      因为底子是从 PSD 直读的完整合法结构（含 contour/present/useGlobalLight 等 PS 必需字段），
+  //      而平台节点上的投影很可能是 MasterGo createRectangle 自带的默认黑投影残留
+  //      （底子里该 dropShadow 是 enabled:false 时尤其如此）——覆盖会同时引入伪投影并丢失合法字段。
+  //   2. 仅当底子完全没有 dropShadow（纯设计工具创建的节点）时，才用平台节点投影生成，
+  //      且必须补齐 contour 等字段，否则 PS 打开报 “settings in the file are invalid”。
+  // 当本层 effects 是「从 pass-through 父组下放来的」副本（inheritedGroupEffects）且本层自身没有
+  // rawEffects 底子时，node.effects 里的 dropShadow/innerShadow 全是组下放的伪影——本层原始并无可见
+  // 阴影（若有会走合成路径并存下 rawEffects）。不写回 PSD，组 effect 由组自身的 rawEffectsData 还原。
+  const suppressInheritedShadow = !!node.inheritedGroupEffects && !rawEffects;
+
+  const drops = suppressInheritedShadow ? [] : node.effects.filter(e => e.type === 'DROP_SHADOW' && e.visible);
+  if (drops.length > 0 && !(Array.isArray(result.dropShadow) && result.dropShadow.length > 0)) {
+    result.dropShadow = drops.map(e => makeShadow(e));
   }
 
-  const inners = node.effects.filter(e => e.type === 'INNER_SHADOW' && e.visible);
-  if (inners.length > 0) {
-    result.innerShadow = inners.map(e => ({
-      enabled: true,
-      color: toRGBA(e.color),
-      opacity: e.color.a,
-      angle: Math.round(Math.atan2(-e.offsetY, e.offsetX) * (180 / Math.PI)),
-      distance: { units: 'Pixels' as const, value: Math.round(Math.sqrt(e.offsetX ** 2 + e.offsetY ** 2)) },
-      size: { units: 'Pixels' as const, value: Math.round(e.blur) },
-      choke: { units: 'Pixels' as const, value: Math.round(e.spread) },
-      blendMode: 'multiply' as BlendMode,
-    }));
+  const inners = suppressInheritedShadow ? [] : node.effects.filter(e => e.type === 'INNER_SHADOW' && e.visible);
+  if (inners.length > 0 && !(Array.isArray(result.innerShadow) && result.innerShadow.length > 0)) {
+    result.innerShadow = inners.map(e => makeShadow(e));
   }
 
   const solidFills = node.fills.filter(f => f.type === 'SOLID' && f.visible && f.color);
@@ -307,7 +386,9 @@ function buildEffects(node: ExportNodeData): {
     });
   }
 
-  const visibleStrokes = node.strokes.filter(s => s.visible);
+  // 同理：下放来的 stroke 副本在本层无 rawEffects 兜底时不写回（组 stroke 由组自身还原）。
+  const suppressInheritedStroke = !!node.inheritedGroupStrokes && !rawEffects;
+  const visibleStrokes = suppressInheritedStroke ? [] : node.strokes.filter(s => s.visible);
   if (visibleStrokes.length > 0) {
     result.stroke = visibleStrokes.map(s => ({
       enabled: true,
@@ -320,10 +401,12 @@ function buildEffects(node: ExportNodeData): {
     }));
   }
 
+  filterPatternOverlay(result, node, availablePatternIds);
+
   return Object.keys(result).length > 0 ? result : undefined;
 }
 
-async function buildLayer(node: ExportNodeData, parentClipRect?: { x: number; y: number; width: number; height: number; cornerRadii?: { topLeft: number; topRight: number; bottomLeft: number; bottomRight: number } } | null): Promise<Layer | Layer[]> {
+async function buildLayer(node: ExportNodeData, parentClipRect?: { x: number; y: number; width: number; height: number; cornerRadii?: { topLeft: number; topRight: number; bottomLeft: number; bottomRight: number } } | null, availablePatternIds?: Set<string>): Promise<Layer | Layer[]> {
   let layerTop = Math.round(node.y);
   let layerLeft = Math.round(node.x);
   let layerBottom = Math.round(node.y + node.height);
@@ -424,7 +507,7 @@ async function buildLayer(node: ExportNodeData, parentClipRect?: { x: number; y:
     clipping: node.isMask,
   };
 
-  const effects = buildEffects(node);
+  const effects = buildEffects(node, availablePatternIds);
   if (effects) {
     layer.effects = effects;
   }
@@ -445,6 +528,7 @@ async function buildLayer(node: ExportNodeData, parentClipRect?: { x: number; y:
       if (vectorData.vectorMask) (layer as any).vectorMask = vectorData.vectorMask;
       if (vectorData.vectorFill) (layer as any).vectorFill = vectorData.vectorFill;
       if (vectorData.vectorOrigination) (layer as any).vectorOrigination = vectorData.vectorOrigination;
+      if (vectorData.vectorStroke) (layer as any).vectorStroke = vectorData.vectorStroke;
     }
   }
 
@@ -456,10 +540,35 @@ async function buildLayer(node: ExportNodeData, parentClipRect?: { x: number; y:
     return estCW > node.width * 1.1;
   })();
   const shouldUseTextCanvas = isTextLayer && (hasPsdTextMetadata || isMultilineNoMeta);
+  // round-trip 最高优先级：文本未被编辑时，用导入时保存的原始 PSD 文本栅格像素 + 原始文档坐标，
+  // 规避 MasterGo/Figma 与 PS 同名字体（如 Asap SemiBold）字形度量差异导致的导出像素偏小/裁剪。
+  // engineData（transform/boundingBox/font）仍在下方照常写回，保持文本可编辑。
+  let usedRawTextImage = false;
+  const rawTextImage = isTextLayer ? node.textInfo!.rawImage : undefined;
+  if (rawTextImage && rawTextImage.base64) {
+    try {
+      const rawPng = base64ToUint8Array(rawTextImage.base64);
+      layer.canvas = await pngToCanvas(rawPng);
+      // 用原始 PSD 文档绝对坐标定位（绕过 boundingBox 估算与 MasterGo renderBounds 偏移）
+      layerLeft = rawTextImage.left;
+      layerTop = rawTextImage.top;
+      layerRight = rawTextImage.left + rawTextImage.width;
+      layerBottom = rawTextImage.top + rawTextImage.height;
+      layer.left = layerLeft;
+      layer.top = layerTop;
+      layer.right = layerRight;
+      layer.bottom = layerBottom;
+      usedRawTextImage = true;
+    } catch {
+      // 解码失败：回退到下方常规像素逻辑（平台重渲染像素）
+      usedRawTextImage = false;
+    }
+  }
+
   // round-trip：基底层若带「烘焙调整前原始像素」，用它替换烘焙后的位图。
   // 这样导出时基底层是原始颜色，配合下方加回的调整图层，PS 应用一次 = 与原始 PSD 一致。
-  const effectiveImageBase64 = node.rawPsdOriginalImage ?? node.imageBase64;
-  if (effectiveImageBase64 && !(isTextLayer && !shouldUseTextCanvas)) {
+  const effectiveImageBase64 = node.rawPsdPrePatternImage ?? node.rawPsdOriginalImage ?? node.rawPsdLayerMaskImage ?? node.imageBase64;
+  if (!usedRawTextImage && effectiveImageBase64 && !(isTextLayer && !shouldUseTextCanvas)) {
     try {
       const pngBytes = base64ToUint8Array(effectiveImageBase64);
       const rawCanvas = await pngToCanvas(pngBytes);
@@ -925,7 +1034,12 @@ async function buildLayer(node: ExportNodeData, parentClipRect?: { x: number; y:
       // 返回子层数组，由调用方展开插入父层。
       const flatLayers: Layer[] = [];
       for (let i = 0; i < node.children.length; i++) {
-        const result = await buildLayer(node.children[i], null);
+        const childNode = node.children[i];
+        // 跳过导入时为 alpha 裁剪拆出的 baseMask 副本（isMask，名字带 " (mask)"）。
+        // 它仅用于平台内裁剪显示，PSD clip 直接用 base 层 alpha 即可；若也展平回去会
+        // 多出一层 "(mask)"，破坏与原始 PSD 的层级对称。base(i=0)、被剪贴层(i>0)照常展平。
+        if (childNode.isMask) continue;
+        const result = await buildLayer(childNode, null, availablePatternIds);
         const childLayers = Array.isArray(result) ? result : [result];
         for (const cl of childLayers) {
           if (i > 0) cl.clipping = true;
@@ -941,7 +1055,7 @@ async function buildLayer(node: ExportNodeData, parentClipRect?: { x: number; y:
 
     layer.children = [];
     for (const child of node.children) {
-      const result = await buildLayer(child, null);
+      const result = await buildLayer(child, null, availablePatternIds);
       if (Array.isArray(result)) {
         layer.children.push(...result);
       } else {
@@ -992,6 +1106,46 @@ async function buildLayer(node: ExportNodeData, parentClipRect?: { x: number; y:
         }
       } catch { /* group mask restore failed, leave without mask */ }
     }
+  }
+
+  // round-trip：还原普通光栅层的可编辑 layer mask。导入时 mask 已烘焙进像素 alpha，
+  // 导出端 effectiveImageBase64 已优先用未烘焙的 rawPsdLayerMaskImage 作 canvas，这里把 mask
+  // 重建为独立的 layer.mask，PS 渲染 canvas×mask = 原始效果（既可编辑又不双重裁剪）。
+  // group 不会有此字段（组用 rawPsdGroupMask）；clip group 子层展平后各自在此还原 mask。
+  if (node.rawPsdLayerMask) {
+    try {
+      const lm = JSON.parse(node.rawPsdLayerMask) as {
+        left: number; top: number; width: number; height: number; defaultColor: number; dataB64: string;
+      };
+      const mw = Math.round(lm.width), mh = Math.round(lm.height);
+      if (mw > 0 && mh > 0 && lm.dataB64) {
+        const single = base64ToUint8Array(lm.dataB64);
+        const mcanvas = document.createElement('canvas');
+        mcanvas.width = mw;
+        mcanvas.height = mh;
+        const mctx = mcanvas.getContext('2d')!;
+        const mimg = mctx.createImageData(mw, mh);
+        // PSD 蒙版为灰度：写入 RGB=alpha 值、A=255，ag-psd 据此回写单通道蒙版。
+        for (let i = 0; i < mw * mh; i++) {
+          const v = single[i];
+          mimg.data[i * 4] = v;
+          mimg.data[i * 4 + 1] = v;
+          mimg.data[i * 4 + 2] = v;
+          mimg.data[i * 4 + 3] = 255;
+        }
+        mctx.putImageData(mimg, 0, 0);
+        // lm.left/top 是相对图层 bbox 左上的偏移；叠加图层最终坐标 layerLeft/layerTop 还原绝对位置，
+        // 使 mask 与 canvas 同步（不受视口裁剪改写坐标 / 平台坐标往返舍入偏差影响）。
+        (layer as any).mask = {
+          left: layerLeft + lm.left,
+          top: layerTop + lm.top,
+          right: layerLeft + lm.left + mw,
+          bottom: layerTop + lm.top + mh,
+          defaultColor: lm.defaultColor ?? 255,
+          canvas: mcanvas,
+        };
+      }
+    } catch { /* layer mask restore failed, leave without mask */ }
   }
 
   // 如果 base 层有关联的 PSD 调整图层数据，在其后插入调整图层（带 clipping 标记）
@@ -1064,8 +1218,14 @@ export async function buildAndDownloadPsd(
   fileName: string,
   onProgress: (percent: number, message: string) => void,
   engineData?: string,
+  patterns?: string,
 ): Promise<void> {
   onProgress(65, '构建 PSD 图层结构...');
+
+  // 解码根 section 上的 pattern 资源表，构造「实际可写回的 pattern id 集合」，
+  // 供 buildEffects → filterPatternOverlay 剔除悬空引用 / 双重叠加。
+  const decodedPatterns = decodePsdPatterns(patterns);
+  const availablePatternIds = new Set<string>((decodedPatterns ?? []).map(p => p.id));
 
   const children: Layer[] = [];
   for (let i = 0; i < nodes.length; i++) {
@@ -1073,7 +1233,7 @@ export async function buildAndDownloadPsd(
       65 + Math.round(((i + 1) / nodes.length) * 20),
       `构建图层 ${i + 1}/${nodes.length}: ${nodes[i].name}`,
     );
-    const result = await buildLayer(nodes[i]);
+    const result = await buildLayer(nodes[i], undefined, availablePatternIds);
     if (Array.isArray(result)) {
       children.push(...result);
     } else {
@@ -1114,6 +1274,12 @@ export async function buildAndDownloadPsd(
   // each text layer (via text.index) with the global TextFrameSet and render with correct font sizes.
   if (engineData) {
     psd.engineData = engineData;
+  }
+
+  // 写回 PSD 全局 pattern 资源表，让 patternOverlay 引用能在 PS 中找到对应像素，
+  // 避免悬空引用导致的 program error。
+  if (decodedPatterns && decodedPatterns.length) {
+    (psd as any).patterns = decodedPatterns;
   }
 
   const arrayBuffer = writePsd(psd, {

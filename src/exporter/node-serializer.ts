@@ -173,6 +173,7 @@ function extractEffects(node: any): ExportEffectInfo[] {
       blur: eff.radius ?? 0,
       spread: eff.spread ?? 0,
       visible: eff.visible !== false,
+      blendMode: typeof eff.blendMode === 'string' ? eff.blendMode : undefined,
     });
   }
   return result;
@@ -427,6 +428,19 @@ async function exportNodeImage(node: any, options?: { withoutStrokesAndEffects?:
     } catch { /* ignore */ }
   }
 
+  // exportAsync 会把节点 opacity 渲染进 PNG 的 alpha 通道；而导出端另有 node.opacity → layer.opacity
+  // 单独写回图层不透明度。若 PNG 也含 opacity，PS 中会「双重透明」（如 30% 图层最终显示成 ~9%，
+  // 典型：被栅格化的半透明 clipping 图层，原始格子纹理几乎看不见）。故导出像素前临时置 opacity=1，
+  // 让 PNG 只保留原始像素 alpha，透明度统一由 layer.opacity 原生承载（与导入端 opacity 走 node.opacity 对称）。
+  let savedOpacity: number | undefined;
+  try {
+    if (typeof node.opacity === 'number' && node.opacity < 1) {
+      savedOpacity = node.opacity;
+      node.opacity = 1;
+      await yieldThread();
+    }
+  } catch { /* ignore */ }
+
   try {
     const bytes: Uint8Array = await withTimeout(
       node.exportAsync({ format: 'PNG', constraint: { type: 'SCALE', value: scale } }),
@@ -445,6 +459,9 @@ async function exportNodeImage(node: any, options?: { withoutStrokesAndEffects?:
     }
     if (savedEffects !== undefined) {
       try { node.effects = savedEffects; } catch { /* ignore */ }
+    }
+    if (savedOpacity !== undefined) {
+      try { node.opacity = savedOpacity; } catch { /* ignore */ }
     }
   }
 }
@@ -569,6 +586,16 @@ async function serializeNode(
         const bboxStr = getData('psd_bounding_box');
         if (bboxStr) {
           try { data.textInfo.boundingBox = JSON.parse(bboxStr); } catch { /* ignore */ }
+        }
+        // round-trip 兜底：原始 PSD 文本栅格像素。仅当当前文本内容与导入时一致（未被编辑）才采用，
+        // 否则原始像素已失效，回退到 MasterGo/Figma 重渲染像素（exportNodeImage）。
+        const rawTextImgStr = getData('psd_raw_text_image');
+        if (rawTextImgStr) {
+          const origText = getData('psd_text_original');
+          const curText = data.textInfo.characters ?? '';
+          if (!origText || origText === curText) {
+            try { data.textInfo.rawImage = JSON.parse(rawTextImgStr); } catch { /* ignore */ }
+          }
         }
         const textIndexStr = getData('psd_text_index');
         if (textIndexStr) {
@@ -721,6 +748,16 @@ async function serializeNode(
     }
   } catch { /* ignore */ }
 
+  // 读取 psd_inherited_group_fx / psd_inherited_group_stroke：标记本层 effects/strokes 含
+  // 父组下放副本（见 psd-parser 的 isSubGroup 下放逻辑）。导出 buildEffects 在本层无
+  // rawPsdEffects 兜底时据此剔除这些下放副本，避免伪投影/伪描边写回 PSD。
+  try {
+    if (typeof node.getPluginData === 'function') {
+      if (node.getPluginData('psd_inherited_group_fx')) data.inheritedGroupEffects = true;
+      if (node.getPluginData('psd_inherited_group_stroke')) data.inheritedGroupStrokes = true;
+    }
+  } catch { /* ignore */ }
+
   // 读取 psd_expand_offset：psd-parser 为了让 stroke 像素完整保留，在 import 时把
   // 位图层向四周扩展了 expand 像素；export 时这里要把这个扩展还原回去，让 PSD layer 的 bbox
   // 与原始一致（PSD effects 由 PS 重新计算 stroke 范围，不需要 expand）。
@@ -772,12 +809,38 @@ async function serializeNode(
     }
   } catch { /* ignore */ }
 
+  // 读取 psd_pre_pattern_image：纯 patternOverlay 层「烤 pattern 前原始像素」，
+  // 导出时用它替换位图 + 保留 patternOverlay effect + 写回 pattern 资源，避免双重叠加。
+  try {
+    if (typeof node.getPluginData === 'function') {
+      const prePat = node.getPluginData('psd_pre_pattern_image');
+      if (prePat) {
+        data.rawPsdPrePatternImage = prePat;
+      }
+    }
+  } catch { /* ignore */ }
+
   // 读取 psd_group_mask：组的矩形图层蒙版（滚动视口裁剪），导出时在组 layer 上重建。
   try {
     if (typeof node.getPluginData === 'function') {
       const gm = node.getPluginData('psd_group_mask');
       if (gm) {
         data.rawPsdGroupMask = gm;
+      }
+    }
+  } catch { /* ignore */ }
+
+  // 读取 psd_layer_mask / psd_layer_mask_image：普通光栅层的可编辑 layer mask 数据 + 烘焙前原始像素。
+  // 导出时用原始像素作 canvas + 在该层重建 layer.mask，还原可编辑蒙版且避免 mask 双重裁剪。
+  try {
+    if (typeof node.getPluginData === 'function') {
+      const lm = node.getPluginData('psd_layer_mask');
+      if (lm) {
+        data.rawPsdLayerMask = lm;
+      }
+      const lmi = node.getPluginData('psd_layer_mask_image');
+      if (lmi) {
+        data.rawPsdLayerMaskImage = lmi;
       }
     }
   } catch { /* ignore */ }
@@ -865,6 +928,24 @@ function findPsdEngineData(node: any): string | undefined {
   return undefined;
 }
 
+// 递归查找根 Section 上的 psd_patterns plugin data（PSD 全局 pattern 资源表 JSON）。
+function findPsdPatterns(node: any): string | undefined {
+  if (!node || typeof node !== 'object') return undefined;
+  try {
+    if (typeof node.getPluginData === 'function') {
+      const v = node.getPluginData('psd_patterns');
+      if (v) return v;
+    }
+  } catch { /* ignore */ }
+  if ('children' in node && Array.isArray(node.children)) {
+    for (const child of node.children) {
+      const r = findPsdPatterns(child);
+      if (r) return r;
+    }
+  }
+  return undefined;
+}
+
 // 识别 importer 凭空添加的「根外壳」节点：
 //   - Section：带 psd_engine_data plugin data（PSD 文件名画板）
 //   - Frame：带 psd_root_frame='1' plugin data（isRootFrame 提供画布裁切的容器）
@@ -899,7 +980,7 @@ function expandImportWrappers(selection: any[]): any[] {
 export async function serializeSelection(
   onLog: LogFn,
   onProgress: ProgressFn,
-): Promise<{ nodes: ExportNodeData[]; width: number; height: number; engineData?: string }> {
+): Promise<{ nodes: ExportNodeData[]; width: number; height: number; engineData?: string; patterns?: string }> {
   const page = isMasterGo ? mg.document.currentPage : api.currentPage;
   const rawSelection = page.selection;
 
@@ -927,6 +1008,28 @@ export async function serializeSelection(
         cursor = cursor.parent;
       }
       if (engineData) break;
+    }
+  }
+
+  // pattern 资源同样写在 Section 上，须在展开外壳前读出。
+  let patterns: string | undefined;
+  for (const node of rawSelection) {
+    patterns = findPsdPatterns(node);
+    if (patterns) break;
+  }
+  if (!patterns) {
+    for (const node of rawSelection) {
+      let cursor: any = node;
+      while (cursor && typeof cursor === 'object') {
+        try {
+          if (typeof cursor.getPluginData === 'function') {
+            const v = cursor.getPluginData('psd_patterns');
+            if (v) { patterns = v; break; }
+          }
+        } catch { /* ignore */ }
+        cursor = cursor.parent;
+      }
+      if (patterns) break;
     }
   }
 
@@ -998,5 +1101,6 @@ export async function serializeSelection(
     width: psdCanvasWidth > 0 ? Math.round(psdCanvasWidth) : Math.max(1, Math.round(maxX - minX)),
     height: psdCanvasHeight > 0 ? Math.round(psdCanvasHeight) : Math.max(1, Math.round(maxY - minY)),
     engineData,
+    patterns,
   };
 }

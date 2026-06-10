@@ -4,6 +4,39 @@ import { countIRNodes } from '../ir/builder';
 
 const FALLBACK_FONT: FontName = { family: 'Inter', style: 'Regular' };
 
+const STYLE_VARIANT_GROUPS: string[][] = [
+  ['Thin', '100', 'Hairline'],
+  ['ExtraLight', 'Extra Light', 'UltraLight', 'Ultra Light', '200'],
+  ['Light', '300'],
+  ['Regular', 'Normal', 'Book', '400'],
+  ['Medium', '500'],
+  ['SemiBold', 'Semibold', 'Semi Bold', 'DemiBold', 'Demi Bold', 'Demi', '600'],
+  ['Bold', '700'],
+  ['ExtraBold', 'Extra Bold', 'UltraBold', 'Ultra Bold', '800'],
+  ['Black', 'Heavy', '900'],
+];
+
+// 给定一个 style 名，返回同字重的所有常见拼写候选（含自身）。用于字体加载失败时跨厂商
+// 命名兜底，避免直接退到 Regular 丢失字重。无法归类的 style 原样返回。
+function styleVariants(style: string): string[] {
+  const trimmed = (style || '').trim();
+  const norm = trimmed.replace(/[\s-]+/g, '').toLowerCase();
+  const isItalic = /italic|oblique/.test(norm);
+  const weightKey = norm.replace(/italic|oblique/g, '') || 'regular';
+  let group: string[] | null = null;
+  for (const g of STYLE_VARIANT_GROUPS) {
+    if (g.some(name => name.replace(/[\s-]+/g, '').toLowerCase() === weightKey)) { group = g; break; }
+  }
+  if (!group) return [trimmed];
+  if (isItalic) {
+    const out: string[] = [];
+    for (const w of group) out.push(`${w} Italic`, `${w}Italic`);
+    if (weightKey === 'regular' || weightKey === 'normal' || weightKey === 'book') out.push('Italic');
+    return out;
+  }
+  return [...group];
+}
+
 async function tryLoadFont(family: string, style: string): Promise<FontName | null> {
   try {
     const fontName: FontName = { family, style };
@@ -17,6 +50,18 @@ async function tryLoadFont(family: string, style: string): Promise<FontName | nu
 async function loadBestFont(rawFamily: string, rawStyle: string, onLog: LogFn, layerName: string): Promise<FontName> {
   const direct = await tryLoadFont(rawFamily, rawStyle);
   if (direct) return direct;
+
+  // 不同字体厂商对同一字重的 style 命名不一致（如 Semibold/SemiBold/Semi Bold/DemiBold/600）。
+  // builder 已把 PSD 字重归一（如 SemiBold→Semibold），但平台字体库可能用别的拼写，
+  // 直接匹配失败若直接退到 Regular 会导致「文字变细」。先尝试同字重的其它常见拼写，保住字重。
+  for (const variant of styleVariants(rawStyle)) {
+    if (variant === rawStyle) continue;
+    const alt = await tryLoadFont(rawFamily, variant);
+    if (alt) {
+      onLog('warn', `Font "${rawFamily} ${rawStyle}" not found for "${layerName}", using equivalent style "${variant}"`);
+      return alt;
+    }
+  }
 
   if (rawStyle !== 'Regular') {
     const regular = await tryLoadFont(rawFamily, 'Regular');
@@ -49,7 +94,12 @@ function applyCornerRadii(node: RectangleNode | FrameNode, radii: IRCornerRadii 
 }
 
 function applyEffects(node: SceneNode, effects: IRShadow[]): void {
-  if (effects.length === 0) return;
+  // effects 为空时显式清空：与 MasterGo 端对称（MasterGo 新建节点自带默认投影，
+  // 不清空会在 round-trip 导出时残留为伪投影）。Figma 默认 effects 为空，此处无害且防御其它来源。
+  if (effects.length === 0) {
+    try { (node as SceneNode & { effects: readonly Effect[] }).effects = []; } catch { /* 只读则忽略 */ }
+    return;
+  }
   const figmaEffects: Effect[] = effects.map((e) => ({
     type: e.type,
     color: { r: e.color.r, g: e.color.g, b: e.color.b, a: e.color.a },
@@ -60,6 +110,16 @@ function applyEffects(node: SceneNode, effects: IRShadow[]): void {
     blendMode: e.blendMode as BlendMode,
   } as DropShadowEffect | InnerShadowEffect));
   (node as SceneNode & { effects: readonly Effect[] }).effects = figmaEffects;
+}
+
+function applyInheritedFxMarkers(node: SceneNode, irNode: IRNode): void {
+  // 标记「从父组下放来的」effect/stroke，导出端据此剔除冗余副本（见 psd-parser 下放逻辑）。
+  if (irNode.inheritedGroupEffects) {
+    try { node.setPluginData('psd_inherited_group_fx', '1'); } catch { /* ignore */ }
+  }
+  if (irNode.inheritedGroupStrokes) {
+    try { node.setPluginData('psd_inherited_group_stroke', '1'); } catch { /* ignore */ }
+  }
 }
 
 function applySingleStroke(node: SceneNode, stroke: IRStroke): void {
@@ -236,6 +296,7 @@ async function createStyledTextNode(
   }
 
   applyEffects(text, irNode.effects);
+  applyInheritedFxMarkers(text, irNode);
   if (strokeOverride) {
     applySingleStroke(text, strokeOverride);
   }
@@ -255,6 +316,14 @@ async function createStyledTextNode(
   }
   if (tp.boundingBox) {
     try { text.setPluginData('psd_bounding_box', JSON.stringify(tp.boundingBox)); } catch { /* ignore */ }
+  }
+  // round-trip 兜底：保存原始 PSD 文本栅格像素 + 原始文本内容。导出端在文本未被编辑时优先写回这份
+  // 原始像素，规避平台与 PS 同名字体字形度量差异导致的导出裁剪（详见 IRTextProps.rawImage）。
+  if (tp.rawImage && tp.rawImage.base64) {
+    try { text.setPluginData('psd_raw_text_image', JSON.stringify(tp.rawImage)); } catch { /* ignore */ }
+    if (tp.originalText != null) {
+      try { text.setPluginData('psd_text_original', tp.originalText); } catch { /* ignore */ }
+    }
   }
   if (tp.textIndex != null && Number.isFinite(tp.textIndex)) {
     try { text.setPluginData('psd_text_index', String(tp.textIndex)); } catch { /* ignore */ }
@@ -410,6 +479,9 @@ async function renderNode(
         if (irNode.psdEngineData) {
           try { section.setPluginData('psd_engine_data', irNode.psdEngineData); } catch { /* ignore */ }
         }
+        if (irNode.psdPatterns) {
+          try { section.setPluginData('psd_patterns', irNode.psdPatterns); } catch { /* ignore */ }
+        }
 
         if (irNode.children) {
           for (const child of irNode.children) {
@@ -435,6 +507,7 @@ async function renderNode(
         frame.y = irNode.y;
 
         applyEffects(frame, irNode.effects);
+        applyInheritedFxMarkers(frame, irNode);
         applyStrokes(frame, irNode.strokes, onLog, irNode.name);
         applyCornerRadii(frame, irNode.cornerRadii);
         if (irNode.rawPsdEffects) {
@@ -478,6 +551,7 @@ async function renderNode(
 
         await applyFills(rect, irNode.fills, onLog, irNode.name);
         applyEffects(rect, irNode.effects);
+        applyInheritedFxMarkers(rect, irNode);
         applyStrokes(rect, irNode.strokes, onLog, irNode.name);
         applyCornerRadii(rect, irNode.cornerRadii);
         if (irNode.rawPsdEffects) {
@@ -494,6 +568,15 @@ async function renderNode(
         }
         if (irNode.rawPsdOriginalImage) {
           try { rect.setPluginData('psd_original_image', irNode.rawPsdOriginalImage); } catch { /* ignore */ }
+        }
+        if (irNode.rawPsdPrePatternImage) {
+          try { rect.setPluginData('psd_pre_pattern_image', irNode.rawPsdPrePatternImage); } catch { /* ignore */ }
+        }
+        if (irNode.psdLayerMask) {
+          try { rect.setPluginData('psd_layer_mask', irNode.psdLayerMask); } catch { /* ignore */ }
+        }
+        if (irNode.rawPsdLayerMaskImage) {
+          try { rect.setPluginData('psd_layer_mask_image', irNode.rawPsdLayerMaskImage); } catch { /* ignore */ }
         }
 
         onNodeCreated();

@@ -1,11 +1,13 @@
 diff --git a/node_modules/ag-psd/dist/additionalInfo.js b/node_modules/ag-psd/dist/additionalInfo.js
-index 2e62b06..99526c8 100644
+index 2e62b06..629b06b 100644
 --- a/node_modules/ag-psd/dist/additionalInfo.js
 +++ b/node_modules/ag-psd/dist/additionalInfo.js
-@@ -2131,15 +2131,24 @@ else {
+@@ -2130,17 +2130,78 @@ if (helpers_1.MOCK_HANDLERS) {
+ else {
      addHandler('Patt', // TODO: handle also Pat2 & Pat3
      function (// TODO: handle also Pat2 & Pat3
-     target) { return !target; }, function (reader, target, left) {
+-    target) { return !target; }, function (reader, target, left) {
++    target) { return !!(target && target.patterns && target.patterns.length); }, function (reader, target, left) {
 +        // Patch: 启用 pattern 资源解析（原版直接 skip，导致 patternOverlay 拿不到像素数据）。
 +        // 循环读取 Patt 块内的多个 pattern，填充 target.patterns；单个 pattern 解析失败时
 +        // 跳过剩余字节，避免中断整个 PSD 解析。
@@ -18,6 +20,7 @@ index 2e62b06..99526c8 100644
 -        // if (!target.patterns) target.patterns = [];
 -        // target.patterns.push(readPattern(reader));
 -        // skipBytes(reader, left());
+-    }, function (_writer, _target) {
 +        if (!target.patterns)
 +            target.patterns = [];
 +        try {
@@ -31,10 +34,63 @@ index 2e62b06..99526c8 100644
 +        }
 +        if (left() > 0)
 +            (0, psdReader_1.skipBytes)(reader, left());
-     }, function (_writer, _target) {
++    }, function (writer, target) {
++        // Patch: 写入 pattern 资源块（原版 write 为空，导致 round-trip 时 patternOverlay
++        // 引用的 pattern 资源丢失，PS 打开报 program error）。严格逆 psdReader.readPattern：
++        // RGB(colorMode=3) + raw(compressionMode=0) 压缩。target.patterns 由导出端填充。
++        var patterns = target.patterns || [];
++        for (var pi = 0; pi < patterns.length; pi++) {
++            writePattern(writer, patterns[pi]);
++        }
++    });
++}
++// Patch: pattern 资源块的二进制序列化（严格逆 psdReader.readPattern）。
++// p: { id, name, x, y, bounds:{w,h}, data: Uint8Array(RGBA, length=w*h*4) }
++// 仅支持 RGB(colorMode=3) + raw(compressionMode=0)，与 readPattern 的对应分支对称。
++function writePattern(writer, p) {
++    var w = p.bounds.w, h = p.bounds.h, data = p.data;
++    // 外层：length(uint32) + 内容，4 字节对齐（readPattern: while(length%4) length++）
++    (0, psdWriter_1.writeSection)(writer, 4, function () {
++        (0, psdWriter_1.writeUint32)(writer, 1); // version = 1
++        (0, psdWriter_1.writeUint32)(writer, 3); // colorMode = 3 (RGB)
++        (0, psdWriter_1.writeInt16)(writer, p.x || 0);
++        (0, psdWriter_1.writeInt16)(writer, p.y || 0);
++        (0, psdWriter_1.writeUnicodeString)(writer, p.name || ''); // len(uint32)+UTF16BE
++        (0, psdWriter_1.writePascalString)(writer, p.id || '', 1); // padTo=1
++        // ---- virtual memory array list ----
++        (0, psdWriter_1.writeUint32)(writer, 3); // VMAL version = 3
++        (0, psdWriter_1.writeSection)(writer, 1, function () { // VMAL length（readPattern 读后即读 top）
++            (0, psdWriter_1.writeUint32)(writer, 0); // top
++            (0, psdWriter_1.writeUint32)(writer, 0); // left
++            (0, psdWriter_1.writeUint32)(writer, h); // bottom
++            (0, psdWriter_1.writeUint32)(writer, w); // right
++            var channelsCount = 3;
++            (0, psdWriter_1.writeUint32)(writer, channelsCount);
++            // readPattern 循环 i < channelsCount + 2；RGB 三通道 has=1，其余 has=0
++            for (var i = 0; i < channelsCount + 2; i++) {
++                if (i < 3) {
++                    (0, psdWriter_1.writeUint32)(writer, 1); // has = 1
++                    (0, psdWriter_1.writeUint32)(writer, 4 + 16 + 2 + 1 + w * h); // length = pixelDepth(4)+rect(16)+pd2(2)+compr(1)+raw(w*h)
++                    (0, psdWriter_1.writeUint32)(writer, 8); // pixelDepth
++                    (0, psdWriter_1.writeUint32)(writer, 0); // ctop
++                    (0, psdWriter_1.writeUint32)(writer, 0); // cleft
++                    (0, psdWriter_1.writeUint32)(writer, h); // cbottom
++                    (0, psdWriter_1.writeUint32)(writer, w); // cright
++                    (0, psdWriter_1.writeUint16)(writer, 8); // pixelDepth2
++                    (0, psdWriter_1.writeUint8)(writer, 0); // compressionMode = 0 (raw)
++                    for (var px = 0; px < w * h; px++) {
++                        (0, psdWriter_1.writeUint8)(writer, data[px * 4 + i]);
++                    }
++                }
++                else {
++                    (0, psdWriter_1.writeUint32)(writer, 0); // has = 0
++                }
++            }
++        });
      });
  }
-@@ -3419,7 +3428,6 @@ addHandler('lfx2', function (target) { return target.effects !== undefined && !h
+ /*
+@@ -3419,7 +3480,6 @@ addHandler('lfx2', function (target) { return target.effects !== undefined && !h
      if (version !== 0)
          throw new Error("Invalid lfx2 version");
      var desc = (0, descriptor_1.readVersionAndDescriptor)(reader);

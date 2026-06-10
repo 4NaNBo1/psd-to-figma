@@ -8,6 +8,7 @@ import type {
   SerializedColor,
   SerializedTextCase,
   SerializedWarp,
+  SerializedPattern,
   LayerType,
 } from '../types/psd-types';
 import { convertEffects, convertStrokes } from '../converter/effect-converter';
@@ -22,7 +23,7 @@ export interface ParseProgress {
 // PSD 全局 pattern 资源表（Patt 块，已通过 ag-psd patch 启用解析）。
 // patternOverlay 只引用 pattern id，像素数据存在这里 / layer.patterns 中。
 // 在 parsePsdFile 入口设置，供 resolvePatternData 跨递归层级取用。
-let globalPsdPatterns: { id: string; bounds: { w: number; h: number }; data: Uint8Array }[] | undefined;
+let globalPsdPatterns: { id: string; name?: string; x?: number; y?: number; bounds: { x?: number; y?: number; w: number; h: number }; data: Uint8Array }[] | undefined;
 
 function toColor(c: Color | undefined): SerializedColor {
   if (!c) return { r: 0, g: 0, b: 0, a: 1 };
@@ -504,6 +505,27 @@ function uint8ArrayToBase64(bytes: Uint8Array): string {
     binary += String.fromCharCode(bytes[i]);
   }
   return btoa(binary);
+}
+
+/**
+ * 序列化 PSD 全局 pattern 资源（Patt 块）为可传输结构，data 转 base64。
+ * round-trip 导出时由 psd-builder 解码并写回 psd.patterns。
+ */
+function serializePsdPatterns(patterns: typeof globalPsdPatterns): SerializedPattern[] | undefined {
+  if (!patterns || !patterns.length) return undefined;
+  const out: SerializedPattern[] = [];
+  for (const p of patterns) {
+    if (!p?.id || !p.data || !p.bounds) continue;
+    out.push({
+      id: p.id,
+      name: p.name ?? '',
+      x: p.x ?? 0,
+      y: p.y ?? 0,
+      bounds: { x: p.bounds.x ?? 0, y: p.bounds.y ?? 0, w: p.bounds.w, h: p.bounds.h },
+      dataB64: uint8ArrayToBase64(p.data),
+    });
+  }
+  return out.length ? out : undefined;
 }
 
 async function canvasToPng(canvas: HTMLCanvasElement): Promise<Uint8Array> {
@@ -1681,6 +1703,18 @@ function hasAnyEffect(b: LayerEffectBundle): boolean {
     b.innerShadows.length > 0 || !!b.outerGlow || !!b.innerGlow;
 }
 
+/**
+ * 「纯 patternOverlay 场景」(P1)：除 patternOverlay 外没有任何其它会被合成进位图的 effect。
+ * 此时可保存「烤 pattern 之前」的原始像素，导出端用它 + 保留 patternOverlay effect + 写回
+ * pattern 资源，PS 应用一次 pattern = 与原始一致，避免双重叠加。
+ * 注：fillOpacity<1 不算「其它 effect」——纹理接管(fillOpacity≈0)正是纯 pattern 的典型形态。
+ */
+function isPatternOnlyLayer(b: LayerEffectBundle, patternOverlayMeta: PatternOverlayMeta | null): boolean {
+  if (!patternOverlayMeta) return false;
+  return b.strokes.length === 0 && !b.solidFill && !b.gradientOverlay && !b.bevel && !b.satin &&
+    b.dropShadows.length === 0 && b.innerShadows.length === 0 && !b.outerGlow && !b.innerGlow;
+}
+
 function copyAlphaToPadded(alpha: Uint8Array, srcW: number, srcH: number, dstW: number, dstH: number, expand: number): Uint8Array {
   const out = new Uint8Array(dstW * dstH);
   for (let y = 0; y < srcH; y++) {
@@ -2109,9 +2143,10 @@ function serializeRawVectorData(layer: Layer): string | undefined {
   const vm = (layer as any).vectorMask;
   const vf = (layer as any).vectorFill;
   const vo = (layer as any).vectorOrigination;
-  if (!vm && !vf && !vo) return undefined;
+  const vs = (layer as any).vectorStroke;
+  if (!vm && !vf && !vo && !vs) return undefined;
   try {
-    const safe = JSON.parse(JSON.stringify({ vectorMask: vm, vectorFill: vf, vectorOrigination: vo }, (_k, v) => {
+    const safe = JSON.parse(JSON.stringify({ vectorMask: vm, vectorFill: vf, vectorOrigination: vo, vectorStroke: vs }, (_k, v) => {
       if (v instanceof Uint8Array || v instanceof Uint8ClampedArray) {
         let bin = '';
         for (let i = 0; i < v.length; i++) bin += String.fromCharCode(v[i]);
@@ -2368,6 +2403,28 @@ async function serializeLayer(
     resolvedPatternData = await resolvePatternData(patternOverlayMeta.id, layer, globalPsdPatterns);
   }
 
+  // round-trip 兜底：文本层额外编码原始 PSD 栅格像素（PS 渲染的字形位图）+ 原始文档坐标 bounds。
+  // MasterGo 与 PS 同名字体（如 Asap SemiBold）字形度量不同，exportAsync 重渲染像素会偏小/偏移
+  // 导致 PS 中文本被裁剪；导出时若文本未被编辑则优先用这份原始像素，保证像素级保真。
+  if (serialized.type === 'text' && serialized.textData && layer.imageData && layer.imageData.width > 0 && layer.imageData.height > 0) {
+    try {
+      const maskedText = applyLayerMask(layer.imageData, layer);
+      const effText = maskedText ?? layer.imageData;
+      const textPng = await imageDataToPng(effText);
+      serialized.textData.rawImage = {
+        base64: uint8ArrayToBase64(textPng),
+        left: (layer as any).left ?? bounds.left,
+        top: (layer as any).top ?? bounds.top,
+        width: effText.width,
+        height: effText.height,
+      };
+      serialized.textData.originalText = layer.text?.text ?? serialized.textData.text;
+      logger.info(`Layer "${layer.name}": saved original text raster (${effText.width}x${effText.height}) for round-trip`);
+    } catch (e) {
+      logger.warn(`Failed to encode original text raster for "${layer.name}": ${e instanceof Error ? e.message : e}`);
+    }
+  }
+
   if (serialized.type !== 'text' && layer.imageData && layer.imageData.width > 0 && layer.imageData.height > 0) {
     onProgress({ percent: 0, message: `Encoding image: ${layer.name}` });
     try {
@@ -2390,6 +2447,11 @@ async function serializeLayer(
         serialized.rawEffectsData = serializeRawPsdEffects(layer, layerFillOpacity);
         serialized.strokes = [];
         serialized.effects = [];
+        // P1 纯 pattern：保存「烤 pattern 之前」的原始像素，供导出端还原可编辑 patternOverlay。
+        if (isPatternOnlyLayer(effectBundle, patternOverlayMeta)) {
+          serialized.rawPsdPrePatternImage = uint8ArrayToBase64(await imageDataToPng(effectiveImageData));
+          logger.info(`Layer "${layer.name}": saved pre-pattern image for round-trip`);
+        }
         logger.info(`Layer "${layer.name}": composited with ${effectBundle.strokes.length} strokes, ${effectBundle.dropShadows.length} shadows, fillOpacity=${layerFillOpacity}, overlayBlend=${overlayBlendMode ?? 'none'}, expand=${expand} (${serialized.width}x${serialized.height})`);
       } else {
         const png = await imageDataToPng(effectiveImageData);
@@ -2405,6 +2467,36 @@ async function serializeLayer(
         if (origB64) {
           serialized.rawPsdOriginalImage = origB64;
           logger.info(`Layer "${layer.name}": saved pre-adjustment original image (${origData.width}x${origData.height}) for round-trip`);
+        }
+      }
+
+      // round-trip：普通光栅层的 layer mask —— 存 mask 数据 + 未烘焙 mask 的原始像素，导出端还原可编辑 mask。
+      // 仅在 mask 真实生效（maskedData 非 null）、且非调整基底（origData）/非纯 pattern 时：后两类已有各自
+      // 的原始像素兜底，但那两份像素均已烘焙 mask，再叠加独立 layer.mask 会双重裁剪。
+      if (maskedData && !origData && !isPatternOnlyLayer(effectBundle, patternOverlayMeta)) {
+        const lmData = serializeAdjustmentMask(layer.mask);
+        if (lmData) {
+          // mask 几何存为相对层 bbox 左上的偏移（非文档绝对），导出端用「图层最终坐标 + 偏移」还原，
+          // 使 mask 始终跟随 canvas 的最终位置（视口裁剪改写坐标、平台坐标往返舍入都不致错位）。
+          lmData.left -= bounds.left;
+          lmData.top -= bounds.top;
+          // 未烘焙 mask 的原始像素：把 layer.imageData 规范化为 Uint8ClampedArray（未乘 mask alpha），
+          // 走与主像素相同的 composite/encode，唯一差异即不乘 mask alpha。
+          const lw = layer.imageData.width, lh = layer.imageData.height;
+          const lsrc = layer.imageData.data;
+          const unmasked = new Uint8ClampedArray(lw * lh * 4);
+          if (lsrc instanceof Uint8ClampedArray || lsrc instanceof Uint8Array) {
+            unmasked.set(lsrc.subarray(0, lw * lh * 4));
+          } else {
+            for (let i = 0; i < lw * lh * 4; i++) unmasked[i] = Math.min(255, Math.max(0, Math.round(Number(lsrc[i]))));
+          }
+          const unmaskedData = { data: unmasked, width: lw, height: lh };
+          const preMaskPng = needsComposite
+            ? (await compositeLayerEffects(unmaskedData, layerFillOpacity, effectBundle, patternOverlayMeta, resolvedPatternData)).png
+            : await imageDataToPng(unmaskedData);
+          serialized.rawLayerMask = lmData;
+          serialized.rawLayerMaskImage = uint8ArrayToBase64(preMaskPng);
+          logger.info(`Layer "${layer.name}": saved layer mask (${lmData.width}x${lmData.height}) + pre-mask image for round-trip`);
         }
       }
     } catch (e) {
@@ -2434,6 +2526,11 @@ async function serializeLayer(
         serialized.rawEffectsData = serializeRawPsdEffects(layer, layerFillOpacity);
         serialized.strokes = [];
         serialized.effects = [];
+        // P1 纯 pattern：保存「烤 pattern 之前」的原始像素，供导出端还原可编辑 patternOverlay。
+        if (isPatternOnlyLayer(effectBundle, patternOverlayMeta)) {
+          serialized.rawPsdPrePatternImage = uint8ArrayToBase64(await imageDataToPng(effectiveCanvasData));
+          logger.info(`Layer "${layer.name}": saved pre-pattern canvas for round-trip`);
+        }
         logger.info(`Layer "${layer.name}": composited canvas with ${effectBundle.strokes.length} strokes, ${effectBundle.dropShadows.length} shadows, fillOpacity=${layerFillOpacity}, overlayBlend=${overlayBlendMode ?? 'none'}, expand=${expand} (${serialized.width}x${serialized.height})`);
       } else {
         const png = maskedCanvasData ? await imageDataToPng(effectiveCanvasData) : await canvasToPng(cvs);
@@ -2449,6 +2546,23 @@ async function serializeLayer(
         if (origB64) {
           serialized.rawPsdOriginalImage = origB64;
           logger.info(`Layer "${layer.name}": saved pre-adjustment original canvas (${origData.width}x${origData.height}) for round-trip`);
+        }
+      }
+
+      // round-trip：普通光栅层的 layer mask —— 存 mask 数据 + 未烘焙 mask 的原始像素，导出端还原可编辑 mask。
+      // rawCanvasData 来自 getImageData，已是 Uint8ClampedArray，直接走同款 composite/encode（不乘 mask alpha）。
+      if (maskedCanvasData && !origData && !isPatternOnlyLayer(effectBundle, patternOverlayMeta)) {
+        const lmData = serializeAdjustmentMask(layer.mask);
+        if (lmData) {
+          // mask 几何存为相对层 bbox 左上的偏移（见 image 分支说明）。
+          lmData.left -= bounds.left;
+          lmData.top -= bounds.top;
+          const preMaskPng = needsComposite
+            ? (await compositeLayerEffects(rawCanvasData, layerFillOpacity, effectBundle, patternOverlayMeta, resolvedPatternData)).png
+            : await imageDataToPng(rawCanvasData);
+          serialized.rawLayerMask = lmData;
+          serialized.rawLayerMaskImage = uint8ArrayToBase64(preMaskPng);
+          logger.info(`Layer "${layer.name}": saved layer mask (${lmData.width}x${lmData.height}) + pre-mask canvas for round-trip`);
         }
       }
     } catch (e) {
@@ -2514,7 +2628,10 @@ async function serializeLayer(
 
     // PS 中 group 的 layer effects（stroke/shadow 等）会合成到整个 group 内容的
     // 像素轮廓上。Figma/MasterGo 无法在 frame 上实现这种效果（frame stroke 只沿矩形边框）。
-    // 近似方案：将 group 的 enabled strokes/effects 下发给子节点。
+    // 近似方案：将 group 的 enabled strokes/effects 下发给子节点（仅用于平台内显示）。
+    // round-trip 注意：组 effect 已由组自身的 rawEffectsData 完整保留并导出，下发到子层的
+    // 副本是冗余的——给被下发的子层打标记，导出端（无自有 rawEffectsData 时）据此剔除，
+    // 否则会被当成子层自有 effect 写回 PSD，产生伪投影/伪描边。
     if (isSubGroup && serialized.children.length > 0) {
       const groupStrokes = serialized.strokes;
       const groupEffects = serialized.effects;
@@ -2522,9 +2639,11 @@ async function serializeLayer(
         for (const child of serialized.children) {
           if (groupStrokes.length > 0) {
             child.strokes = [...child.strokes, ...groupStrokes];
+            child.inheritedGroupStrokes = true;
           }
           if (groupEffects.length > 0) {
             child.effects = [...child.effects, ...groupEffects];
+            child.inheritedGroupEffects = true;
           }
         }
         serialized.strokes = [];
@@ -2588,5 +2707,6 @@ export async function parsePsdFile(
     engineData: psd.engineData,
     layers,
     images: base64Images,
+    psdPatterns: serializePsdPatterns(globalPsdPatterns),
   };
 }
