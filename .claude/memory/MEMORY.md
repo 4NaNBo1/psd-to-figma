@@ -1,0 +1,9 @@
+- [PSD round-trip 调试流程](debug-workflow-psd-roundtrip.md) — 导入/还原不对时三级排查:MCP 读节点 → 插桩日志 → 解析 PSD,数据驱动不猜
+- [Roo Code LiteLLM 代理](roo-code-litellm-proxy.md) — 内部网关本地代理(8788)+ 网关不收 tools 的坑
+- [MasterGo effect visible:false 坑](mastergo-effect-visible-false.md) — 禁用效果不能靠 visible 屏蔽，必须在 effect-converter 不进 IR
+- [ag-psd 不解析 pattern](agpsd-pattern-not-parsed.md) — Patt 块默认被 skip，patternOverlay 拿不到像素，已 patch 启用 + 喂 psd.patterns
+- [ag-psd group bevel 报错](agpsd-group-bevel-program-error.md) — group 上的 bevel 让 PS 报 program error，导出端须在容器节点剔除 bevel
+- [导出层几何用相对坐标](psd-export-layer-geometry-relative-coords.md) — parentClipRect 视口裁剪会改写 layerLeft，挂层几何(layer mask)须存相对层偏移 + 导出叠加 layerLeft
+- [文本栅格化用兄弟rect](psd-text-rasterize-companion-rect.md) — spread阴影/warp 文本回退栅格化，合成图须挂兄弟rect不能进TextNode.fills；imageData是warp前字形
+- [亮度对比度 useLegacy](psd-brightness-contrast-uselegacy.md) — 新版(useLegacy:false)须用端点保护曲线烘焙，旧版线性公式削平亮部致 coin 发糊
+- [投影羽化高斯近似](psd-shadow-feather-gaussian.md) — 3-pass box 每-pass 半径须=blur·0.55，否则辉光过窄像硬描边(featherAlpha)
