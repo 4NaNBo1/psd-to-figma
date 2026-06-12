@@ -3122,7 +3122,6 @@ async function serializeLayer(
       serialized.textData.docBoundsY -= parentTop;
     }
 
-
     const solidFills = (layer.effects as any)?.solidFill;
     if (solidFills && serialized.textData) {
       for (const sf of solidFills) {

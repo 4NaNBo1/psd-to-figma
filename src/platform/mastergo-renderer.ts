@@ -593,8 +593,19 @@ function alignTextPosition(text: any, irNode: IRNode, onLog: LogFn, linePaddingO
     if (Number.isFinite(renderBoundsY) && Number.isFinite(boundingBoxY)) {
       appliedPadding = renderBoundsY - boundingBoxY;
       text.y = targetY - appliedPadding;
+      if (tp.docBoundsY != null && irNode.strokes.length === 0) {
+        const actualRenderY = text.absoluteRenderBounds?.y;
+        if (Number.isFinite(actualRenderY)) {
+          const drift = actualRenderY - irNode.y;
+          if (Math.abs(drift) > 0.01) {
+            text.y -= drift;
+            appliedPadding += drift;
+          }
+        }
+      }
     }
   } catch { /* keep targetY */ }
+
   // 把 linePadding 存到 plugin data，供 export 还原 PSD ty 时使用
   try { text.setPluginData('psd_line_padding_y', String(appliedPadding)); } catch { /* ignore */ }
   return appliedPadding;
