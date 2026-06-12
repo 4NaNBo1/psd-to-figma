@@ -567,7 +567,15 @@ async function buildLayer(node: ExportNodeData, parentClipRect?: { x: number; y:
 
   // round-trip：智能对象（带模糊滤镜，导入时已重渲染清晰像素）的兜底数据。
   // 导出时优先用存储的原始模糊 channel data 还原图层位图，并用存储的 transform 重建 placedLayer。
-  let smartObjData: { origImageB64?: string; transform?: number[]; soId?: string; width?: number; height?: number } | null = null;
+  let smartObjData: {
+    origImageB64?: string; transform?: number[]; soId?: string; width?: number; height?: number;
+    filter?: any;
+    filterEffectsMasks?: Array<{
+      id: string; top: number; left: number; bottom: number; right: number; depth: number;
+      channels: ({ compressionMode: number; data: string } | null)[];
+      extra?: { top: number; left: number; bottom: number; right: number; compressionMode: number; data: string };
+    }>;
+  } | null = null;
   if (node.rawPsdSmartObject) {
     try { smartObjData = JSON.parse(node.rawPsdSmartObject); } catch { smartObjData = null; }
   }
@@ -1030,6 +1038,16 @@ async function buildLayer(node: ExportNodeData, parentClipRect?: { x: number; y:
       width: smartObjData.width ?? node.width,
       height: smartObjData.height ?? node.height,
     };
+    if (smartObjData.filter) {
+      (layer.placedLayer as any).filter = smartObjData.filter;
+    }
+    if (smartObjData.filterEffectsMasks) {
+      (layer as any).filterEffectsMasks = smartObjData.filterEffectsMasks.map(m => ({
+        id: m.id, top: m.top, left: m.left, bottom: m.bottom, right: m.right, depth: m.depth,
+        channels: m.channels.map(ch => ch ? { compressionMode: ch.compressionMode, data: base64ToUint8Array(ch.data) } : undefined),
+        extra: m.extra ? { top: m.extra.top, left: m.extra.left, bottom: m.extra.bottom, right: m.extra.right, compressionMode: m.extra.compressionMode, data: base64ToUint8Array(m.extra.data) } : undefined,
+      }));
+    }
   } else if (node.isInstance && node.imageBase64 && !(node.children && node.children.length > 0)) {
     // 仅叶子 instance（无 children）作为 smart object，有 children 的展开为 group
     layer.placedLayer = {

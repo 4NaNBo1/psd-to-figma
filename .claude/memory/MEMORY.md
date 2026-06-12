@@ -8,3 +8,4 @@
 - [亮度对比度 useLegacy](psd-brightness-contrast-uselegacy.md) — 新版(useLegacy:false)须用端点保护曲线烘焙，旧版线性公式削平亮部致 coin 发糊
 - [投影羽化高斯近似](psd-shadow-feather-gaussian.md) — 3-pass box 每-pass 半径须=blur·0.55，否则辉光过窄像硬描边(featherAlpha)
 - [智能对象模糊滤镜重渲染](psd-smart-object-blur-rerender.md) — 模糊智能滤镜致发糊:用内嵌源仿射重渲染清晰像素,坑在blend判定/补回曲线+剪贴调整/超采样
+- [graphify 无 key AST 档](graphify-no-key-ast-tier.md) — 本机无 LLM key,只能 graphify update .(AST 图);extract --backend claude 需 ANTHROPIC_API_KEY

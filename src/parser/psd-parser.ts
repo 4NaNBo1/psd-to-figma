@@ -876,11 +876,162 @@ function getRerenderBaseCache(layer: Layer): { canvas: HTMLCanvasElement; width:
 }
 
 /**
+ * PackBits (RLE) 解码：PSD channel data 的标准压缩格式 (compressionMode=1)。
+ * 将压缩的 Uint8Array 解码为原始灰度字节。
+ */
+function decodePackBits(encoded: Uint8Array, expectedLength: number): Uint8Array {
+  const result = new Uint8Array(expectedLength);
+  let srcIdx = 0;
+  let dstIdx = 0;
+  while (srcIdx < encoded.length && dstIdx < expectedLength) {
+    const n = (encoded[srcIdx] << 24) >> 24; // sign-extend to int8
+    srcIdx++;
+    if (n >= 0) {
+      const count = n + 1;
+      for (let i = 0; i < count && dstIdx < expectedLength && srcIdx < encoded.length; i++) {
+        result[dstIdx++] = encoded[srcIdx++];
+      }
+    } else if (n > -128) {
+      const count = 1 - n;
+      const val = srcIdx < encoded.length ? encoded[srcIdx++] : 0;
+      for (let i = 0; i < count && dstIdx < expectedLength; i++) {
+        result[dstIdx++] = val;
+      }
+    }
+    // n === -128: no-op (spec)
+  }
+  return result;
+}
+
+/**
+ * 从 layer.filterEffectsMasks (FEid/FXid) 解码滤镜蒙版 alpha，映射到层 bounds 尺寸。
+ * 返回 Uint8Array(W*H)，每像素一个灰度值：255=显示滤镜效果(模糊), 0=显示清晰源。
+ * 无蒙版数据时返回 null。
+ */
+function decodeFilterEffectsMask(
+  layer: Layer,
+  bounds: { left: number; top: number; right: number; bottom: number }
+): Uint8Array | null {
+  const masks = (layer as any).filterEffectsMasks as Array<{
+    id: string;
+    top: number; left: number; bottom: number; right: number;
+    depth: number;
+    channels: ({ compressionMode: number; data: Uint8Array } | undefined)[];
+    extra?: { top: number; left: number; bottom: number; right: number; compressionMode: number; data: Uint8Array };
+  }> | undefined;
+  if (!masks || masks.length === 0) return null;
+
+  // 取第一个有效蒙版 entry（通常智能对象只有一个 filterEffects entry）
+  const entry = masks[0];
+  const mw = entry.right - entry.left;
+  const mh = entry.bottom - entry.top;
+  if (mw <= 0 || mh <= 0) return null;
+
+
+  // 用户蒙版 channel 是 channels[maxChannels]（倒数第二个 slot）。
+  // channels 长度 = maxChannels + 2，所以 user mask index = channels.length - 2。
+  const userMaskIdx = entry.channels.length - 2;
+  const maskCh = userMaskIdx >= 0 ? entry.channels[userMaskIdx] : undefined;
+  if (!maskCh) {
+    // 无 user mask channel，尝试 extra 块作为 fallback
+    if (!entry.extra) return null;
+    const extra = entry.extra;
+    const ew = extra.right - extra.left;
+    const eh = extra.bottom - extra.top;
+    if (ew <= 0 || eh <= 0) return null;
+    const rawLen = ew * eh;
+    const decoded = extra.compressionMode === 1
+      ? decodePackBits(extra.data, rawLen)
+      : extra.data.length >= rawLen ? extra.data : null;
+    if (!decoded) return null;
+    return mapMaskToBounds(decoded, ew, eh, extra.left, extra.top, bounds);
+  }
+
+  const rawLen = mw * mh;
+  const decoded = maskCh.compressionMode === 1
+    ? decodePackBitsRLE(maskCh.data, mw, mh)
+    : maskCh.data.length >= rawLen ? maskCh.data : null;
+  if (!decoded) return null;
+
+  return mapMaskToBounds(decoded, mw, mh, entry.left, entry.top, bounds);
+}
+
+/**
+ * PackBits RLE for PSD channel: 逐行解码（每行有 2 字节行长前缀）。
+ */
+function decodePackBitsRLE(encoded: Uint8Array, width: number, height: number): Uint8Array | null {
+  const result = new Uint8Array(width * height);
+  let srcIdx = 0;
+
+  // 跳过行长表（每行 2 字节 × height 行）
+  const rowLengthsStart = srcIdx;
+  srcIdx += height * 2;
+  if (srcIdx > encoded.length) {
+    // 没有行长表，尝试无行长表的纯 PackBits 解码
+    return decodePackBits(encoded, width * height);
+  }
+
+  for (let row = 0; row < height; row++) {
+    const rowLen = (encoded[rowLengthsStart + row * 2] << 8) | encoded[rowLengthsStart + row * 2 + 1];
+    const rowEnd = srcIdx + rowLen;
+    let dstIdx = row * width;
+    const dstEnd = dstIdx + width;
+
+    while (srcIdx < rowEnd && dstIdx < dstEnd) {
+      const n = (encoded[srcIdx] << 24) >> 24;
+      srcIdx++;
+      if (n >= 0) {
+        const count = n + 1;
+        for (let i = 0; i < count && dstIdx < dstEnd && srcIdx < rowEnd; i++) {
+          result[dstIdx++] = encoded[srcIdx++];
+        }
+      } else if (n > -128) {
+        const count = 1 - n;
+        const val = srcIdx < rowEnd ? encoded[srcIdx++] : 0;
+        for (let i = 0; i < count && dstIdx < dstEnd; i++) {
+          result[dstIdx++] = val;
+        }
+      }
+    }
+    srcIdx = rowEnd;
+  }
+
+  return result;
+}
+
+/**
+ * 将解码后的蒙版灰度数据（maskW×maskH，文档坐标 maskLeft/maskTop）映射到层 bounds 区域。
+ * 蒙版范围外的像素默认 0（黑=显示清晰源）。
+ */
+function mapMaskToBounds(
+  maskData: Uint8Array, maskW: number, maskH: number,
+  maskLeft: number, maskTop: number,
+  bounds: { left: number; top: number; right: number; bottom: number }
+): Uint8Array {
+  const bw = bounds.right - bounds.left;
+  const bh = bounds.bottom - bounds.top;
+  const result = new Uint8Array(bw * bh); // 默认 0（黑=清晰源）
+
+  for (let y = 0; y < bh; y++) {
+    const docY = bounds.top + y;
+    const my = docY - maskTop;
+    if (my < 0 || my >= maskH) continue;
+    for (let x = 0; x < bw; x++) {
+      const docX = bounds.left + x;
+      const mx = docX - maskLeft;
+      if (mx < 0 || mx >= maskW) continue;
+      result[y * bw + x] = maskData[my * maskW + mx];
+    }
+  }
+  return result;
+}
+
+/**
  * 用智能对象内嵌源 + placedLayer.transform 仿射变换，渲染出与 PS merged composite 一致的像素。
  * placedLayer.transform 为 8 数（TL,TR,BR,BL 角点），对金币这类是纯仿射（平行四边形，无透视），用 setTransform 还原。
  * 两条路径：
  *  - 模糊路径（hasBlurSmartFilter）：清晰源(币主体)叠在「模糊缓存(=动感拖尾)」之上，还原「清晰币 + 拖尾」。
- *    （PS 用滤镜蒙版让主体显示清晰、拖尾区显示模糊；ag-psd 不暴露滤镜蒙版，用 sharp-over-blur 近似。）
+ *    PS 用 filterEffectsMasks 滤镜蒙版控制每个像素的拖尾强度（白=模糊效果, 黑=清晰源），实现精确的单向弱拖尾。
  *  - 锐度路径（无模糊但源分辨率更高）：纯清晰源超采样，但带轮廓守卫——源若为带不透明白底的扁平合成、
  *    或重渲染轮廓与缓存差异过大（源像素≠该层实际像素，如 backlgt 白底），返回 null 回退缓存，避免白块。
  * 失败（无源 / 解码失败 / 无 transform / 非仿射 / 无锐度增益 / 守卫未过）返回 null，调用方回退原像素。
@@ -969,13 +1120,48 @@ function renderSmartObjectClearImage(
     return { data: sharpId.data, width: W, height: H };
   }
 
-  // 模糊路径（scale=1）：清晰源 + destination-over 拖尾合成。
-  // scale=1 保证 W=bw, H=bh，图片尺寸=bounds 尺寸，位置精确。
-  // ag-psd 不暴露 PS 滤镜蒙版，拖尾为对称模糊的近似；round-trip 通过 rawPsdSmartObject 完美还原。
+  // 模糊路径（scale=1）：清晰源 + 模糊缓存拖尾合成。
+  // PS 用 filterEffectsMasks（滤镜蒙版 alpha）逐像素控制：白=显示滤镜效果(模糊拖尾)，黑=显示原始像素(清晰源)。
+  // 公式：pixel = sharp × (1 - mask) + blurCache × mask
   const trail = getRerenderBaseCache(layer);
   if (!trail) {
     return { data: sharpId.data, width: W, height: H };
   }
+
+  const filterMask = decodeFilterEffectsMask(layer, bounds);
+
+
+  if (filterMask) {
+    // 精确蒙版合成：逐像素按蒙版 alpha 混合。
+    const trailCv = document.createElement('canvas');
+    trailCv.width = W; trailCv.height = H;
+    const tctx = trailCv.getContext('2d')!;
+    tctx.drawImage(trail.canvas, 0, 0, trail.width, trail.height, 0, 0, W, H);
+    const trailId = tctx.getImageData(0, 0, W, H);
+
+    const out = new Uint8ClampedArray(W * H * 4);
+    const sharp = sharpId.data;
+    const blur = trailId.data;
+    const mask = filterMask;
+    for (let i = 0; i < W * H; i++) {
+      const p = i * 4;
+      const m = mask[i] / 255;
+      const im = 1 - m;
+      out[p]     = Math.round(sharp[p]     * im + blur[p]     * m);
+      out[p + 1] = Math.round(sharp[p + 1] * im + blur[p + 1] * m);
+      out[p + 2] = Math.round(sharp[p + 2] * im + blur[p + 2] * m);
+      out[p + 3] = Math.round(sharp[p + 3] * im + blur[p + 3] * m);
+    }
+    logger.info(`Layer "${layer.name}": filter mask compositing (mask ${filterMask.length} px, bounds ${W}x${H})`);
+    return { data: out, width: W, height: H };
+  }
+
+  // PS smart filter 渲染模型：清晰源 → motion blur → 滤镜蒙版混合。
+  // 默认蒙版全白 = 完全显示模糊结果。channel data (trail) 就是 PS 的最终渲染结果。
+  // 但 trail 中心是「模糊后的主体」而非清晰源，主体会比 PS merged composite 稍模糊，
+  // 因为 PS 在后续合成时可能还有额外步骤。
+  // 用 destination-over 在 sharp 不透明处显示清晰源（更锐利），透明处显示 trail（拖尾）。
+  // sharp 已经应用了非模糊滤镜(curves)，trail 的 curves 效果在 channel data 中已内置。
   sctx.putImageData(sharpId, 0, 0);
   const out = document.createElement('canvas');
   out.width = W; out.height = H;
@@ -3062,6 +3248,16 @@ async function serializeLayer(
           ? await imageDataToPng(layer.imageData)
           : (layer.canvas ? await canvasToPng(layer.canvas as HTMLCanvasElement) : null);
         const pl = (layer as any).placedLayer;
+        const feMasks = (layer as any).filterEffectsMasks as Array<{
+          id: string; top: number; left: number; bottom: number; right: number; depth: number;
+          channels: ({ compressionMode: number; data: Uint8Array } | undefined)[];
+          extra?: { top: number; left: number; bottom: number; right: number; compressionMode: number; data: Uint8Array };
+        }> | undefined;
+        const feData = feMasks ? feMasks.map(m => ({
+          id: m.id, top: m.top, left: m.left, bottom: m.bottom, right: m.right, depth: m.depth,
+          channels: m.channels.map(ch => ch ? { compressionMode: ch.compressionMode, data: uint8ArrayToBase64(ch.data) } : null),
+          extra: m.extra ? { top: m.extra.top, left: m.extra.left, bottom: m.extra.bottom, right: m.extra.right, compressionMode: m.extra.compressionMode, data: uint8ArrayToBase64(m.extra.data) } : undefined,
+        })) : undefined;
         serialized.rawPsdSmartObject = JSON.stringify({
           origImageB64: origPng ? uint8ArrayToBase64(origPng) : undefined,
           transform: pl.transform,
@@ -3069,6 +3265,7 @@ async function serializeLayer(
           width: pl.width,
           height: pl.height,
           filter: pl.filter,
+          filterEffectsMasks: feData,
         });
       } catch (e) {
         logger.warn(`Failed to save smart-object round-trip data for "${layer.name}": ${e instanceof Error ? e.message : e}`);
