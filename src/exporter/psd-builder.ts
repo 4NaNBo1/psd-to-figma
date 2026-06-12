@@ -565,9 +565,16 @@ async function buildLayer(node: ExportNodeData, parentClipRect?: { x: number; y:
     }
   }
 
+  // round-trip：智能对象（带模糊滤镜，导入时已重渲染清晰像素）的兜底数据。
+  // 导出时优先用存储的原始模糊 channel data 还原图层位图，并用存储的 transform 重建 placedLayer。
+  let smartObjData: { origImageB64?: string; transform?: number[]; soId?: string; width?: number; height?: number } | null = null;
+  if (node.rawPsdSmartObject) {
+    try { smartObjData = JSON.parse(node.rawPsdSmartObject); } catch { smartObjData = null; }
+  }
+
   // round-trip：基底层若带「烘焙调整前原始像素」，用它替换烘焙后的位图。
   // 这样导出时基底层是原始颜色，配合下方加回的调整图层，PS 应用一次 = 与原始 PSD 一致。
-  const effectiveImageBase64 = node.rawPsdPrePatternImage ?? node.rawPsdOriginalImage ?? node.rawPsdLayerMaskImage ?? node.imageBase64;
+  const effectiveImageBase64 = node.rawPsdPrePatternImage ?? node.rawPsdOriginalImage ?? smartObjData?.origImageB64 ?? node.rawPsdLayerMaskImage ?? node.imageBase64;
   if (!usedRawTextImage && effectiveImageBase64 && !(isTextLayer && !shouldUseTextCanvas)) {
     try {
       const pngBytes = base64ToUint8Array(effectiveImageBase64);
@@ -714,7 +721,10 @@ async function buildLayer(node: ExportNodeData, parentClipRect?: { x: number; y:
       'JUSTIFIED': 'justify-all',
     };
 
-    const isPointText = ti.textAutoResize === 'WIDTH_AND_HEIGHT';
+    // 优先用原始 PSD shapeType 判定 point/box（栅格化文本的 textAutoResize 被强制设为 NONE，
+    // 不能据此判定，否则 point 文本误走 box 分支丢缩放/旋转）。无 shapeType 时回退 textAutoResize。
+    const isPointText = ti.shapeType === 'point' ||
+      (ti.shapeType == null && ti.textAutoResize === 'WIDTH_AND_HEIGHT');
     const fontSize = firstStyle?.fontSize ?? 16;
 
     const centerX = node.x + node.width / 2;
@@ -1010,7 +1020,17 @@ async function buildLayer(node: ExportNodeData, parentClipRect?: { x: number; y:
 
   }
 
-  if (node.isInstance && node.imageBase64 && !(node.children && node.children.length > 0)) {
+  if (smartObjData && Array.isArray(smartObjData.transform) && smartObjData.transform.length >= 8 && !(node.children && node.children.length > 0)) {
+    // round-trip：带模糊滤镜的智能对象，用存储的原始 transform 重建 placedLayer。
+    // 图层位图已用 effectiveImageBase64（原始模糊 channel data）还原，PSD 图层数据接近原始、信息不丢。
+    layer.placedLayer = {
+      id: smartObjData.soId || nodeIdToGuid(node.id),
+      type: 'raster',
+      transform: smartObjData.transform,
+      width: smartObjData.width ?? node.width,
+      height: smartObjData.height ?? node.height,
+    };
+  } else if (node.isInstance && node.imageBase64 && !(node.children && node.children.length > 0)) {
     // 仅叶子 instance（无 children）作为 smart object，有 children 的展开为 group
     layer.placedLayer = {
       id: nodeIdToGuid(node.id),

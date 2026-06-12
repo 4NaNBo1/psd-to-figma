@@ -9,6 +9,8 @@ import type {
   SerializedTextCase,
   SerializedWarp,
   SerializedPattern,
+  SerializedFill,
+  SerializedGradientOverlay,
   LayerType,
 } from '../types/psd-types';
 import { convertEffects, convertStrokes } from '../converter/effect-converter';
@@ -24,6 +26,27 @@ export interface ParseProgress {
 // patternOverlay 只引用 pattern id，像素数据存在这里 / layer.patterns 中。
 // 在 parsePsdFile 入口设置，供 resolvePatternData 跨递归层级取用。
 let globalPsdPatterns: { id: string; name?: string; x?: number; y?: number; bounds: { x?: number; y?: number; w: number; h: number }; data: Uint8Array }[] | undefined;
+
+// PSD 智能对象内嵌源文件表（lnk2/lnkD 块）。placedLayer.id 引用其中的 linkedFile.id。
+// 在 parsePsdFile 入口设置，供「智能对象带模糊滤镜时用源重渲染清晰像素」跨递归取用。
+let globalPsdLinkedFiles: { id?: string; name?: string; data?: Uint8Array }[] | undefined;
+
+// 智能对象内嵌源解码缓存（按 placedLayer.id）。多个实例（如 cions 组 4 枚 coin）常共享同一源，
+// 大 PSB 解码昂贵，缓存避免重复 readPsd。null 表示该源解码失败/不可用，不再重试。
+// transparentFrac：源（降采样采样）中 alpha<250 的像素占比，用于判断源是否「带白底的扁平合成」
+// （占比≈0 = 不透明白底，源像素不等于该层实际像素，重渲染会得到白块，须拒绝）。
+type SmartObjectSource = { canvas: HTMLCanvasElement; sw: number; sh: number; transparentFrac: number };
+let globalSmartObjectSourceCache: Map<string, SmartObjectSource | null> | undefined;
+
+/**
+ * 效果原生化总开关。true：整层若所有效果都能与 PS 像素级一致地原生化，则保留为平台可编辑
+ * 属性（effects/strokes/overlay fill）而非烤进位图；false：退回旧「全合成」行为。
+ * 出问题时置 false 可快速回退。详见 docs / 计划文件「PSD 图层效果原生化」。
+ */
+const ENABLE_EFFECT_NATIVIZATION = true;
+
+/** color/gradient overlay 原生化要求图层像素近似填满 bbox 的最小不透明覆盖率（见 canNativizeLayer 难点 2）。 */
+const OVERLAY_NATIVIZE_MIN_COVERAGE = 0.98;
 
 function toColor(c: Color | undefined): SerializedColor {
   if (!c) return { r: 0, g: 0, b: 0, a: 1 };
@@ -104,16 +127,36 @@ function applyHueSaturation(
 
 function applyBrightnessContrast(
   data: Uint8ClampedArray | Uint8Array, w: number, h: number,
-  adj: { brightness?: number; contrast?: number }
+  adj: { brightness?: number; contrast?: number; useLegacy?: boolean }
 ): void {
   const brightness = adj.brightness ?? 0;
   const contrast = adj.contrast ?? 0;
   if (brightness === 0 && contrast === 0) return;
+
+  // PS「亮度/对比度」分两套算法：
+  //   - useLegacy=true（旧版）：brightness 线性平移 + contrast 绕 128 线性缩放。
+  //   - useLegacy=false（CS3+ 新版，默认）：brightness 是「向端点收敛」的曲线——
+  //     亮度提升时 255 端不动、越亮提升越小（亮部不被削平为纯白），暗度降低时 0 端不动。
+  // 旧版公式对集中在中高调的图像（如金属高光的 coin）会把亮部大面积 clip 到 255，
+  // 导致丢失层次、视觉发白发糊。新版按 useLegacy=false 走端点保护曲线，贴近 PS 渲染。
+  const useLegacy = adj.useLegacy === true;
+
+  // brightness 映射：legacy 为加常数；新版为向端点收敛的线性比例（b/255）。
+  const bNorm = brightness / 255;
+  const applyBrightness = useLegacy
+    ? (v: number) => v + brightness
+    : brightness >= 0
+      ? (v: number) => v + (255 - v) * bNorm   // 255 端不动，亮部提升递减
+      : (v: number) => v + v * bNorm;          // 0 端不动，暗部压暗递减
+
+  // contrast 绕 128 线性缩放（contrast=0 时 factor=1，无影响）。新旧版对 contrast 的处理
+  // 在本项目暂统一用此式；如遇 useLegacy=false 且 contrast≠0 的精度问题再细分。
   const factor = (259 * (contrast + 255)) / (255 * (259 - contrast));
+
   for (let i = 0; i < w * h * 4; i += 4) {
     if (data[i + 3] === 0) continue;
     for (let c = 0; c < 3; c++) {
-      let v = data[i + c] + brightness;
+      let v = applyBrightness(data[i + c]);
       v = factor * (v - 128) + 128;
       data[i + c] = Math.max(0, Math.min(255, Math.round(v)));
     }
@@ -589,6 +632,362 @@ async function imageDataToPng(
   return canvasToPng(downscaled);
 }
 
+// 模糊类智能滤镜：这类滤镜会让 PS 写入的图层 channel data（ag-psd 读到的像素）与
+// merged composite 不一致——channel data 是被模糊污染的缓存，导致导入后图层发糊。
+const BLUR_SMART_FILTER_TYPES = new Set([
+  'motion blur', 'gaussian blur', 'lens blur', 'smart blur',
+  'box blur', 'surface blur', 'radial blur', 'shape blur', 'average',
+]);
+
+
+/**
+ * 判断智能对象（placedLayer）是否带「启用的模糊类智能滤镜」。
+ * 命中则其 channel data 不可靠，应改用智能对象源 + 仿射变换重渲染清晰像素。
+ */
+function hasBlurSmartFilter(layer: Layer): boolean {
+  const filter = (layer as any).placedLayer?.filter;
+  if (!filter || filter.enabled === false) return false;
+  const list = filter.list;
+  if (!Array.isArray(list)) return false;
+  return list.some((f: any) => f && f.enabled !== false && BLUR_SMART_FILTER_TYPES.has(f.type));
+}
+
+/**
+ * 判断是否应「用源重渲染清晰像素」替换模糊缓存。
+ * 仅当：带启用的模糊滤镜（hasBlurSmartFilter）+ normal 混合 + 高透明度。
+ */
+function shouldRerenderClearForBlur(layer: Layer): boolean {
+  if (!(layer as any).placedLayer || !hasBlurSmartFilter(layer)) return false;
+  const blend = (layer as any).blendMode;
+  if (blend !== undefined && blend !== 'normal' && blend !== 'passThrough') return false;
+  const opacity = (layer as any).opacity;
+  if (typeof opacity === 'number' && opacity < 0.95) return false;
+  return true;
+}
+
+/**
+ * placedLayer.transform 是否为纯仿射平行四边形（无透视）。
+ * transform = 8 数 [TLx,TLy, TRx,TRy, BRx,BRy, BLx,BLy]（四角点）。
+ * 仿射时 BR 必满足 BR ≈ TR + (BL - TL)；若有透视/自由变形则不成立。
+ * 重渲染只用 TL/TR/BL 建仿射矩阵（忽略 BR），非仿射会被错误地当平行四边形渲染而扭曲，
+ * 故非仿射时一律放弃重渲染、回退原缓存像素。
+ */
+function isAffineParallelogram(transform: number[]): boolean {
+  if (!Array.isArray(transform) || transform.length < 8) return false;
+  const [TLx, TLy, TRx, TRy, BRx, BRy, BLx, BLy] = transform;
+  const expBRx = TRx + (BLx - TLx);
+  const expBRy = TRy + (BLy - TLy);
+  const diag = Math.hypot(BRx - TLx, BRy - TLy) || 1;
+  const tol = Math.max(2, diag * 0.01); // 2px 或对角线 1%
+  return Math.hypot(BRx - expBRx, BRy - expBRy) <= tol;
+}
+
+/**
+ * 判断是否应「用清晰源重渲染」以提升锐度（与模糊无关）。
+ * 即便无模糊滤镜，智能对象（如 cions 组里无滤镜的小 coin）的 channel data 是按显示尺寸
+ * 栅格化的低分辨率缓存（如 58x46），而内嵌源（138x97）分辨率更高；PS 放大时从源重渲染保持锐利，
+ * 我们也应从源超采样重渲染，否则放大发糊。
+ * 命中条件：placedLayer + 纯仿射 + normal/passThrough 混合 + 高透明度 + 非模糊（模糊层走 shouldRerenderClearForBlur）。
+ * 是否真正有分辨率增益（源边长 > 显示边长）由 renderSmartObjectClearImage 按 scale 决定，无增益则回退缓存。
+ */
+function shouldRerenderClearForSharpness(layer: Layer): boolean {
+  const pl = (layer as any).placedLayer;
+  if (!pl || !isAffineParallelogram(pl.transform)) return false;
+  if (hasBlurSmartFilter(layer)) return false;
+  const blend = (layer as any).blendMode;
+  if (blend !== undefined && blend !== 'normal' && blend !== 'passThrough') return false;
+  const opacity = (layer as any).opacity;
+  if (typeof opacity === 'number' && opacity < 0.95) return false;
+  return true;
+}
+
+/** 是否需要从源重渲染（模糊清洗 或 锐度提升）。 */
+function shouldRerenderClear(layer: Layer): boolean {
+  return shouldRerenderClearForBlur(layer) || shouldRerenderClearForSharpness(layer);
+}
+
+/**
+ * 由曲线控制点（{x,y} 升序，x/y ∈ 0..255）构建 0..255 查找表。
+ * PS 曲线本身是平滑样条，控制点少时分段线性插值已足够接近，且更稳健可预测。
+ */
+function buildCurveLUT(points: { x: number; y: number }[]): Uint8Array {
+  const lut = new Uint8Array(256);
+  const pts = points.slice().sort((p, q) => p.x - q.x);
+  if (pts.length === 0) {
+    for (let i = 0; i < 256; i++) lut[i] = i;
+    return lut;
+  }
+  for (let i = 0; i < 256; i++) {
+    let p0 = pts[0], p1 = pts[pts.length - 1];
+    if (i <= pts[0].x) { p0 = pts[0]; p1 = pts[0]; }
+    else if (i >= pts[pts.length - 1].x) { p0 = pts[pts.length - 1]; p1 = pts[pts.length - 1]; }
+    else {
+      for (let k = 0; k < pts.length - 1; k++) {
+        if (i >= pts[k].x && i <= pts[k + 1].x) { p0 = pts[k]; p1 = pts[k + 1]; break; }
+      }
+    }
+    const span = p1.x - p0.x;
+    const tt = span === 0 ? 0 : (i - p0.x) / span;
+    lut[i] = Math.max(0, Math.min(255, Math.round(p0.y + (p1.y - p0.y) * tt)));
+  }
+  return lut;
+}
+
+/**
+ * 把智能对象上「启用的非模糊类智能滤镜」就地烘焙进重渲染后的像素，匹配 PS 效果。
+ * 重渲染用的是干净源像素，会丢失原图层缓存里烘进去的这些滤镜（如曲线提亮），故需补回。
+ * 模糊类滤镜（BLUR_SMART_FILTER_TYPES）是发糊根因，跳过不应用。
+ * 当前支持 curves；其它非模糊类型暂记录警告并跳过（像素保持源渲染值，不致崩）。
+ */
+function applyNonBlurSmartFilters(
+  data: Uint8ClampedArray,
+  layer: Layer
+): void {
+  const list = (layer as any).placedLayer?.filter?.list;
+  if (!Array.isArray(list)) return;
+  for (const f of list) {
+    if (!f || f.enabled === false) continue;
+    if (BLUR_SMART_FILTER_TYPES.has(f.type)) continue;
+    if (f.type === 'curves') {
+      const adjustments = f.filter?.adjustments;
+      if (!Array.isArray(adjustments)) continue;
+      // 逐通道 LUT：composite/rgb 作用于 R/G/B；red/green/blue 单通道。
+      let lutR: Uint8Array | null = null, lutG: Uint8Array | null = null, lutB: Uint8Array | null = null;
+      for (const adj of adjustments) {
+        if (!adj || !Array.isArray(adj.curve) || adj.curve.length < 2) continue;
+        const lut = buildCurveLUT(adj.curve);
+        const channels: string[] = Array.isArray(adj.channels) ? adj.channels : ['composite'];
+        for (const ch of channels) {
+          if (ch === 'composite' || ch === 'rgb') { lutR = lut; lutG = lut; lutB = lut; }
+          else if (ch === 'red') lutR = lut;
+          else if (ch === 'green') lutG = lut;
+          else if (ch === 'blue') lutB = lut;
+        }
+      }
+      if (lutR || lutG || lutB) {
+        const opacity = typeof f.opacity === 'number' ? Math.max(0, Math.min(1, f.opacity)) : 1;
+        for (let i = 0; i < data.length; i += 4) {
+          if (lutR) data[i] = opacity === 1 ? lutR[data[i]] : Math.round(data[i] + (lutR[data[i]] - data[i]) * opacity);
+          if (lutG) data[i + 1] = opacity === 1 ? lutG[data[i + 1]] : Math.round(data[i + 1] + (lutG[data[i + 1]] - data[i + 1]) * opacity);
+          if (lutB) data[i + 2] = opacity === 1 ? lutB[data[i + 2]] : Math.round(data[i + 2] + (lutB[data[i + 2]] - data[i + 2]) * opacity);
+        }
+      }
+    } else {
+      logger.warn(`Layer "${layer.name}": smart filter "${f.type}" not baked into re-rendered clear image (unsupported non-blur filter)`);
+    }
+  }
+}
+
+/**
+ * 超采样是否安全：重渲染后的 imageData 尺寸会大于 1x bbox，若该层还要走「按 1x 坐标对齐的蒙版」
+ * （layer mask 或带真实空间蒙版的剪贴调整），尺寸不匹配会错位。这两种情况下禁用超采样（退回 1x）。
+ * 仅有 alpha 形状、无空间蒙版的调整（如全图 +17 亮度）不受影响，可超采样。
+ */
+function supersampleSafe(layer: Layer): boolean {
+  const hasRealMask = (m: any) =>
+    m && !m.disabled && ((m.imageData && m.imageData.width > 0) || (m.canvas && m.canvas.width > 0));
+  if (hasRealMask((layer as any).mask)) return false;
+  const adjs = (layer as any).__rerenderClipAdjustments as Layer[] | undefined;
+  if (Array.isArray(adjs)) {
+    for (const adj of adjs) if (hasRealMask((adj as any).mask)) return false;
+  }
+  return true;
+}
+
+/**
+ * 解码智能对象内嵌源（按 placedLayer.id 缓存，多个实例共享同一源只解码一次）。
+ * 返回源 canvas 与尺寸；无源 / 解码失败返回 null（并缓存 null，不再重试）。
+ */
+function decodeSmartObjectSource(
+  soId: string | undefined,
+  layerName: string
+): SmartObjectSource | null {
+  if (!globalPsdLinkedFiles) return null;
+  const cache = globalSmartObjectSourceCache;
+  if (cache && soId !== undefined && cache.has(soId)) return cache.get(soId)!;
+
+  // 在 64x64 降采样上估算 alpha<250 占比（足以判断「是否带不透明白底」），避免扫描大源全图。
+  const computeTransparentFrac = (cv: HTMLCanvasElement): number => {
+    try {
+      const sN = 64;
+      const sCv = document.createElement('canvas');
+      sCv.width = Math.max(1, Math.min(sN, cv.width));
+      sCv.height = Math.max(1, Math.min(sN, cv.height));
+      const sctx = sCv.getContext('2d')!;
+      sctx.drawImage(cv, 0, 0, sCv.width, sCv.height);
+      const d = sctx.getImageData(0, 0, sCv.width, sCv.height).data;
+      const n = sCv.width * sCv.height;
+      let trans = 0;
+      for (let i = 0; i < n; i++) if (d[i * 4 + 3] < 250) trans++;
+      return n > 0 ? trans / n : 0;
+    } catch { return 1; } // 估算失败时按「有透明」处理（不因此拒绝重渲染）
+  };
+
+  const finish = (v: SmartObjectSource | null) => {
+    if (cache && soId !== undefined) cache.set(soId, v);
+    return v;
+  };
+
+  const lf = globalPsdLinkedFiles.find((f) => f && f.id === soId);
+  if (!lf || !lf.data) return finish(null);
+
+  try {
+    const inner = readPsd(lf.data as any, { skipThumbnail: true });
+    if (inner.canvas && inner.canvas.width > 0) {
+      const cv = inner.canvas as HTMLCanvasElement;
+      return finish({ canvas: cv, sw: cv.width, sh: cv.height, transparentFrac: computeTransparentFrac(cv) });
+    }
+    if (inner.imageData && inner.imageData.width > 0) {
+      const c = document.createElement('canvas');
+      c.width = inner.imageData.width;
+      c.height = inner.imageData.height;
+      const pc = inner.imageData.width * inner.imageData.height * 4;
+      const buf = new Uint8ClampedArray(pc);
+      const sd = inner.imageData.data as any;
+      if (sd instanceof Uint8ClampedArray || sd instanceof Uint8Array) buf.set(sd.subarray(0, pc));
+      else for (let i = 0; i < pc; i++) buf[i] = Math.min(255, Math.max(0, Math.round(Number(sd[i]))));
+      c.getContext('2d')!.putImageData(new ImageData(buf, inner.imageData.width, inner.imageData.height), 0, 0);
+      return finish({ canvas: c, sw: c.width, sh: c.height, transparentFrac: computeTransparentFrac(c) });
+    }
+  } catch (e) {
+    logger.warn(`Smart object source decode failed for "${layerName}": ${e instanceof Error ? e.message : e}`);
+    return finish(null);
+  }
+  return finish(null);
+}
+
+/**
+ * 取该层「重渲染所需的缓存基底」为 canvas：优先用烘焙剪贴调整前的原始像素
+ * （__origImageDataBeforeAdjustment，避免与稍后重新应用的 +17 调整双重叠加），否则用当前 imageData。
+ * 用途：(a) 模糊路径作拖尾底图；(b) 锐度路径作轮廓守卫的比对基准。
+ */
+function getRerenderBaseCache(layer: Layer): { canvas: HTMLCanvasElement; width: number; height: number } | null {
+  const cache = (layer as any).__origImageDataBeforeAdjustment ?? (layer as any).imageData;
+  if (!cache || !cache.data || cache.width <= 0 || cache.height <= 0) return null;
+  const need = cache.width * cache.height * 4;
+  if (cache.data.length < need) return null;
+  const data = cache.data instanceof Uint8ClampedArray
+    ? cache.data
+    : new Uint8ClampedArray(cache.data.buffer ? cache.data.buffer.slice(0, need) : cache.data.subarray(0, need));
+  const cv = document.createElement('canvas');
+  cv.width = cache.width; cv.height = cache.height;
+  cv.getContext('2d')!.putImageData(new ImageData(data, cache.width, cache.height), 0, 0);
+  return { canvas: cv, width: cache.width, height: cache.height };
+}
+
+/**
+ * 用智能对象内嵌源 + placedLayer.transform 仿射变换，渲染出与 PS merged composite 一致的像素。
+ * placedLayer.transform 为 8 数（TL,TR,BR,BL 角点），对金币这类是纯仿射（平行四边形，无透视），用 setTransform 还原。
+ * 两条路径：
+ *  - 模糊路径（hasBlurSmartFilter）：清晰源(币主体)叠在「模糊缓存(=动感拖尾)」之上，还原「清晰币 + 拖尾」。
+ *    （PS 用滤镜蒙版让主体显示清晰、拖尾区显示模糊；ag-psd 不暴露滤镜蒙版，用 sharp-over-blur 近似。）
+ *  - 锐度路径（无模糊但源分辨率更高）：纯清晰源超采样，但带轮廓守卫——源若为带不透明白底的扁平合成、
+ *    或重渲染轮廓与缓存差异过大（源像素≠该层实际像素，如 backlgt 白底），返回 null 回退缓存，避免白块。
+ * 失败（无源 / 解码失败 / 无 transform / 非仿射 / 无锐度增益 / 守卫未过）返回 null，调用方回退原像素。
+ */
+function renderSmartObjectClearImage(
+  layer: Layer
+): { data: Uint8ClampedArray; width: number; height: number } | null {
+  const pl = (layer as any).placedLayer;
+  if (!pl || !Array.isArray(pl.transform) || pl.transform.length < 8) return null;
+  // 非仿射（透视 / 自由变形）时本函数会把它当平行四边形渲染而扭曲，放弃重渲染、回退缓存。
+  if (!isAffineParallelogram(pl.transform)) return null;
+
+  const src = decodeSmartObjectSource(pl.id, layer.name ?? '');
+  if (!src) return null;
+  const { canvas: srcCanvas, sw, sh } = src;
+
+  const t = pl.transform as number[];
+  const TLx = t[0], TLy = t[1], TRx = t[2], TRy = t[3], BLx = t[6], BLy = t[7];
+  const bounds = getLayerBounds(layer);
+  const bw = bounds.right - bounds.left;
+  const bh = bounds.bottom - bounds.top;
+  if (bw <= 0 || bh <= 0) return null;
+
+  // 源 (0,0)=TL,(sw,0)=TR,(0,sh)=BL → 1x 仿射矩阵（平移到层 bbox 原点）。
+  const a = (TRx - TLx) / sw, b = (TRy - TLy) / sw;
+  const c = (BLx - TLx) / sh, d = (BLy - TLy) / sh;
+  const e = TLx - bounds.left, f = TLy - bounds.top;
+
+  // 超采样：源（如 138x97）映射到的平行四边形显示边长可能远小于源，按 bbox 烤会丢分辨率，
+  // 放大后发糊（PS 智能对象保留源分辨率，放大更锐利）。按「源边长/显示边长」算倍率，
+  // 让位图拿到源的完整像素；节点显示尺寸仍用 bbox（1x），平台缩放显示即可。
+  // 有 layer mask / 带空间蒙版的剪贴调整时降为 1x，避免后续蒙版按 1x 坐标对齐时错位。
+  const edgeU = Math.hypot(TRx - TLx, TRy - TLy);
+  const edgeV = Math.hypot(BLx - TLx, BLy - TLy);
+  const rawScale = (edgeU > 0 && edgeV > 0) ? Math.max(sw / edgeU, sh / edgeV) : 1;
+  // 仅为提升锐度（非模糊驱动）时，若源分辨率不高于显示尺寸（无超采样增益），
+  // 重渲染只会用源像素替换缓存而无收益、反而可能引入细微差异，故放弃、回退缓存。
+  if (!hasBlurSmartFilter(layer) && rawScale <= 1.05) return null;
+  // 强制 1x：超采样图片在 MasterGo IMAGE FILL 中会导致位置偏移（平台对大于节点的图片
+  // 做居中裁剪而非等比缩放），用 1x 渲染保证图片尺寸 = bounds 尺寸，位置精确。
+  // 清晰度仍优于原始缓存（源像素通过仿射映射渲染，而非低分辨率栅格）。
+  const scale = 1;
+
+  const W = Math.max(1, Math.round(bw * scale));
+  const H = Math.max(1, Math.round(bh * scale));
+
+  // 渲染清晰源到 W×H 画布。
+  const sharpCv = document.createElement('canvas');
+  sharpCv.width = W;
+  sharpCv.height = H;
+  const sctx = sharpCv.getContext('2d')!;
+  sctx.imageSmoothingEnabled = true;
+  (sctx as any).imageSmoothingQuality = 'high';
+  sctx.setTransform(a * scale, b * scale, c * scale, d * scale, e * scale, f * scale);
+  sctx.drawImage(srcCanvas, 0, 0);
+  sctx.setTransform(1, 0, 0, 1, 0, 0);
+  const sharpId = sctx.getImageData(0, 0, W, H);
+  // 曲线等非模糊滤镜只作用于清晰源（缓存已自带这些滤镜，勿重复）。
+  applyNonBlurSmartFilters(sharpId.data, layer);
+
+  const blur = hasBlurSmartFilter(layer);
+
+  if (!blur) {
+    // 锐度路径：轮廓守卫。源为带不透明白底的扁平合成（透明占比≈0）时，重渲染必出白块 → 拒绝。
+    if (src.transparentFrac < 0.02) {
+      logger.warn(`Layer "${layer.name}": skip sharpness re-render — source has opaque background (transparentFrac=${src.transparentFrac.toFixed(2)}), keeping cache`);
+      return null;
+    }
+    // 重渲染轮廓(alpha)与缓存轮廓差异过大，说明源像素≠该层实际像素 → 拒绝，回退缓存。
+    const base = getRerenderBaseCache(layer);
+    if (base && base.width === bw && base.height === bh) {
+      const cmp = document.createElement('canvas');
+      cmp.width = bw; cmp.height = bh;
+      const cctx = cmp.getContext('2d')!;
+      cctx.drawImage(sharpCv, 0, 0, bw, bh);
+      const sa = cctx.getImageData(0, 0, bw, bh).data;
+      const ca = base.canvas.getContext('2d')!.getImageData(0, 0, bw, bh).data;
+      let sum = 0; const n = bw * bh;
+      for (let i = 0; i < n; i++) sum += Math.abs(sa[i * 4 + 3] - ca[i * 4 + 3]);
+      const meanAlphaDiff = sum / n;
+      if (meanAlphaDiff > 40) {
+        logger.warn(`Layer "${layer.name}": skip sharpness re-render — silhouette mismatch vs cache (meanAlphaDiff=${meanAlphaDiff.toFixed(1)}), keeping cache`);
+        return null;
+      }
+    }
+    return { data: sharpId.data, width: W, height: H };
+  }
+
+  // 模糊路径（scale=1）：清晰源 + destination-over 拖尾合成。
+  // scale=1 保证 W=bw, H=bh，图片尺寸=bounds 尺寸，位置精确。
+  // ag-psd 不暴露 PS 滤镜蒙版，拖尾为对称模糊的近似；round-trip 通过 rawPsdSmartObject 完美还原。
+  const trail = getRerenderBaseCache(layer);
+  if (!trail) {
+    return { data: sharpId.data, width: W, height: H };
+  }
+  sctx.putImageData(sharpId, 0, 0);
+  const out = document.createElement('canvas');
+  out.width = W; out.height = H;
+  const octx = out.getContext('2d')!;
+  octx.drawImage(sharpCv, 0, 0);
+  octx.globalCompositeOperation = 'destination-over';
+  octx.drawImage(trail.canvas, 0, 0, trail.width, trail.height, 0, 0, W, H);
+  octx.globalCompositeOperation = 'source-over';
+  const id = octx.getImageData(0, 0, W, H);
+  return { data: id.data, width: W, height: H };
+}
+
 function applyLayerMask(
   imageData: { data: Uint8ClampedArray | Uint8Array | Uint16Array | Float32Array; width: number; height: number },
   layer: Layer
@@ -840,7 +1239,11 @@ function getEnabledInnerGlow(layer: Layer): ShadowCompositeInfo | null {
 function computeShadowExpansion(shadows: ShadowCompositeInfo[]): number {
   let expand = 0;
   for (const s of shadows) {
-    const reach = s.blur + s.spread + Math.max(Math.abs(s.offsetX), Math.abs(s.offsetY));
+    // featherAlpha 用 3-pass box(每 pass 半径 = blur·SHADOW_BLUR_PASS_FACTOR),羽化可达半径
+    // ≈ passes·passRadius,比名义 blur 大。reach 须按此估算,否则辉光外圈被画布边界截断
+    // (典型:低阶猪猪 拷贝 黄色辉光铺不开)。
+    const featherReach = s.blur * SHADOW_BLUR_PASS_FACTOR * SHADOW_BLUR_PASSES;
+    const reach = featherReach + s.spread + Math.max(Math.abs(s.offsetX), Math.abs(s.offsetY));
     expand = Math.max(expand, Math.ceil(reach));
   }
   return expand;
@@ -1028,6 +1431,28 @@ function boxBlurAlpha(src: Uint8Array, w: number, h: number, radius: number): Ui
     }
   }
   return dst2;
+}
+
+/**
+ * PS 投影/发光的羽化系数：把 PSD 的 size(blur 名义半径)换算成 box-blur 的每-pass 半径。
+ *
+ * PS 的羽化是高斯模糊,而我们用 3-pass box blur 近似。3 个全宽 (2r+1) 的 box 叠加,
+ * 等效高斯 σ² = 3·((2r+1)²−1)/12。若直接用 r=blur/3(旧实现),有效 σ≈blur/3 —— 远小于
+ * PS 的 size,导致辉光过窄、紧贴边缘像硬描边(典型:低阶猪猪 拷贝 的黄色辉光被压成实色边)。
+ * 经低阶猪猪真实 alpha 实测,r=blur·0.55 时辉光宽度/柔和度与 PS 渲染基本吻合。
+ */
+const SHADOW_BLUR_PASS_FACTOR = 0.55;
+const SHADOW_BLUR_PASSES = 3;
+
+/** 用 3-pass box blur 近似 PS 高斯羽化(系数见 SHADOW_BLUR_PASS_FACTOR)。blurRadius 为 PSD 名义 size。 */
+function featherAlpha(alpha: Uint8Array, w: number, h: number, blurRadius: number): Uint8Array {
+  if (blurRadius <= 0) return alpha;
+  const passRadius = blurRadius * SHADOW_BLUR_PASS_FACTOR;
+  let out = alpha;
+  for (let p = 0; p < SHADOW_BLUR_PASSES; p++) {
+    out = boxBlurAlpha(out, w, h, passRadius);
+  }
+  return out;
 }
 
 interface ColorOverlayInfo {
@@ -1715,6 +2140,180 @@ function isPatternOnlyLayer(b: LayerEffectBundle, patternOverlayMeta: PatternOve
     b.dropShadows.length === 0 && b.innerShadows.length === 0 && !b.outerGlow && !b.innerGlow;
 }
 
+// ===== 效果原生化（整层判定）=====
+
+/** 该 effect 混合模式是否平台可像素级一致表达。缺省/undefined 视为 'normal'（与 PS 一致）。 */
+function isNativizableBlendMode(bm: string | undefined): boolean {
+  // 只接受 normal：平台 effect/stroke/overlay-fill 以 normal 合成到本层时与 PS 一致。
+  // 其它混合模式（multiply/screen/...）平台对 effect/stroke 的支持不一致，无法保证像素级一致 → 不原生化。
+  return bm == null || bm === 'normal';
+}
+
+/**
+ * 等高线是否为默认线性（恒等映射）。PS 的默认等高线在不同语言环境下 name 被本地化
+ * （英文 'Linear' / 中文 '线性' 等），不能靠 name 判断。改以 curve 几何判定：缺省、
+ * 或 curve 为从 (0,0) 到 (255,255) 的恒等直线即视为线性，可原生化（平台均匀阴影与 PS 一致）；
+ * 任何自定义曲线（点数≠2 或端点偏离恒等）都会改变阴影衰减 → 不可原生化。
+ */
+function isLinearContour(contour: any): boolean {
+  if (!contour) return true;
+  const curve = contour.curve;
+  if (!Array.isArray(curve)) return true; // 无 curve 数据时保守视为默认线性
+  if (curve.length !== 2) return false;
+  const [a, b] = curve;
+  const near = (v: number, t: number) => Math.abs(v - t) <= 1;
+  return near(a.x, 0) && near(a.y, 0) && near(b.x, 255) && near(b.y, 255);
+}
+
+/** 统计图层不透明像素覆盖率（alpha>=128 的像素占比），用于判定 overlay 能否安全叠加（难点 2）。 */
+function opaqueCoverageRatio(imageData: { data: ArrayLike<number>; width: number; height: number }): number {
+  const { data, width, height } = imageData;
+  const total = width * height;
+  if (total <= 0) return 0;
+  let opaque = 0;
+  for (let i = 0; i < total; i++) {
+    if (data[i * 4 + 3] >= 128) opaque++;
+  }
+  return opaque / total;
+}
+
+/**
+ * 整层原生化判定（像素级一致闸门）。返回 true 表示该层所有效果都能与 PS 像素级一致地用平台
+ * 原生属性表达，可整层保留为可编辑；返回 false 则整层栅格化（行为同今天）。
+ * 注意：以原始 layer.effects 的 blendMode 判定（effectBundle 不携带 blendMode、合成时按 normal）。
+ */
+function canNativizeLayer(
+  layer: Layer,
+  bundle: LayerEffectBundle,
+  patternOverlayMeta: PatternOverlayMeta | null,
+  imageData: { data: ArrayLike<number>; width: number; height: number }
+): boolean {
+  // 强制栅格化项：平台无可逆像素级一致表达
+  if (patternOverlayMeta) return false;
+  if (bundle.bevel || bundle.satin) return false;
+  if (bundle.fillOpacity < 1) return false;
+
+  const fx: any = layer.effects;
+  if (!fx) return false;
+
+  // shadow / glow：混合模式须 normal、无 contour/noise 等平台表达不了的参数
+  const shadowGroups: any[] = [
+    ...(Array.isArray(fx.dropShadow) ? fx.dropShadow : []),
+    ...(Array.isArray(fx.innerShadow) ? fx.innerShadow : []),
+    ...(fx.outerGlow ? [fx.outerGlow] : []),
+    ...(fx.innerGlow ? [fx.innerGlow] : []),
+  ];
+  for (const s of shadowGroups) {
+    if (!s || !s.enabled) continue;
+    if (!isNativizableBlendMode(s.blendMode)) return false;
+    // contour 非线性 / noise / 抖动会让平台均匀阴影与 PS 不一致（按 curve 几何判定，不依赖本地化 name）
+    if (!isLinearContour(s.contour)) return false;
+    if (typeof s.noise === 'number' && s.noise > 0) return false;
+    // glow 的 range/jitter 等非默认参数同样无法等价
+    if (typeof s.jitter === 'number' && s.jitter > 0) return false;
+  }
+
+  // stroke：仅 fillType==='color'、混合模式 normal 才可原生（gradient/pattern stroke 强制栅格）
+  if (Array.isArray(fx.stroke)) {
+    for (const st of fx.stroke) {
+      if (!st || !st.enabled) continue;
+      if (st.fillType !== 'color') return false;
+      if (!isNativizableBlendMode(st.blendMode)) return false;
+    }
+  }
+
+  // color / gradient overlay：混合模式 normal + 像素填满 bbox（否则矩形色块盖透明区，难点 2）
+  const hasOverlay = !!bundle.solidFill || !!bundle.gradientOverlay;
+  if (hasOverlay) {
+    if (Array.isArray(fx.solidFill)) {
+      for (const sf of fx.solidFill) {
+        if (sf && sf.enabled && !isNativizableBlendMode(sf.blendMode)) return false;
+      }
+    }
+    if (Array.isArray(fx.gradientOverlay)) {
+      for (const go of fx.gradientOverlay) {
+        if (go && go.enabled && !isNativizableBlendMode(go.blendMode)) return false;
+      }
+    }
+    // 渐变 overlay 仅支持 linear（与 builder/平台 GRADIENT_LINEAR 对齐）
+    if (bundle.gradientOverlay && bundle.gradientOverlay.style !== 'linear') return false;
+    if (opaqueCoverageRatio(imageData) < OVERLAY_NATIVIZE_MIN_COVERAGE) return false;
+  }
+
+  return true;
+}
+
+/**
+ * 文本层效果是否「平台能渲染出来」（区别于 canNativizeLayer 的像素级一致闸门）。
+ * 返回 false = 平台画布根本渲染不出（无可逆替代），需回退栅格化为合成图显示，
+ * 但节点仍保持平台 TextNode 类型、保留全部 round-trip 源数据。任一满足即不可渲染：
+ *  (a) dropShadow / innerShadow 含 spread>0（实色外扩硬边阴影）——MasterGo 文本节点不渲染 spread；
+ *  (b) warp 弧形（style!=='none'）——两平台都不支持可编辑文本弯曲。
+ * 注：spread 用 0.5 容差避浮点噪声；warp 取 serialized.textData.warp（已过滤 style==='none'）。
+ */
+function textEffectsRenderable(bundle: LayerEffectBundle, warp: SerializedWarp | undefined): boolean {
+  for (const s of bundle.dropShadows) {
+    if (s.spread > 0.5) return false;
+  }
+  for (const s of bundle.innerShadows) {
+    if (s.spread > 0.5) return false;
+  }
+  if (warp && warp.style && warp.style !== 'none') return false;
+  return true;
+}
+
+/**
+ * 把 bundle 中的 color/gradient overlay 转为平台可叠加的 SerializedFill[]（叠在 IMAGE fill 之上）。
+ * 顺序与 PS 合成一致：gradient overlay 在 color overlay 之上（PS 中 gradient 覆盖 color）。
+ * 仅在 canNativizeLayer 通过时调用。
+ */
+function convertOverlaysToFills(bundle: LayerEffectBundle): SerializedFill[] {
+  const fills: SerializedFill[] = [];
+  // PS 合成顺序：color overlay 先（下），gradient overlay 后（上）。叠加 fill 数组里靠后的在视觉上层。
+  if (bundle.solidFill) {
+    const sf = bundle.solidFill;
+    fills.push({
+      type: 'SOLID',
+      color: { r: sf.r / 255, g: sf.g / 255, b: sf.b / 255, a: sf.opacity },
+    });
+  }
+  if (bundle.gradientOverlay && bundle.gradientOverlay.style === 'linear') {
+    const go = bundle.gradientOverlay;
+    const gradient: SerializedGradientOverlay = {
+      type: 'linear',
+      angle: go.angle,
+      reverse: go.reverse,
+      opacity: go.opacity,
+      stops: go.colorStops.map((cs) => {
+        // 用同位置的 opacity stop（线性插值近似：直接取最近的 location 匹配，缺省 1）
+        const op = matchOpacityAtLocation(go.opacityStops, cs.location);
+        return {
+          color: { r: cs.r / 255, g: cs.g / 255, b: cs.b / 255, a: op },
+          position: cs.location, // GradientStop.location 已是 0~1
+        };
+      }),
+    };
+    fills.push({ type: 'GRADIENT_LINEAR', gradient });
+  }
+  return fills;
+}
+
+/** 在 opacityStops 中按 location 取不透明度（线性插值），缺省 1。 */
+function matchOpacityAtLocation(stops: { location: number; opacity: number }[], location: number): number {
+  if (!stops || stops.length === 0) return 1;
+  const sorted = [...stops].sort((a, b) => a.location - b.location);
+  if (location <= sorted[0].location) return sorted[0].opacity;
+  if (location >= sorted[sorted.length - 1].location) return sorted[sorted.length - 1].opacity;
+  for (let i = 0; i < sorted.length - 1; i++) {
+    const a = sorted[i], b = sorted[i + 1];
+    if (location >= a.location && location <= b.location) {
+      const t = (location - a.location) / (b.location - a.location || 1);
+      return a.opacity + (b.opacity - a.opacity) * t;
+    }
+  }
+  return 1;
+}
+
 function copyAlphaToPadded(alpha: Uint8Array, srcW: number, srcH: number, dstW: number, dstH: number, expand: number): Uint8Array {
   const out = new Uint8Array(dstW * dstH);
   for (let y = 0; y < srcH; y++) {
@@ -1939,18 +2538,18 @@ async function compositeLayerEffects(
 
   const dstPixels = new Uint8ClampedArray(dstW * dstH * 4);
 
-  // 1. Drop Shadow（在最下层）
-  for (const shadow of effects.dropShadows) {
+  // 1. Drop Shadow（在最下层）。
+  // PS 语义：effects 列表中靠前的 dropShadow 在视觉最上层。blendColorOnto 后画的覆盖先画的，
+  // 故倒序遍历（最后一个先画在最底，第 0 个最后画在最上），使列表首个投影（通常是最亮/最外圈
+  // 的实色边，如 Piggy Pop 的亮橙 r212）露在最外层，匹配 PS；否则后面的深色投影会盖暗它。
+  for (let si = effects.dropShadows.length - 1; si >= 0; si--) {
+    const shadow = effects.dropShadows[si];
     let shadowAlpha = copyAlphaToPadded(origAlpha, srcW, srcH, dstW, dstH, expand);
     if (shadow.spread > 0) {
       shadowAlpha = dilateAlpha(shadowAlpha, dstW, dstH, Math.ceil(shadow.spread));
     }
     if (shadow.blur > 0) {
-      const passes = 3;
-      const passRadius = shadow.blur / passes;
-      for (let p = 0; p < passes; p++) {
-        shadowAlpha = boxBlurAlpha(shadowAlpha, dstW, dstH, passRadius);
-      }
+      shadowAlpha = featherAlpha(shadowAlpha, dstW, dstH, shadow.blur);
     }
     // 偏移
     const offsetAlpha = new Uint8Array(dstW * dstH);
@@ -1971,9 +2570,7 @@ async function compositeLayerEffects(
     let glowAlpha = copyAlphaToPadded(origAlpha, srcW, srcH, dstW, dstH, expand);
     if (g.spread > 0) glowAlpha = dilateAlpha(glowAlpha, dstW, dstH, Math.ceil(g.spread));
     if (g.blur > 0) {
-      const passes = 3;
-      const passRadius = g.blur / passes;
-      for (let p = 0; p < passes; p++) glowAlpha = boxBlurAlpha(glowAlpha, dstW, dstH, passRadius);
+      glowAlpha = featherAlpha(glowAlpha, dstW, dstH, g.blur);
     }
     blendColorOnto(dstPixels, dstW, dstH, glowAlpha, g.r, g.g, g.b, g.opacity);
   }
@@ -2011,8 +2608,10 @@ async function compositeLayerEffects(
     }
   }
 
-  // 4. Inner Shadow（在 fill 之上，但只在 alpha>0 区域可见）
-  for (const inner of effects.innerShadows) {
+  // 4. Inner Shadow（在 fill 之上，但只在 alpha>0 区域可见）。
+  // 同 dropShadow：倒序遍历使 effects 列表首个 innerShadow 露在最上层，匹配 PS 视觉叠加顺序。
+  for (let ii = effects.innerShadows.length - 1; ii >= 0; ii--) {
+    const inner = effects.innerShadows[ii];
     let invAlpha = new Uint8Array(srcW * srcH);
     for (let i = 0; i < srcW * srcH; i++) invAlpha[i] = 255 - origAlpha[i];
     let paddedInv = copyAlphaToPadded(invAlpha, srcW, srcH, dstW, dstH, expand);
@@ -2029,9 +2628,7 @@ async function compositeLayerEffects(
     let shadowField: Uint8Array = offsetInv;
     if (inner.spread > 0) shadowField = dilateAlpha(shadowField, dstW, dstH, Math.ceil(inner.spread));
     if (inner.blur > 0) {
-      const passes = 3;
-      const passRadius = inner.blur / passes;
-      for (let p = 0; p < passes; p++) shadowField = boxBlurAlpha(shadowField, dstW, dstH, passRadius);
+      shadowField = featherAlpha(shadowField, dstW, dstH, inner.blur);
     }
     // 用 origAlpha 限定在 fill 内部
     const paddedOrig = copyAlphaToPadded(origAlpha, srcW, srcH, dstW, dstH, expand);
@@ -2058,9 +2655,7 @@ async function compositeLayerEffects(
     }
     let envPadded = copyAlphaToPadded(env, srcW, srcH, dstW, dstH, expand);
     if (g.blur > 0) {
-      const passes = 3;
-      const passRadius = g.blur / passes;
-      for (let p = 0; p < passes; p++) envPadded = boxBlurAlpha(envPadded, dstW, dstH, passRadius);
+      envPadded = featherAlpha(envPadded, dstW, dstH, g.blur);
     }
     // 用 origAlpha 限定在 fill 内部
     const paddedOrig = copyAlphaToPadded(origAlpha, srcW, srcH, dstW, dstH, expand);
@@ -2425,14 +3020,96 @@ async function serializeLayer(
     }
   }
 
+  // 文本「平台不可渲染效果」回退栅格化：文本含 spread 实色外扩阴影 / warp 弧形等平台画布渲染不出
+  // 的效果时（textEffectsRenderable=false），把字形+全部效果用 compositeLayerEffects 烤成合成图，
+  // 由 imageIndex 指向供画布显示；但 textData / rawImage / rawEffectsData 全保留，节点仍按文本层
+  // 导出（详见 builder.buildTextNode 与两个 renderer 的 rasterized 分支）。
+  if (
+    serialized.type === 'text' && serialized.textData &&
+    layer.imageData && layer.imageData.width > 0 && layer.imageData.height > 0 &&
+    hasAnyEffect(effectBundle) &&
+    !textEffectsRenderable(effectBundle, serialized.textData.warp)
+  ) {
+    try {
+      const maskedText = applyLayerMask(layer.imageData, layer);
+      const effText = maskedText ?? layer.imageData;
+      const { png, expand, overlayBlendMode } = await compositeLayerEffects(
+        effText, layerFillOpacity, effectBundle, patternOverlayMeta, resolvedPatternData
+      );
+      serialized.imageIndex = images.length;
+      images.push(png);
+      if (expand > 0) serialized.expandOffset = expand;
+      if (overlayBlendMode) serialized.blendMode = convertBlendMode(overlayBlendMode);
+      // 节点仍是文本层：保留 textData/rawImage 供导出还原可编辑文本，存 rawEffectsData 供回写 effects；
+      // effects/strokes 在 IR 端按 rasterized 置空（合成图已含效果，避免平台再叠一层）。
+      serialized.rawEffectsData = serializeRawPsdEffects(layer, layerFillOpacity);
+      serialized.textRasterized = true;
+      logger.info(`Layer "${layer.name}": text rasterized (platform-unrenderable effects: ${effectBundle.dropShadows.length} dropShadow, ${effectBundle.innerShadows.length} innerShadow, warp=${serialized.textData.warp?.style ?? 'none'}), composite ${serialized.width}x${serialized.height} expand=${expand}`);
+    } catch (e) {
+      logger.warn(`Failed to rasterize text effects for "${layer.name}": ${e instanceof Error ? e.message : e}`);
+    }
+  }
+
+  // 智能对象（placedLayer）改用「内嵌源 + 仿射变换」渲染清晰像素（匹配 PS merged composite），两种触发：
+  //  1) 带启用的模糊类智能滤镜：ag-psd 读到的 channel data 是被模糊污染的缓存（导入后发糊）；
+  //  2) 无模糊但源分辨率高于显示尺寸（如 cions 组无滤镜的小 coin）：缓存是低分辨率栅格，放大发糊。
+  // 同时存原始像素 + placedLayer/滤镜元信息，供 round-trip 导出还原智能对象图层。
+  if (shouldRerenderClear(layer)) {
+    const clear = renderSmartObjectClearImage(layer);
+    if (clear) {
+      try {
+        const origPng = layer.imageData && layer.imageData.width > 0
+          ? await imageDataToPng(layer.imageData)
+          : (layer.canvas ? await canvasToPng(layer.canvas as HTMLCanvasElement) : null);
+        const pl = (layer as any).placedLayer;
+        serialized.rawPsdSmartObject = JSON.stringify({
+          origImageB64: origPng ? uint8ArrayToBase64(origPng) : undefined,
+          transform: pl.transform,
+          soId: pl.id,
+          width: pl.width,
+          height: pl.height,
+          filter: pl.filter,
+        });
+      } catch (e) {
+        logger.warn(`Failed to save smart-object round-trip data for "${layer.name}": ${e instanceof Error ? e.message : e}`);
+      }
+      // 用清晰像素覆盖，后续 mask / native / composite / plain 流程自然复用清晰像素。
+      (layer as any).imageData = { data: clear.data, width: clear.width, height: clear.height };
+      if ((layer as any).canvas) (layer as any).canvas = undefined;
+      // 父层预处理已把剪贴调整（如 +17 亮度）烘进旧的模糊 imageData，但刚被清晰像素覆盖丢失。
+      // 在清晰像素上重新应用同一批调整，使 display = 清晰源 + 曲线 + 调整层（与 PS 一致）。
+      // round-trip 不受影响：rawPsdSmartObject 存的是未调整的原始模糊像素，调整层另由 rawPsdAdjustments 还原。
+      const rerenderAdj = (layer as any).__rerenderClipAdjustments as Layer[] | undefined;
+      if (rerenderAdj && rerenderAdj.length > 0) {
+        applyAdjustmentLayers(layer, rerenderAdj);
+        logger.info(`Layer "${layer.name}": re-applied ${rerenderAdj.length} clip adjustment(s) on clear image: ${rerenderAdj.map(a => (a as any).adjustment?.type).join(', ')}`);
+      }
+      const reason = hasBlurSmartFilter(layer) ? 'blur filter (sharp body + blur trail)' : 'sharpness (downsampled source)';
+      logger.info(`Layer "${layer.name}": smart object re-rendered from source [${reason}] (${clear.width}x${clear.height})`);
+    }
+  }
+
   if (serialized.type !== 'text' && layer.imageData && layer.imageData.width > 0 && layer.imageData.height > 0) {
     onProgress({ percent: 0, message: `Encoding image: ${layer.name}` });
     try {
       const maskedData = applyLayerMask(layer.imageData, layer);
       const effectiveImageData = maskedData ?? layer.imageData;
-      const needsComposite = hasAnyEffect(effectBundle) || !!patternOverlayMeta;
+      // 整层原生化闸门：所有效果都能与 PS 像素级一致地用平台属性表达时，保留 effects/strokes/
+      // overlay fill 为可编辑、不烤进位图；否则退回栅格化（needsComposite）。二者互斥。
+      const native = ENABLE_EFFECT_NATIVIZATION && hasAnyEffect(effectBundle) &&
+        canNativizeLayer(layer, effectBundle, patternOverlayMeta, effectiveImageData);
+      const needsComposite = !native && (hasAnyEffect(effectBundle) || !!patternOverlayMeta);
 
-      if (needsComposite) {
+      if (native) {
+        // effects/strokes 已在 serialized 初始化时由 convertEffects/convertStrokes 设置，保留即可。
+        const png = await imageDataToPng(effectiveImageData);
+        serialized.imageIndex = images.length;
+        images.push(png);
+        const overlays = convertOverlaysToFills(effectBundle);
+        if (overlays.length > 0) serialized.overlayFills = overlays;
+        // 不设 expandOffset、不写 rawEffectsData：效果由平台节点属性唯一承载并导出。
+        logger.info(`Layer "${layer.name}": nativized effects (${serialized.effects.length} shadows, ${serialized.strokes.length} strokes, ${overlays.length} overlay fills) — kept editable`);
+      } else if (needsComposite) {
         const { png, expand, overlayBlendMode } = await compositeLayerEffects(effectiveImageData, layerFillOpacity, effectBundle, patternOverlayMeta, resolvedPatternData);
         serialized.imageIndex = images.length;
         images.push(png);
@@ -2510,9 +3187,21 @@ async function serializeLayer(
       const rawCanvasData = cctx.getImageData(0, 0, cvs.width, cvs.height);
       const maskedCanvasData = applyLayerMask(rawCanvasData, layer);
       const effectiveCanvasData = maskedCanvasData ?? rawCanvasData;
-      const needsComposite = hasAnyEffect(effectBundle) || !!patternOverlayMeta;
+      // 整层原生化闸门（与 image 分支对称，逻辑须一致）。
+      const native = ENABLE_EFFECT_NATIVIZATION && hasAnyEffect(effectBundle) && cvs.width > 0 && cvs.height > 0 &&
+        canNativizeLayer(layer, effectBundle, patternOverlayMeta, effectiveCanvasData);
+      const needsComposite = !native && (hasAnyEffect(effectBundle) || !!patternOverlayMeta);
 
-      if (needsComposite && cvs.width > 0 && cvs.height > 0) {
+      if (native) {
+        // effects/strokes 已在 serialized 初始化时由 convertEffects/convertStrokes 设置，保留即可。
+        const png = maskedCanvasData ? await imageDataToPng(effectiveCanvasData) : await canvasToPng(cvs);
+        serialized.imageIndex = images.length;
+        images.push(png);
+        const overlays = convertOverlaysToFills(effectBundle);
+        if (overlays.length > 0) serialized.overlayFills = overlays;
+        // 不设 expandOffset、不写 rawEffectsData：效果由平台节点属性唯一承载并导出。
+        logger.info(`Layer "${layer.name}": nativized effects (${serialized.effects.length} shadows, ${serialized.strokes.length} strokes, ${overlays.length} overlay fills) — kept editable`);
+      } else if (needsComposite && cvs.width > 0 && cvs.height > 0) {
         const { png, expand, overlayBlendMode } = await compositeLayerEffects(effectiveCanvasData, layerFillOpacity, effectBundle, patternOverlayMeta, resolvedPatternData);
         serialized.imageIndex = images.length;
         images.push(png);
@@ -2603,6 +3292,11 @@ async function serializeLayer(
           };
         }
         applyAdjustmentLayers(base, adjustments);
+        // 若该基底是「稍后会被清晰源重渲染的智能对象」（模糊清洗 或 锐度提升），其 imageData
+        // 会被重渲染覆盖（丢失此处烘焙的调整）。暂存调整层引用，serializeLayer 重渲染后在清晰像素上重新应用一次。
+        if (shouldRerenderClear(base)) {
+          (base as any).__rerenderClipAdjustments = adjustments;
+        }
         logger.info(`Applied ${adjustments.length} adjustment layers to "${base.name}": ${adjustments.map(a => (a as any).adjustment?.type).join(', ')}`);
         baseAdjustmentsMap.set(base, JSON.stringify(
           adjustments.map(a => ({
@@ -2670,7 +3364,9 @@ export async function parsePsdFile(
   });
 
   globalPsdPatterns = (psd as any).patterns as typeof globalPsdPatterns;
-  logger.info(`PSD structure parsed: ${psd.width}x${psd.height}, ${psd.children?.length ?? 0} top-level layers, ${globalPsdPatterns?.length ?? 0} global patterns`);
+  globalPsdLinkedFiles = (psd as any).linkedFiles as typeof globalPsdLinkedFiles;
+  globalSmartObjectSourceCache = new Map();
+  logger.info(`PSD structure parsed: ${psd.width}x${psd.height}, ${psd.children?.length ?? 0} top-level layers, ${globalPsdPatterns?.length ?? 0} global patterns, ${globalPsdLinkedFiles?.length ?? 0} linked files`);
   onProgress({ percent: 20, message: 'PSD structure parsed. Processing layers...' });
 
   const images: Uint8Array[] = [];

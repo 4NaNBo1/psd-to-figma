@@ -192,6 +192,12 @@ export interface IRNode {
    */
   rawPsdPrePatternImage?: string;
   /**
+   * 智能对象 round-trip 数据 JSON（{ origImageB64, transform, soId, width, height, filter }）。
+   * renderer 写入 setPluginData('psd_smart_object', ...)，导出时用原始模糊像素 + transform 重建
+   * placedLayer 智能对象图层。仅智能对象带模糊类智能滤镜（重渲染清晰像素）的层有。
+   */
+  rawPsdSmartObject?: string;
+  /**
    * 组的矩形图层蒙版数据 JSON（{left,top,width,height,defaultColor}，坐标相对组 frame）。
    * frame 节点用 clipsContent + 蒙版框尺寸表达裁剪；renderer 写入
    * setPluginData('psd_group_mask', ...)，round-trip 导出时重建组的矩形 layer mask。

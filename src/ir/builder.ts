@@ -1,4 +1,4 @@
-import type { SerializedLayer, SerializedPsd, SerializedShadow, SerializedStroke, SerializedCornerRadii } from '../types/psd-types';
+import type { SerializedLayer, SerializedPsd, SerializedShadow, SerializedStroke, SerializedCornerRadii, SerializedFill } from '../types/psd-types';
 import type { IRNode, IRFill, IRShadow, IRStroke, IRCornerRadii, IRTextProps, IRTextRange, IRGradientFill, IRSolidFill, IRColor } from './types';
 
 const POSTSCRIPT_TO_FAMILY: Record<string, string> = {
@@ -201,17 +201,49 @@ function convertCornerRadii(radii: SerializedCornerRadii | undefined): IRCornerR
   };
 }
 
-function buildImageFill(images: string[], imageIndex: number | undefined): IRFill[] {
-  if (imageIndex === undefined || !images[imageIndex]) return [];
+/** 把整层原生化的 color/gradient overlay（SerializedFill[]）转成叠加在 IMAGE fill 之上的 IRFill[]。 */
+function buildOverlayFills(overlayFills: SerializedFill[] | undefined): IRFill[] {
+  if (!overlayFills || overlayFills.length === 0) return [];
+  const out: IRFill[] = [];
+  for (const f of overlayFills) {
+    if (f.type === 'SOLID') {
+      out.push({ type: 'SOLID', color: { ...f.color } });
+    } else if (f.type === 'GRADIENT_LINEAR') {
+      // 复用与文本 gradientOverlay 一致的 angle→transform 换算（见 buildTextProps）。
+      const go = f.gradient;
+      const angleRad = ((go.angle + 180) * Math.PI) / 180;
+      const cos = Math.cos(angleRad);
+      const sin = Math.sin(angleRad);
+      const cx = 0.5, cy = 0.5;
+      const stops = go.reverse ? [...go.stops].reverse() : go.stops;
+      out.push({
+        type: 'GRADIENT_LINEAR',
+        stops: stops.map((s) => ({
+          position: go.reverse ? 1 - s.position : s.position,
+          color: { r: s.color.r, g: s.color.g, b: s.color.b, a: (s.color.a ?? 1) * go.opacity },
+        })),
+        transform: [
+          [cos, sin, cx - cos * cx - sin * cy],
+          [-sin, cos, cy + sin * cx - cos * cy],
+        ],
+        angle: go.angle,
+      });
+    }
+  }
+  return out;
+}
+
+function buildImageFill(images: string[], imageIndex: number | undefined, overlayFills?: SerializedFill[]): IRFill[] {
+  const overlays = buildOverlayFills(overlayFills);
+  if (imageIndex === undefined || !images[imageIndex]) return overlays;
   const base64 = images[imageIndex];
-  if (!base64 || base64.length === 0) return [];
+  if (!base64 || base64.length === 0) return overlays;
   const bytes = base64ToUint8Array(base64);
-  if (bytes.length === 0) return [];
-  return [{
-    type: 'IMAGE' as const,
-    imageBytes: bytes,
-    scaleMode: 'FILL' as const,
-  }];
+  if (bytes.length === 0) return overlays;
+  return [
+    { type: 'IMAGE' as const, imageBytes: bytes, scaleMode: 'FILL' as const },
+    ...overlays,
+  ];
 }
 
 function buildTextProps(layer: SerializedLayer): IRTextProps | undefined {
@@ -304,6 +336,7 @@ function buildTextProps(layer: SerializedLayer): IRTextProps | undefined {
     warp: td.warp,
     rawImage: td.rawImage,
     originalText: td.originalText,
+    rasterized: layer.textRasterized,
   };
 }
 
@@ -364,10 +397,40 @@ function buildGroupNode(
 
 function buildTextNode(
   layer: SerializedLayer,
-  _images: string[],
+  images: string[],
   _depth: number
 ): IRNode {
   const textProps = buildTextProps(layer);
+
+  // 文本「平台不可渲染效果」回退栅格化（textRasterized）：合成图已含字形+全部效果，
+  // 几何按合成图（含 expand）摆放、fills 用合成图、effects/strokes 置空（避免平台再叠一层）；
+  // 节点仍是 text 类型，textProps 保留全部 round-trip 源数据（含 rasterized:true）供导出还原文本层。
+  if (layer.textRasterized) {
+    const expand = layer.expandOffset ?? 0;
+    const w = Math.max(1, layer.width + expand * 2);
+    const h = Math.max(1, layer.height + expand * 2);
+    return {
+      type: 'text',
+      name: layer.name,
+      x: layer.x - expand,
+      y: layer.y - expand,
+      width: w,
+      height: h,
+      opacity: layer.opacity,
+      blendMode: normalizeBlendMode(layer.blendMode),
+      visible: layer.visible,
+      clipsContent: false,
+      fills: buildImageFill(images, layer.imageIndex),
+      effects: [],
+      strokes: [],
+      textProps,
+      rawPsdEffects: layer.rawEffectsData,
+      psdExpandOffset: expand > 0 ? expand : undefined,
+      inheritedGroupEffects: layer.inheritedGroupEffects,
+      inheritedGroupStrokes: layer.inheritedGroupStrokes,
+    };
+  }
+
   const irStrokes = convertStrokes(layer.strokes);
   const irEffects = convertEffects(layer.effects);
   return {
@@ -401,7 +464,7 @@ function buildShapeNode(
   const h = layer.isSubGroup ? layer.height : Math.max(1, layer.height);
   const rectW = Math.max(1, w + expand * 2);
   const rectH = Math.max(1, h + expand * 2);
-  const fills = buildImageFill(images, layer.imageIndex);
+  const fills = buildImageFill(images, layer.imageIndex, layer.overlayFills);
 
   return {
     type: 'rectangle',
@@ -424,6 +487,7 @@ function buildShapeNode(
     rawPsdAdjustments: layer.rawPsdAdjustments,
     rawPsdOriginalImage: layer.rawPsdOriginalImage,
     rawPsdPrePatternImage: layer.rawPsdPrePatternImage,
+    rawPsdSmartObject: layer.rawPsdSmartObject,
     psdLayerMask: layer.rawLayerMask ? JSON.stringify(layer.rawLayerMask) : undefined,
     rawPsdLayerMaskImage: layer.rawLayerMaskImage,
     inheritedGroupEffects: layer.inheritedGroupEffects,

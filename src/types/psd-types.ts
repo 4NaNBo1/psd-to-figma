@@ -57,6 +57,15 @@ export interface SerializedGradientOverlay {
   opacity: number;
 }
 
+/**
+ * 图层 Color/Gradient Overlay 效果的「可编辑表达」——当整层通过原生化闸门时，overlay 不再
+ * 烤进位图，而是作为叠加 fill 透传给平台（IMAGE fill 之上叠加 SOLID/GRADIENT_LINEAR），
+ * 导出端从 node.fills 读回还原 PSD solidFill / gradientOverlay。
+ */
+export type SerializedFill =
+  | { type: 'SOLID'; color: SerializedColor }
+  | { type: 'GRADIENT_LINEAR'; gradient: SerializedGradientOverlay };
+
 export interface PsdTextBounds {
   top: number;
   left: number;
@@ -147,8 +156,19 @@ export interface SerializedLayer {
   imageIndex?: number;
   effects: SerializedShadow[];
   strokes: SerializedStroke[];
+  /**
+   * 整层原生化时，Color/Gradient Overlay 的可编辑表达（叠加在 IMAGE fill 之上）。
+   * 仅在该层通过 canNativizeLayer 闸门时设置；栅格化的层此字段为空（overlay 已烤进位图）。
+   */
+  overlayFills?: SerializedFill[];
   cornerRadii?: SerializedCornerRadii;
   expandOffset?: number;
+  /**
+   * 标记：本文本层因含「平台渲染不出」的效果（如 spread 实色外扩阴影、warp 弧形）而被栅格化——
+   * effects/strokes 已用 compositeLayerEffects 烤进 imageIndex 指向的合成图。节点仍按文本层
+   * 导出（textData/rawEffectsData 完整保留），仅画布显示改用合成图。详见 textEffectsRenderable。
+   */
+  textRasterized?: boolean;
   /**
    * 标记：本层的 effects 含「从父组下放来的」effect（见 psd-parser 的 isSubGroup 下放逻辑）。
    * PS 中 pass-through 组的 layer effects 会作用于组合轮廓，Figma/MasterGo 的 frame 在
@@ -200,6 +220,14 @@ export interface SerializedLayer {
    * PS 应用一次 pattern = 与原始一致，避免「烤后像素 + 再叠加 pattern」的双重应用。
    */
   rawPsdPrePatternImage?: string;
+  /**
+   * 智能对象（placedLayer）带启用的模糊类智能滤镜（如动感模糊）时的 round-trip 数据 JSON。
+   * 这类图层 ag-psd 读到的 channel data 是被模糊污染的缓存，导入时已改用「智能对象源 +
+   * 仿射变换」渲染出清晰像素；此字段保存原始模糊像素 + placedLayer/滤镜元信息，
+   * 导出时优先写回原始智能对象图层，保证不丢失原始 PSD 信息。
+   * 结构：{ origImageB64, transform:number[8], soId, width, height, filter }
+   */
+  rawPsdSmartObject?: string;
   /**
    * 普通光栅层的 layer mask 数据（几何 + 单通道 alpha base64）。
    * left/top 为相对层 bbox 左上的偏移（非文档绝对），导出端叠加图层最终坐标还原绝对位置。
@@ -279,6 +307,9 @@ export interface ExportTextInfo {
   alignment: 'LEFT' | 'CENTER' | 'RIGHT' | 'JUSTIFIED';
   styles: ExportTextStyleRange[];
   textAutoResize?: 'NONE' | 'HEIGHT' | 'WIDTH_AND_HEIGHT';
+  /** 原始 PSD 文本 shapeType（point/box）。栅格化文本把 textAutoResize 强制设为 NONE 对齐 companion，
+   * 会污染 isPointText 判定；导出时优先用此字段决定走 point/box 分支，保留缩放/旋转 transform。 */
+  shapeType?: 'point' | 'box';
   /** Asymmetric font offset from visual character center to PSD transform.tx.
    * Positive value means PSD tx is right of visual center. */
   txOffsetX?: number;
@@ -398,6 +429,12 @@ export interface ExportNodeData {
    * 导出时用它替换图层位图 + 保留 patternOverlay effect + 写回 pattern 资源，避免 pattern 双重应用。
    */
   rawPsdPrePatternImage?: string;
+  /**
+   * 从节点 setPluginData('psd_smart_object', ...) 读出的智能对象 round-trip 数据 JSON
+   * （{ origImageB64, transform, soId, width, height, filter }）。
+   * 导出时优先用原始模糊像素 + transform 重建 placedLayer 智能对象图层。
+   */
+  rawPsdSmartObject?: string;
   /**
    * 从节点 setPluginData('psd_group_mask', ...) 读出的组矩形图层蒙版数据 JSON
    * （{left,top,width,height,defaultColor}，坐标相对组 frame）。

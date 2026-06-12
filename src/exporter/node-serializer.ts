@@ -413,8 +413,12 @@ async function exportNodeImage(node: any, options?: { withoutStrokesAndEffects?:
 
   // For text layers, temporarily disable strokes/effects to get a tight character-bounded image,
   // matching PSD's native text layer canvas size (which doesn't include stroke extension).
+  // 对整层原生化的位图层（IMAGE fill + 原生 effects/strokes/overlay fill），导出像素时也临时
+  // 去除 effects/strokes 与叠加的 overlay fill（仅保留 IMAGE fill），使导出 PNG 只含原始像素，
+  // 避免这些效果既被烤进 PNG、又由 node 属性写回 PSD（双重应用）。
   let savedStrokes: any[] | undefined;
   let savedEffects: any[] | undefined;
+  let savedFills: any[] | undefined;
   if (options?.withoutStrokesAndEffects) {
     try {
       if (Array.isArray(node.strokes) && node.strokes.length > 0) {
@@ -425,6 +429,19 @@ async function exportNodeImage(node: any, options?: { withoutStrokesAndEffects?:
         savedEffects = node.effects;
         node.effects = [];
       }
+      // 仅保留 IMAGE fill；去掉叠加的 SOLID/GRADIENT overlay fill。
+      if (Array.isArray(node.fills) && node.fills.some((f: any) => f && f.type !== 'IMAGE')) {
+        const imageOnly = node.fills.filter((f: any) => f && f.type === 'IMAGE');
+        if (imageOnly.length !== node.fills.length) {
+          savedFills = node.fills;
+          node.fills = imageOnly;
+        }
+      }
+      // 属性变更需让渲染状态落地后再 exportAsync，否则 MasterGo/Figma 可能仍按变更前的
+      // 渲染缓存导出（阴影/描边/叠加 fill 被烤进 PNG，与 node 属性写回 PSD 双重应用）。
+      // opacity 分支（下方）仅在 opacity<1 时 yield，原生化图标层 opacity=1 不进该分支，
+      // 故此处去 effect 后必须单独 yield 一次。
+      await yieldThread();
     } catch { /* ignore */ }
   }
 
@@ -459,6 +476,9 @@ async function exportNodeImage(node: any, options?: { withoutStrokesAndEffects?:
     }
     if (savedEffects !== undefined) {
       try { node.effects = savedEffects; } catch { /* ignore */ }
+    }
+    if (savedFills !== undefined) {
+      try { node.fills = savedFills; } catch { /* ignore */ }
     }
     if (savedOpacity !== undefined) {
       try { node.opacity = savedOpacity; } catch { /* ignore */ }
@@ -502,6 +522,13 @@ async function serializeNode(
     onLog('warn', `Skipping "${node.name}": exceeded max nesting depth`);
     return null;
   }
+  // 栅格化文本的合成图兄弟 rectangle（renderer 创建，仅用于画布显示）：导出时跳过，
+  // 由同位置的透明占位 TextNode 导出为文本层（含 rawImage 字形 + rawEffects 还原 spread 阴影/warp）。
+  try {
+    if (typeof node.getPluginData === 'function' && node.getPluginData('psd_raster_companion')) {
+      return null;
+    }
+  } catch { /* ignore */ }
 
   const nodeType = mapNodeType(node);
 
@@ -621,6 +648,12 @@ async function serializeNode(
             if (w && typeof w.style === 'string' && w.style !== 'none') data.textInfo.warp = w;
           } catch { /* ignore */ }
         }
+        // 原始 PSD shapeType（栅格化文本专用）：栅格化把 textAutoResize 设为 NONE 污染了 point 判定，
+        // 用此字段让 psd-builder 仍按原始 shapeType 走 point 分支，保留缩放/旋转 transform。
+        const shapeTypeStr = getData('psd_shape_type');
+        if (shapeTypeStr === 'point' || shapeTypeStr === 'box') {
+          data.textInfo.shapeType = shapeTypeStr;
+        }
         // 精确还原：anchor + 原始 PSD transform.tx/ty
         const anchorYStr = getData('psd_anchor_node_y');
         if (anchorYStr) {
@@ -730,7 +763,10 @@ async function serializeNode(
 
     const hasImageFill = data.fills.some(f => f.type === 'IMAGE' && f.visible);
     if (hasImageFill || !effectiveVisible) {
-      data.imageBase64 = await exportNodeImage(node);
+      // 去除 node 的 effects/strokes 与叠加 overlay fill 再导出，使 PNG 只含原始像素：
+      // 整层原生化的位图层这些效果由 node 属性写回 PSD，不可重复烤进 PNG（难点 4）。
+      // 栅格化层的 effects/strokes 已在导入时清空、无 overlay fill，此操作对其为无副作用。
+      data.imageBase64 = await exportNodeImage(node, { withoutStrokesAndEffects: true });
     }
   } else {
     data.imageBase64 = await exportNodeImage(node);
@@ -816,6 +852,17 @@ async function serializeNode(
       const prePat = node.getPluginData('psd_pre_pattern_image');
       if (prePat) {
         data.rawPsdPrePatternImage = prePat;
+      }
+    }
+  } catch { /* ignore */ }
+
+  // 读取 psd_smart_object：智能对象（带模糊滤镜，导入时已重渲染清晰像素）的 round-trip 数据，
+  // 导出时用原始模糊像素 + transform 重建 placedLayer 智能对象图层。
+  try {
+    if (typeof node.getPluginData === 'function') {
+      const so = node.getPluginData('psd_smart_object');
+      if (so) {
+        data.rawPsdSmartObject = so;
       }
     }
   } catch { /* ignore */ }

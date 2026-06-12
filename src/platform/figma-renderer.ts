@@ -1,8 +1,11 @@
-import type { IRNode, IRFill, IRShadow, IRStroke, IRCornerRadii, IRTextProps, IRTextRange, IRGradientFill, IRSolidFill, IRImageFill } from '../ir/types';
+import type { IRNode, IRFill, IRShadow, IRStroke, IRCornerRadii, IRTextProps, IRTextRange, IRGradientFill, IRSolidFill } from '../ir/types';
 import type { PlatformRenderer, LogFn, ProgressFn, RenderOptions } from './types';
 import { countIRNodes } from '../ir/builder';
 
 const FALLBACK_FONT: FontName = { family: 'Inter', style: 'Regular' };
+
+// radius=0 的纯 spread 阴影在部分平台渲染不出，给一个极小可见 radius 兜底（与 MasterGo 端对称，见 applyEffects）。
+const MIN_VISIBLE_SHADOW_RADIUS = 0.01;
 
 const STYLE_VARIANT_GROUPS: string[][] = [
   ['Thin', '100', 'Hairline'],
@@ -104,7 +107,9 @@ function applyEffects(node: SceneNode, effects: IRShadow[]): void {
     type: e.type,
     color: { r: e.color.r, g: e.color.g, b: e.color.b, a: e.color.a },
     offset: { x: e.offset.x, y: e.offset.y },
-    radius: e.radius,
+    // radius=0（PSD choke=100 的纯实色外扩阴影，如紧贴文字的描边状投影）在部分平台
+    // 渲染不出，给一个极小 radius 兜底让其可见——视觉上 0 与 0.01 不可分。与 MasterGo 端对称。
+    radius: e.radius === 0 && e.spread > 0 ? MIN_VISIBLE_SHADOW_RADIUS : e.radius,
     spread: e.spread,
     visible: e.visible,
     blendMode: e.blendMode as BlendMode,
@@ -145,20 +150,6 @@ function applyStrokes(node: SceneNode, strokes: IRStroke[], onLog?: LogFn, nodeN
   applySingleStroke(node, strokes[0]);
 }
 
-async function applyImageFill(node: RectangleNode | FrameNode, fill: IRImageFill, onLog: LogFn, name: string): Promise<void> {
-  try {
-    const image = figma.createImage(fill.imageBytes);
-    node.fills = [{
-      type: 'IMAGE',
-      imageHash: image.hash,
-      scaleMode: fill.scaleMode,
-    }];
-  } catch (e) {
-    onLog('warn', `Failed to apply image on "${name}": ${e instanceof Error ? e.message : e}`);
-    node.fills = [];
-  }
-}
-
 function applySolidFills(node: MinimalFillsMixin, fills: IRSolidFill[]): void {
   node.fills = fills.map((f) => ({
     type: 'SOLID' as const,
@@ -167,30 +158,48 @@ function applySolidFills(node: MinimalFillsMixin, fills: IRSolidFill[]): void {
   }));
 }
 
+/** 把单个 IRFill 转成 Figma Paint。IMAGE 需异步 createImage，返回 null 表示失败由调用方处理。 */
+function irFillToPaint(fill: IRFill, onLog: LogFn, name: string): Paint | null {
+  if (fill.type === 'IMAGE') {
+    try {
+      const image = figma.createImage(fill.imageBytes);
+      return { type: 'IMAGE', imageHash: image.hash, scaleMode: fill.scaleMode };
+    } catch (e) {
+      onLog('warn', `Failed to apply image on "${name}": ${e instanceof Error ? e.message : e}`);
+      return null;
+    }
+  }
+  if (fill.type === 'SOLID') {
+    return {
+      type: 'SOLID',
+      color: { r: fill.color.r, g: fill.color.g, b: fill.color.b },
+      opacity: fill.opacity ?? fill.color.a,
+    };
+  }
+  // GRADIENT_LINEAR
+  return {
+    type: 'GRADIENT_LINEAR',
+    gradientStops: fill.stops.map((s) => ({
+      position: s.position,
+      color: { r: s.color.r, g: s.color.g, b: s.color.b, a: s.color.a },
+    })),
+    gradientTransform: fill.transform,
+  };
+}
+
 async function applyFills(node: RectangleNode | FrameNode, fills: IRFill[], onLog: LogFn, name: string): Promise<void> {
   if (fills.length === 0) {
     node.fills = [];
     return;
   }
-  const fill = fills[0];
-  if (fill.type === 'IMAGE') {
-    await applyImageFill(node, fill, onLog, name);
-  } else if (fill.type === 'SOLID') {
-    node.fills = [{
-      type: 'SOLID',
-      color: { r: fill.color.r, g: fill.color.g, b: fill.color.b },
-      opacity: fill.opacity ?? fill.color.a,
-    }];
-  } else if (fill.type === 'GRADIENT_LINEAR') {
-    node.fills = [{
-      type: 'GRADIENT_LINEAR',
-      gradientStops: fill.stops.map((s) => ({
-        position: s.position,
-        color: { r: s.color.r, g: s.color.g, b: s.color.b, a: s.color.a },
-      })),
-      gradientTransform: fill.transform,
-    }];
+  // 支持 IMAGE fill 之上叠加 color/gradient overlay fill（整层原生化的 overlay）。
+  // Figma fills 数组靠后的在视觉上层，与 IR 中 [IMAGE, ...overlays] 顺序一致。
+  const paints: Paint[] = [];
+  for (const fill of fills) {
+    const paint = irFillToPaint(fill, onLog, name);
+    if (paint) paints.push(paint);
   }
+  node.fills = paints;
 }
 
 // 创建并样式化一个文本节点；strokeOverride 决定本节点承载的 stroke（undefined = 不画 stroke）
@@ -258,7 +267,14 @@ async function createStyledTextNode(
         }
       }
 
-      if (range.fills.length > 0) {
+      // rasterized 文本：合成图由兄弟 rectangle 承载显示，本占位 TextNode 须不可见，
+      // 否则可见字符会盖住合成图（白字遮橙边）。设字符 fill 为透明 alpha=0，
+      // 字体/字号/letterSpacing 仍正常设置以保留导出所需度量。
+      if (tp.rasterized) {
+        text.setRangeFills(start, end, [{
+          type: 'SOLID', color: { r: 0, g: 0, b: 0 }, opacity: 0,
+        }]);
+      } else if (range.fills.length > 0) {
         const f = range.fills[0];
         if (f.type === 'SOLID') {
           text.setRangeFills(start, end, [{
@@ -283,27 +299,78 @@ async function createStyledTextNode(
     }
   }
 
-  if (tp.gradientOverlay) {
-    const go = tp.gradientOverlay;
-    text.fills = [{
-      type: 'GRADIENT_LINEAR',
-      gradientStops: go.stops.map((s) => ({
-        position: s.position,
-        color: { r: s.color.r, g: s.color.g, b: s.color.b, a: s.color.a },
-      })),
-      gradientTransform: go.transform,
-    }];
-  }
+  // 文本「平台不可渲染效果」回退栅格化（tp.rasterized）：节点仍是 TextNode（保 characters 供导出
+  // 识别为文本层），但画布显示改用合成图 IMAGE fill（已含字形+spread 阴影/描边/warp 等平台渲染不出
+  // 的效果）。跳过 gradientOverlay / applyEffects / stroke / alignTextPosition（合成图已包含），
+  // resize 到 IR 尺寸（含 expand）使合成图铺满。round-trip 元数据照常写入（见下方 setPluginData）。
+  if (tp.rasterized) {
+    // 占位 TextNode：字符已透明（见上方 range fills），自身不显示像素（fills 置空）。
+    // 合成图改由同 parent 的兄弟 rectangle 承载显示（见下方），避免可见字符/字框度量干扰合成图。
+    // 文本节点仍保 characters + 全部 pluginData 供导出识别为文本层。
+    text.fills = [];
+    // 位置/尺寸对齐合成图（去掉字框自适应度量的漂移），与 companion rectangle 完全重合，
+    // 并锁定避免用户误选/误移（不可见 + 锁定，仅作导出文本层的载体）。
+    text.textAutoResize = 'NONE';
+    text.x = irNode.x;
+    text.y = irNode.y;
+    text.resize(Math.max(1, irNode.width), Math.max(1, irNode.height));
+    try { text.locked = true; } catch { /* ignore */ }
+    applyInheritedFxMarkers(text, irNode);
+    if (tp.rotation) {
+      text.rotation = tp.rotation;
+    }
+    try { text.setPluginData('psd_text_rasterized', '1'); } catch { /* ignore */ }
+    // 栅格化为对齐 companion 把 textAutoResize 强制设为 NONE，会污染导出端 isPointText 判定
+    // （psd-builder 据 textAutoResize 选 point/box 分支）。单独存原始 shapeType，导出端据此还原：
+    // point 文本走 point 分支保留原始 sx/sy 缩放 + 旋转 transform（如 Piggy Pop sy≈2.167），
+    // 否则走 box 分支会丢缩放/旋转，文本字号位置错。
+    if (tp.shapeType) {
+      try { text.setPluginData('psd_shape_type', tp.shapeType); } catch { /* ignore */ }
+    }
 
-  applyEffects(text, irNode.effects);
-  applyInheritedFxMarkers(text, irNode);
-  if (strokeOverride) {
-    applySingleStroke(text, strokeOverride);
-  }
+    // 兄弟 rectangle 承载合成图显示（含字形+spread 阴影/描边）。几何 = IR 文本几何（含 expand），
+    // 标记 psd_raster_companion 让导出端跳过（不进 PSD，由透明文本节点导出文本层）。
+    if (irNode.fills.length > 0) {
+      const paints: Paint[] = [];
+      for (const fill of irNode.fills) {
+        const paint = irFillToPaint(fill, onLog, irNode.name);
+        if (paint) paints.push(paint);
+      }
+      if (paints.length > 0) {
+        const companion = figma.createRectangle();
+        companion.name = irNode.name + ' (raster)';
+        parent.appendChild(companion);
+        companion.x = irNode.x;
+        companion.y = irNode.y;
+        companion.resize(Math.max(1, irNode.width), Math.max(1, irNode.height));
+        companion.fills = paints;
+        if (tp.rotation) companion.rotation = tp.rotation;
+        try { companion.setPluginData('psd_raster_companion', '1'); } catch { /* ignore */ }
+      }
+    }
+  } else {
+    if (tp.gradientOverlay) {
+      const go = tp.gradientOverlay;
+      text.fills = [{
+        type: 'GRADIENT_LINEAR',
+        gradientStops: go.stops.map((s) => ({
+          position: s.position,
+          color: { r: s.color.r, g: s.color.g, b: s.color.b, a: s.color.a },
+        })),
+        gradientTransform: go.transform,
+      }];
+    }
 
-  alignTextPosition(text, irNode, onLog);
-  if (tp.rotation) {
-    text.rotation = tp.rotation;
+    applyEffects(text, irNode.effects);
+    applyInheritedFxMarkers(text, irNode);
+    if (strokeOverride) {
+      applySingleStroke(text, strokeOverride);
+    }
+
+    alignTextPosition(text, irNode, onLog);
+    if (tp.rotation) {
+      text.rotation = tp.rotation;
+    }
   }
 
   // 与 mastergo 端保持对等：把 PSD 转 figma 时丢失的关键元数据存到 plugin data
@@ -571,6 +638,9 @@ async function renderNode(
         }
         if (irNode.rawPsdPrePatternImage) {
           try { rect.setPluginData('psd_pre_pattern_image', irNode.rawPsdPrePatternImage); } catch { /* ignore */ }
+        }
+        if (irNode.rawPsdSmartObject) {
+          try { rect.setPluginData('psd_smart_object', irNode.rawPsdSmartObject); } catch { /* ignore */ }
         }
         if (irNode.psdLayerMask) {
           try { rect.setPluginData('psd_layer_mask', irNode.psdLayerMask); } catch { /* ignore */ }

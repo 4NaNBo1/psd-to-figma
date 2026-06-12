@@ -21,3 +21,10 @@ Thumbs.db
 *.log
 
 .kilo
+
+# CodeGraph index (local semantic code index)
+.codegraph/
+
+# Local MCP server config
+.mcp.json
+.mastergo/

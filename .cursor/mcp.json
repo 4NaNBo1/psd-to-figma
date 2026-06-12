@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "mastergo": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@mastergo/vibe-mcp",
+        "--url=http://localhost:50678"
+      ]
+    }
+  }
+}
