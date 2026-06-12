@@ -2408,6 +2408,12 @@ function canNativizeLayer(
     }
   }
 
+  // stroke 覆盖率闸门：PSD stroke 沿像素轮廓渲染，平台 stroke 沿节点几何（矩形）渲染。
+  // 当图层像素不近似填满 bbox 时（如三角形 icon），两者外观差异巨大，须退回栅格化。
+  if (bundle.strokes.length > 0 && opaqueCoverageRatio(imageData) < OVERLAY_NATIVIZE_MIN_COVERAGE) {
+    return false;
+  }
+
   // color / gradient overlay：混合模式 normal + 像素填满 bbox（否则矩形色块盖透明区，难点 2）
   const hasOverlay = !!bundle.solidFill || !!bundle.gradientOverlay;
   if (hasOverlay) {
