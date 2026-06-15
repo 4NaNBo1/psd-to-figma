@@ -1,6 +1,6 @@
 {
   "name": "psd-to-figma",
-  "version": "1.0.0",
+  "version": "1.5.0",
   "description": "Figma plugin to import PSD files as editable Figma layers",
   "scripts": {
     "postinstall": "patch-package",
