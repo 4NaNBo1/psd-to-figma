@@ -1,5 +1,26 @@
+diff --git a/node_modules/ag-psd/dist-es/additionalInfo.js b/node_modules/ag-psd/dist-es/additionalInfo.js
+index 786d0de..50b66b2 100644
+--- a/node_modules/ag-psd/dist-es/additionalInfo.js
++++ b/node_modules/ag-psd/dist-es/additionalInfo.js
+@@ -3312,7 +3312,6 @@ addHandler('FEid', hasKey('filterEffectsMasks'), function (reader, target, leftB
+         }
+     }
+ }, function (writer, target) {
+-    var _a;
+     writeInt32(writer, 3); // version
+     for (var _i = 0, _b = target.filterEffectsMasks; _i < _b.length; _i++) {
+         var mask = _b[_i];
+@@ -3342,7 +3341,7 @@ addHandler('FEid', hasKey('filterEffectsMasks'), function (reader, target, leftB
+             }
+         }
+         writer.view.setUint32(length2Offset - 4, writer.offset - length2Offset, false);
+-        var extra = (_a = target.filterEffectsMasks[target.filterEffectsMasks.length - 1]) === null || _a === void 0 ? void 0 : _a.extra;
++        var extra = mask.extra;
+         if (extra) {
+             writeUint8(writer, 1);
+             writeInt32(writer, extra.top);
 diff --git a/node_modules/ag-psd/dist/additionalInfo.js b/node_modules/ag-psd/dist/additionalInfo.js
-index 2e62b06..629b06b 100644
+index 2e62b06..2168904 100644
 --- a/node_modules/ag-psd/dist/additionalInfo.js
 +++ b/node_modules/ag-psd/dist/additionalInfo.js
 @@ -2130,17 +2130,78 @@ if (helpers_1.MOCK_HANDLERS) {
@@ -90,7 +111,24 @@ index 2e62b06..629b06b 100644
      });
  }
  /*
-@@ -3419,7 +3480,6 @@ addHandler('lfx2', function (target) { return target.effects !== undefined && !h
+@@ -3317,7 +3378,6 @@ addHandler('FEid', hasKey('filterEffectsMasks'), function (reader, target, leftB
+         }
+     }
+ }, function (writer, target) {
+-    var _a;
+     (0, psdWriter_1.writeInt32)(writer, 3); // version
+     for (var _i = 0, _b = target.filterEffectsMasks; _i < _b.length; _i++) {
+         var mask = _b[_i];
+@@ -3347,7 +3407,7 @@ addHandler('FEid', hasKey('filterEffectsMasks'), function (reader, target, leftB
+             }
+         }
+         writer.view.setUint32(length2Offset - 4, writer.offset - length2Offset, false);
+-        var extra = (_a = target.filterEffectsMasks[target.filterEffectsMasks.length - 1]) === null || _a === void 0 ? void 0 : _a.extra;
++        var extra = mask.extra;
+         if (extra) {
+             (0, psdWriter_1.writeUint8)(writer, 1);
+             (0, psdWriter_1.writeInt32)(writer, extra.top);
+@@ -3419,7 +3479,6 @@ addHandler('lfx2', function (target) { return target.effects !== undefined && !h
      if (version !== 0)
          throw new Error("Invalid lfx2 version");
      var desc = (0, descriptor_1.readVersionAndDescriptor)(reader);
@@ -112,3 +150,16 @@ index e18ef7b..f03d93f 100644
      var decode = function (val) {
          var value = val.split('.')[1];
          if (value && !rev[value])
+diff --git a/node_modules/ag-psd/src/additionalInfo.ts b/node_modules/ag-psd/src/additionalInfo.ts
+index 3c9a774..2633b90 100644
+--- a/node_modules/ag-psd/src/additionalInfo.ts
++++ b/node_modules/ag-psd/src/additionalInfo.ts
+@@ -5196,7 +5196,7 @@ addHandler(
+ 
+ 			writer.view.setUint32(length2Offset - 4, writer.offset - length2Offset, false);
+ 
+-			const extra = target.filterEffectsMasks![target.filterEffectsMasks!.length - 1]?.extra;
++			const extra = mask.extra;
+ 			if (extra) {
+ 				writeUint8(writer, 1);
+ 				writeInt32(writer, extra.top);

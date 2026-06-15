@@ -31,6 +31,10 @@ let globalPsdPatterns: { id: string; name?: string; x?: number; y?: number; boun
 // 在 parsePsdFile 入口设置，供「智能对象带模糊滤镜时用源重渲染清晰像素」跨递归取用。
 let globalPsdLinkedFiles: { id?: string; name?: string; data?: Uint8Array }[] | undefined;
 
+// PSD 根对象。文档级 filterEffectsMasks(FEid 滤镜蒙版栅格，按 placed instance id 关联)挂在根上，
+// 在 parsePsdFile 入口设置，供智能对象 round-trip 完整还原时取用。
+let globalPsdRoot: any | undefined;
+
 // 智能对象内嵌源解码缓存（按 placedLayer.id）。多个实例（如 cions 组 4 枚 coin）常共享同一源，
 // 大 PSB 解码昂贵，缓存避免重复 readPsd。null 表示该源解码失败/不可用，不再重试。
 // transparentFrac：源（降采样采样）中 alpha<250 的像素占比，用于判断源是否「带白底的扁平合成」
@@ -227,7 +231,7 @@ function getMaskAlphaLookup(
  * 无真实像素蒙版（空 mask / 全 defaultColor）返回 null，导出时不还原（与原始 no-op 等价）。
  */
 function serializeAdjustmentMask(mask: any): {
-  left: number; top: number; width: number; height: number; defaultColor: number; dataB64: string;
+  left: number; top: number; width: number; height: number; defaultColor: number; dataB64: string; empty?: boolean;
 } | null {
   if (!mask || mask.disabled) return null;
   let pixels: Uint8ClampedArray | Uint8Array | Uint16Array | Float32Array | null = null;
@@ -242,7 +246,11 @@ function serializeAdjustmentMask(mask: any): {
     mW = cvs.width;
     mH = cvs.height;
   }
-  if (!pixels || mW === 0 || mH === 0) return null;
+  // 存在 mask 但无像素数据(全白/全黑空蒙版，defaultColor)：保留为「空蒙版」标记，
+  // 让导出端创建对应的空蒙版，使 PS 图层面板结构与原始一致(调整层旁的蒙版缩略图)。
+  if (!pixels || mW === 0 || mH === 0) {
+    return { left: mask.left ?? 0, top: mask.top ?? 0, width: 0, height: 0, defaultColor: mask.defaultColor ?? 255, dataB64: '', empty: true };
+  }
   const stride = pixels.length === mW * mH ? 1 : 4;
   // 抽取单通道 alpha
   const single = new Uint8Array(mW * mH);
@@ -548,6 +556,15 @@ function uint8ArrayToBase64(bytes: Uint8Array): string {
     binary += String.fromCharCode(bytes[i]);
   }
   return btoa(binary);
+}
+
+// 把整个 placedLayer 对象序列化为可 JSON 化结构(Uint8Array → {__u8:base64})。
+// 用于智能对象完整还原：导出时原样写回，避免逐字段重建漏掉 crop/comp/compInfo/frameCount 等。
+function serializePlacedLayer(pl: any): any {
+  return JSON.parse(JSON.stringify(pl, (_k, v) => {
+    if (v instanceof Uint8Array) return { __u8: uint8ArrayToBase64(v) };
+    return v;
+  }));
 }
 
 /**
@@ -1130,7 +1147,6 @@ function renderSmartObjectClearImage(
 
   const filterMask = decodeFilterEffectsMask(layer, bounds);
 
-
   if (filterMask) {
     // 精确蒙版合成：逐像素按蒙版 alpha 混合。
     const trailCv = document.createElement('canvas');
@@ -1156,23 +1172,32 @@ function renderSmartObjectClearImage(
     return { data: out, width: W, height: H };
   }
 
-  // PS smart filter 渲染模型：清晰源 → motion blur → 滤镜蒙版混合。
-  // 默认蒙版全白 = 完全显示模糊结果。channel data (trail) 就是 PS 的最终渲染结果。
-  // 但 trail 中心是「模糊后的主体」而非清晰源，主体会比 PS merged composite 稍模糊，
-  // 因为 PS 在后续合成时可能还有额外步骤。
-  // 用 destination-over 在 sharp 不透明处显示清晰源（更锐利），透明处显示 trail（拖尾）。
-  // sharp 已经应用了非模糊滤镜(curves)，trail 的 curves 效果在 channel data 中已内置。
+  // PS smart filter 渲染模型：清晰源(币主体) + 动感模糊拖尾。ag-psd 不暴露滤镜蒙版栅格
+  // (filterMask 为空走此兜底)，无法精确还原"哪端是拖尾"。
+  // trail 缓存是沿运动轴「对称两端」的整条动感模糊；若用 destination-over 全不透明叠加，
+  // trail 会铺满整个 bbox 把清晰币淹没成一团模糊光斑(本次 bug)。
+  // 正解(见 memory psd-smart-object-blur-rerender 第7条)：以清晰币为主体，在其上用低不透明度
+  // 叠加 trail 作为「淡淡的运动拖尾」——清晰币主导、拖尾仅淡淡透出运动感。
   sctx.putImageData(sharpId, 0, 0);
   const out = document.createElement('canvas');
   out.width = W; out.height = H;
   const octx = out.getContext('2d')!;
+  // 清晰币(sharp)叠在最上确保主体锐利；轮廓外透明区用 destination-over 显示全强度动感拖尾。
+  // sharp 现在是真正的清晰币(高不透明中心)，destination-over 只在币轮廓外/半透明边缘透出 trail，
+  // 不会再淹没币主体；同时拖尾保持原始 channel data 的完整浓度，与原始 composite 接近。
   octx.drawImage(sharpCv, 0, 0);
   octx.globalCompositeOperation = 'destination-over';
+  octx.globalAlpha = SMART_BLUR_TRAIL_OPACITY;
   octx.drawImage(trail.canvas, 0, 0, trail.width, trail.height, 0, 0, W, H);
+  octx.globalAlpha = 1;
   octx.globalCompositeOperation = 'source-over';
   const id = octx.getImageData(0, 0, W, H);
   return { data: id.data, width: W, height: H };
 }
+
+// 动感模糊拖尾叠加不透明度。trail 用 destination-over 只填充清晰币轮廓外的透明区(不淹没币主体)，
+// 故可用接近全强度还原原始拖尾浓度；保留少量衰减(0.9)避免对称双向拖尾在轮廓外显得过实。
+const SMART_BLUR_TRAIL_OPACITY = 0.9;
 
 function applyLayerMask(
   imageData: { data: Uint8ClampedArray | Uint8Array | Uint16Array | Float32Array; width: number; height: number },
@@ -3249,8 +3274,13 @@ async function serializeLayer(
     const clear = renderSmartObjectClearImage(layer);
     if (clear) {
       try {
-        const origPng = layer.imageData && layer.imageData.width > 0
-          ? await imageDataToPng(layer.imageData)
+        // 完整还原的图层 channel data 应是「未经剪贴调整烘焙的原始模糊像素」(= PS 原始 channel data)。
+        // 父层预处理可能已把剪贴调整(如亮度+17)烘进 layer.imageData，导致 channel data 偏离原始、
+        // 拖尾渲染变淡。优先用 __origImageDataBeforeAdjustment(调整前原始)。
+        const preAdjData = (layer as any).__origImageDataBeforeAdjustment;
+        const channelSrc = (preAdjData && preAdjData.width > 0) ? preAdjData : layer.imageData;
+        const origPng = channelSrc && channelSrc.width > 0
+          ? await imageDataToPng(channelSrc)
           : (layer.canvas ? await canvasToPng(layer.canvas as HTMLCanvasElement) : null);
         const pl = (layer as any).placedLayer;
         const feMasks = (layer as any).filterEffectsMasks as Array<{
@@ -3263,15 +3293,52 @@ async function serializeLayer(
           channels: m.channels.map(ch => ch ? { compressionMode: ch.compressionMode, data: uint8ArrayToBase64(ch.data) } : null),
           extra: m.extra ? { top: m.extra.top, left: m.extra.left, bottom: m.extra.bottom, right: m.extra.right, compressionMode: m.extra.compressionMode, data: uint8ArrayToBase64(m.extra.data) } : undefined,
         })) : undefined;
-        serialized.rawPsdSmartObject = JSON.stringify({
+        // 带智能滤镜(motion blur 等)的智能对象：存「内嵌源字节 + 文档级滤镜蒙版栅格」，
+        // 供导出端完整还原成真·智能对象(PS 用源+滤镜+蒙版实时渲染 = 与原始 1:1，可变换、参数齐全)。
+        // 经验证 ag-psd 完整往返无损。仅对带 filter 的层存源(避免无滤镜大源如博士帽金币 22MB 撑大文件)。
+        const hasFilter = !!(pl.filter);
+        let linkedSrcB64: string | undefined;
+        let docFeMasks: typeof feData | undefined;
+        if (hasFilter && globalPsdLinkedFiles) {
+          const lf = globalPsdLinkedFiles.find((f) => f && f.id === pl.id);
+          if (lf && (lf as any).data) {
+            linkedSrcB64 = uint8ArrayToBase64((lf as any).data as Uint8Array);
+          }
+          // 滤镜蒙版栅格在文档级 psd.filterEffectsMasks，按 placed instance id 关联(非图层级)。
+          const psdFe = (globalPsdRoot as any)?.filterEffectsMasks as Array<any> | undefined;
+          if (psdFe && pl.placed) {
+            docFeMasks = psdFe.filter((m) => m && m.id === pl.placed).map((m: any) => ({
+              id: m.id, top: m.top, left: m.left, bottom: m.bottom, right: m.right, depth: m.depth,
+              channels: m.channels.map((ch: any) => ch ? { compressionMode: ch.compressionMode, data: uint8ArrayToBase64(ch.data) } : null),
+              extra: m.extra ? { top: m.extra.top, left: m.extra.left, bottom: m.extra.bottom, right: m.extra.right, compressionMode: m.extra.compressionMode, data: uint8ArrayToBase64(m.extra.data) } : undefined,
+            }));
+          }
+        }
+        const rawSmartObjectData = {
           origImageB64: origPng ? uint8ArrayToBase64(origPng) : undefined,
           transform: pl.transform,
+          nonAffineTransform: pl.nonAffineTransform,
+          resolution: pl.resolution,
           soId: pl.id,
+          placed: pl.placed,
           width: pl.width,
           height: pl.height,
+          warp: pl.warp,
           filter: pl.filter,
           filterEffectsMasks: feData,
-        });
+          // 完整还原数据(仅带滤镜的智能对象)：内嵌源 + 文档级滤镜蒙版。
+          linkedSrcB64,
+          docFilterEffectsMasks: docFeMasks,
+          // 完整原始 placedLayer 对象(原样序列化)：逐字段重建永远难以等于原始(crop/comp/compInfo/
+          // frameCount/... 任一缺失都可能让 PS 渲染异常)。直接存整个 pl，导出原样写回，一次性全对。
+          fullPlacedLayer: hasFilter && linkedSrcB64 ? serializePlacedLayer(pl) : undefined,
+          referencePoint: (layer as any).referencePoint,
+          // 图层 id(lyid)：PS 的智能滤镜蒙版(FEid)按图层 id 关联，缺失则 PS 找不到蒙版 →
+          // 用默认全白蒙版 → motion blur 应用到整层 → 光斑。必须写回原始图层 id。
+          layerId: (layer as any).id,
+          blendingRanges: (layer as any).blendingRanges,
+        };
+        serialized.rawPsdSmartObject = JSON.stringify(rawSmartObjectData);
       } catch (e) {
         logger.warn(`Failed to save smart-object round-trip data for "${layer.name}": ${e instanceof Error ? e.message : e}`);
       }
@@ -3565,6 +3632,7 @@ export async function parsePsdFile(
     logMissingFeatures: false,
   });
 
+  globalPsdRoot = psd;
   globalPsdPatterns = (psd as any).patterns as typeof globalPsdPatterns;
   globalPsdLinkedFiles = (psd as any).linkedFiles as typeof globalPsdLinkedFiles;
   globalSmartObjectSourceCache = new Map();

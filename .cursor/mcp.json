@@ -7,6 +7,16 @@
         "@mastergo/vibe-mcp",
         "--url=http://localhost:50678"
       ]
+    },
+    "codegraph": {
+      "type": "stdio",
+      "command": "codegraph",
+      "args": [
+        "serve",
+        "--mcp",
+        "--path",
+        "/Users/admin/Documents/psd-to-figma"
+      ]
     }
   }
 }

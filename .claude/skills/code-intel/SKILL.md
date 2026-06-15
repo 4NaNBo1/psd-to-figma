@@ -29,6 +29,15 @@ you halfway.
 *conceptual / "what-means-what / explain / why / which-code-is-about-X"* →
 **graphify**. Deep understanding usually wants **both**.
 
+> **Setup status (this repo).** codegraph is wired into **both Cursor and Claude
+> Code** via [colbymchenry/codegraph](https://github.com/colbymchenry/codegraph)
+> (project-local MCP: `.mcp.json` for Claude Code, `.cursor/mcp.json` for Cursor;
+> index in `.codegraph/`, auto-syncs on save). The canonical cross-tool routing
+> lives in the repo-root `CLAUDE.md` §7 (mirrored to `.cursor/rules/code-intel-routing.mdc`
+> via sync-rules) — this skill and that section must stay consistent; on conflict,
+> `CLAUDE.md` §7 wins. graphify is still on the AST-only tier (see
+> [[graphify-no-key-ast-tier]]).
+
 ---
 
 ## 1. Route the question

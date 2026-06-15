@@ -51,6 +51,25 @@ function toPostScriptName(family: string, style: string): string {
   return `${cleanFamily}-${cleanStyle}`;
 }
 
+// 智能对象完整还原收集器：buildLayer 把带滤镜智能对象的「内嵌源 + 文档级滤镜蒙版」收集到这里，
+// 在 buildAndDownloadPsd 写 PSD 前注入到文档根(psd.linkedFiles / psd.filterEffectsMasks)。
+// 文档级数据 + 图层级 placedLayer/filter 一起，让 PS 完整还原智能滤镜(经纯往返验证无损)。
+let collectedLinkedFiles: { id: string; name: string; type: string; data: Uint8Array }[] = [];
+let collectedFilterEffectsMasks: any[] = [];
+
+// 还原 serializePlacedLayer 序列化的 placedLayer({__u8:base64} → Uint8Array)。
+function deserializePlacedLayer(obj: any): any {
+  if (obj == null) return obj;
+  if (Array.isArray(obj)) return obj.map(deserializePlacedLayer);
+  if (typeof obj === 'object') {
+    if (typeof obj.__u8 === 'string') return base64ToUint8Array(obj.__u8);
+    const out: any = {};
+    for (const k of Object.keys(obj)) out[k] = deserializePlacedLayer(obj[k]);
+    return out;
+  }
+  return obj;
+}
+
 function base64ToUint8Array(base64: string): Uint8Array {
   const raw = atob(base64);
   const bytes = new Uint8Array(raw.length);
@@ -568,21 +587,50 @@ async function buildLayer(node: ExportNodeData, parentClipRect?: { x: number; y:
   // round-trip：智能对象（带模糊滤镜，导入时已重渲染清晰像素）的兜底数据。
   // 导出时优先用存储的原始模糊 channel data 还原图层位图，并用存储的 transform 重建 placedLayer。
   let smartObjData: {
-    origImageB64?: string; transform?: number[]; soId?: string; width?: number; height?: number;
+    origImageB64?: string; transform?: number[]; nonAffineTransform?: number[]; resolution?: any;
+    soId?: string; placed?: string; width?: number; height?: number;
+    warp?: any;
     filter?: any;
     filterEffectsMasks?: Array<{
       id: string; top: number; left: number; bottom: number; right: number; depth: number;
       channels: ({ compressionMode: number; data: string } | null)[];
       extra?: { top: number; left: number; bottom: number; right: number; compressionMode: number; data: string };
     }>;
+    linkedSrcB64?: string;
+    docFilterEffectsMasks?: Array<{
+      id: string; top: number; left: number; bottom: number; right: number; depth: number;
+      channels: ({ compressionMode: number; data: string } | null)[];
+      extra?: { top: number; left: number; bottom: number; right: number; compressionMode: number; data: string };
+    }>;
+    fullPlacedLayer?: any;
+    referencePoint?: { x: number; y: number };
+    layerId?: number;
+    blendingRanges?: any;
   } | null = null;
   if (node.rawPsdSmartObject) {
     try { smartObjData = JSON.parse(node.rawPsdSmartObject); } catch { smartObjData = null; }
   }
 
+  // 带滤镜智能对象的两条导出路径：
+  //  - 完整还原(有内嵌源 linkedSrcB64)：写回 源+placedLayer(原始 transform)+filter(enabled)+文档级蒙版，
+  //    PS 实时渲染 = 与原始 1:1。图层位图用 origImageB64(原始模糊 channel data，即 PS 的图层缓存)，
+  //    与纯往返一致(PS 会用源重渲染覆盖它，缓存只是预览)。
+  //  - 降级(无内嵌源)：退化为普通栅格层，用 node.imageBase64(导入重渲染的清晰币像素)避免光斑/报错。
+  const smartObjFullRestore = !!(smartObjData && smartObjData.filter && smartObjData.linkedSrcB64 && smartObjData.fullPlacedLayer);
+  const smartObjDowngrade = !!(smartObjData && smartObjData.filter && !(smartObjData.linkedSrcB64 && smartObjData.fullPlacedLayer));
   // round-trip：基底层若带「烘焙调整前原始像素」，用它替换烘焙后的位图。
-  // 这样导出时基底层是原始颜色，配合下方加回的调整图层，PS 应用一次 = 与原始 PSD 一致。
-  const effectiveImageBase64 = node.rawPsdPrePatternImage ?? node.rawPsdOriginalImage ?? smartObjData?.origImageB64 ?? node.rawPsdLayerMaskImage ?? node.imageBase64;
+  const effectiveImageBase64 = smartObjFullRestore
+    ? (smartObjData!.origImageB64 ?? node.imageBase64)
+    : smartObjDowngrade
+      ? node.imageBase64
+      : (node.rawPsdPrePatternImage ?? node.rawPsdOriginalImage ?? smartObjData?.origImageB64 ?? node.rawPsdLayerMaskImage ?? node.imageBase64);
+  // round-trip 原始像素来源（prePattern/origImage/smartObjOrig/layerMask）保存的是「未扩展」的原始
+  // layer bbox 像素；只有合成图 imageBase64 在导入时被 expandOffset 扩展过。
+  // 完整还原用 origImageB64(未扩展)；降级用 node.imageBase64(已 expand，不算 unexpanded)。
+  const usingUnexpandedRawImage = smartObjFullRestore
+    ? true
+    : (!smartObjDowngrade &&
+      !!(node.rawPsdPrePatternImage || node.rawPsdOriginalImage || smartObjData?.origImageB64 || node.rawPsdLayerMaskImage));
   if (!usedRawTextImage && effectiveImageBase64 && !(isTextLayer && !shouldUseTextCanvas)) {
     try {
       const pngBytes = base64ToUint8Array(effectiveImageBase64);
@@ -627,7 +675,7 @@ async function buildLayer(node: ExportNodeData, parentClipRect?: { x: number; y:
             layer.canvas = padded;
           }
         }
-      } else if (node.psdExpandOffset != null && node.psdExpandOffset > 0) {
+      } else if (!usingUnexpandedRawImage && node.psdExpandOffset != null && node.psdExpandOffset > 0) {
         // Import 时为容纳 stroke 像素把位图扩展了 psdExpandOffset 像素，
         // 这里裁剪掉外围 expand 边框，让 canvas 尺寸与 PSD 原始 layer bbox 一致
         // （否则 ag-psd 用 canvas.width/height 重写 layer.right/bottom，导致 bg 大 20x20）。
@@ -1029,24 +1077,67 @@ async function buildLayer(node: ExportNodeData, parentClipRect?: { x: number; y:
   }
 
   if (smartObjData && Array.isArray(smartObjData.transform) && smartObjData.transform.length >= 8 && !(node.children && node.children.length > 0)) {
-    // round-trip：带模糊滤镜的智能对象，用存储的原始 transform 重建 placedLayer。
-    // 图层位图已用 effectiveImageBase64（原始模糊 channel data）还原，PSD 图层数据接近原始、信息不丢。
-    layer.placedLayer = {
-      id: smartObjData.soId || nodeIdToGuid(node.id),
-      type: 'raster',
-      transform: smartObjData.transform,
-      width: smartObjData.width ?? node.width,
-      height: smartObjData.height ?? node.height,
-    };
-    if (smartObjData.filter) {
-      (layer.placedLayer as any).filter = smartObjData.filter;
-    }
-    if (smartObjData.filterEffectsMasks) {
-      (layer as any).filterEffectsMasks = smartObjData.filterEffectsMasks.map(m => ({
-        id: m.id, top: m.top, left: m.left, bottom: m.bottom, right: m.right, depth: m.depth,
-        channels: m.channels.map(ch => ch ? { compressionMode: ch.compressionMode, data: base64ToUint8Array(ch.data) } : undefined),
-        extra: m.extra ? { top: m.extra.top, left: m.extra.left, bottom: m.extra.bottom, right: m.extra.right, compressionMode: m.extra.compressionMode, data: base64ToUint8Array(m.extra.data) } : undefined,
-      }));
+    if (smartObjFullRestore) {
+      // 完整还原(带滤镜 + 有内嵌源)：写回原始 placedLayer(原始 transform/filter/warp/源关联)，
+      // 并把内嵌源 + 文档级滤镜蒙版收集起来(buildAndDownloadPsd 注入文档根)。
+      // PS 用「源 + filter + 蒙版」实时渲染 = 与原始 1:1(经纯往返验证无损)，可变换、参数齐全。
+      // 原样还原完整原始 placedLayer(含 crop/comp/compInfo/frameCount/warp/filter 等所有字段)。
+      // 逐字段重建永远难以等于原始，任一元字段缺失都可能让 PS 渲染异常(光斑)，故整体还原。
+      layer.placedLayer = deserializePlacedLayer(smartObjData.fullPlacedLayer) as any;
+      if (smartObjData.referencePoint) (layer as any).referencePoint = smartObjData.referencePoint;
+      // 关键：写回原始图层 id(lyid)。PS 的智能滤镜蒙版(FEid)按图层 id 关联，缺失则蒙版失效 →
+      // 全白蒙版 → motion blur 应用到整层 → 光斑(已二分定位:删 id 必模糊，删其他字段不影响)。
+      if (smartObjData.layerId != null) (layer as any).id = smartObjData.layerId;
+      if (smartObjData.blendingRanges) (layer as any).blendingRanges = smartObjData.blendingRanges;
+      // 文档 composite 预览用「清晰币」(node.imageBase64)而非图层 channel data(模糊条纹)：
+      // 图层 channel data 必须是原始模糊缓存(PS 用源+滤镜重渲染时的缓存)，但若 composite 也用它，
+      // PS 打开时显示的文档预览(及部分场景信任的缓存)会是光斑。composite 单独用清晰币保证预览正确。
+      if (node.imageBase64) {
+        try {
+          const clearCanvas = await pngToCanvas(base64ToUint8Array(node.imageBase64));
+          (layer as any).__clearComposite = clearCanvas;
+        } catch { /* ignore */ }
+      }
+      // 收集内嵌源(去重，按 id)。
+      const soId = smartObjData.soId || (layer.placedLayer as any).id;
+      if (smartObjData.linkedSrcB64 && soId && !collectedLinkedFiles.some(f => f.id === soId)) {
+        collectedLinkedFiles.push({ id: soId, name: `${soId}.psb`, type: '8BPB', data: base64ToUint8Array(smartObjData.linkedSrcB64) });
+      }
+      // 收集文档级滤镜蒙版栅格(去重，按 mask id = placed instance id)。
+      if (smartObjData.docFilterEffectsMasks) {
+        for (const m of smartObjData.docFilterEffectsMasks) {
+          if (collectedFilterEffectsMasks.some((x: any) => x.id === m.id)) continue;
+          const decodedMask = {
+            id: m.id, top: m.top, left: m.left, bottom: m.bottom, right: m.right, depth: m.depth,
+            channels: m.channels.map(ch => ch ? { compressionMode: ch.compressionMode, data: base64ToUint8Array(ch.data) } : undefined),
+            extra: m.extra ? { top: m.extra.top, left: m.extra.left, bottom: m.extra.bottom, right: m.extra.right, compressionMode: m.extra.compressionMode, data: base64ToUint8Array(m.extra.data) } : undefined,
+          };
+          collectedFilterEffectsMasks.push(decodedMask);
+        }
+      }
+    } else {
+      // 无内嵌源(无滤镜的锐度重渲染智能对象，或带滤镜但无源的兜底)：placedLayer 几何对齐 bbox(轴对齐 1:1)。
+      // 沿用原始高分 transform 会让 PS 找不到源 → 变换报错 + 放大发糊；对齐 bbox 后 PS 把图层缓存当 1:1 源，自洽可变换。
+      // 带滤镜但无源时不写 filter(避免「滤镜+缺源」report program error)，参数仅存平台 plugin data 兜底。
+      const cw = (layer.canvas && layer.canvas.width) || (layerRight - layerLeft) || node.width;
+      const ch = (layer.canvas && layer.canvas.height) || (layerBottom - layerTop) || node.height;
+      const bx = layerLeft, by = layerTop;
+      layer.placedLayer = {
+        id: smartObjData.soId || nodeIdToGuid(node.id),
+        type: 'raster',
+        transform: [bx, by, bx + cw, by, bx + cw, by + ch, bx, by + ch],
+        width: cw,
+        height: ch,
+      };
+      if (smartObjData.placed) (layer.placedLayer as any).placed = smartObjData.placed;
+      (layer.placedLayer as any).warp = {
+        style: 'none', value: 0, perspective: 0, perspectiveOther: 0, rotate: 'horizontal',
+        bounds: {
+          top: { value: 0, units: 'Pixels' }, left: { value: 0, units: 'Pixels' },
+          bottom: { value: ch, units: 'Pixels' }, right: { value: cw, units: 'Pixels' },
+        },
+        uOrder: 4, vOrder: 4,
+      };
     }
   } else if (node.isInstance && node.imageBase64 && !(node.children && node.children.length > 0)) {
     // 仅叶子 instance（无 children）作为 smart object，有 children 的展开为 group
@@ -1189,7 +1280,7 @@ async function buildLayer(node: ExportNodeData, parentClipRect?: { x: number; y:
   // 如果 base 层有关联的 PSD 调整图层数据，在其后插入调整图层（带 clipping 标记）
   if (node.rawPsdAdjustments) {
     try {
-      type AdjMaskData = { left: number; top: number; width: number; height: number; defaultColor: number; dataB64: string };
+      type AdjMaskData = { left: number; top: number; width: number; height: number; defaultColor: number; dataB64: string; empty?: boolean };
       const adjList: Array<{ name: string; hidden: boolean; adjustment: any; mask?: AdjMaskData | null }> = JSON.parse(node.rawPsdAdjustments);
       // 基底层已用「烘焙调整前原始像素」(rawPsdOriginalImage)，因此把所有调整图层
       // 原样加回（带 clipping 标记），PS 应用一次 = 与原始 PSD 完全一致，
@@ -1211,8 +1302,16 @@ async function buildLayer(node: ExportNodeData, parentClipRect?: { x: number; y:
           clipping: true,
           adjustment: adj.adjustment,
         };
+        // 空蒙版(全白/全黑 defaultColor，无栅格)：原样还原为空蒙版，使 PS 图层面板结构与原始一致
+        // (调整层旁带蒙版缩略图，即「和一个空页面连接」的样子)。ag-psd 据 defaultColor 写空蒙版。
+        if (adj.mask && adj.mask.empty) {
+          (adjLayer as any).mask = {
+            left: adj.mask.left, top: adj.mask.top, right: adj.mask.left, bottom: adj.mask.top,
+            defaultColor: adj.mask.defaultColor,
+          };
+        }
         // 还原调整图层的真实空间蒙版（PS 中调整通过蒙版局部生效）。
-        if (adj.mask && adj.mask.width > 0 && adj.mask.height > 0 && adj.mask.dataB64) {
+        else if (adj.mask && adj.mask.width > 0 && adj.mask.height > 0 && adj.mask.dataB64) {
           try {
             const single = base64ToUint8Array(adj.mask.dataB64);
             const mw = adj.mask.width, mh = adj.mask.height;
@@ -1260,6 +1359,10 @@ export async function buildAndDownloadPsd(
 ): Promise<void> {
   onProgress(65, '构建 PSD 图层结构...');
 
+  // 重置智能对象完整还原收集器(每次导出独立)。
+  collectedLinkedFiles = [];
+  collectedFilterEffectsMasks = [];
+
   // 解码根 section 上的 pattern 资源表，构造「实际可写回的 pattern id 集合」，
   // 供 buildEffects → filterPatternOverlay 剔除悬空引用 / 双重叠加。
   const decodedPatterns = decodePsdPatterns(patterns);
@@ -1292,9 +1395,10 @@ export async function buildAndDownloadPsd(
       if (l.hidden) continue;
       if (l.children && l.children.length > 0) {
         paintLayerToComposite(l.children);
-      } else if ((l as any).canvas && (l.left != null) && (l.top != null)) {
+      } else if (((l as any).__clearComposite || (l as any).canvas) && (l.left != null) && (l.top != null)) {
+        // 完整还原智能对象用清晰币画 composite 预览(__clearComposite)，其余用图层 canvas。
         compCtx.globalAlpha = l.opacity ?? 1;
-        compCtx.drawImage((l as any).canvas, l.left, l.top);
+        compCtx.drawImage((l as any).__clearComposite || (l as any).canvas, l.left, l.top);
         compCtx.globalAlpha = 1;
       }
     }
@@ -1318,6 +1422,15 @@ export async function buildAndDownloadPsd(
   // 避免悬空引用导致的 program error。
   if (decodedPatterns && decodedPatterns.length) {
     (psd as any).patterns = decodedPatterns;
+  }
+
+  // 智能对象完整还原：注入文档级内嵌源 + 滤镜蒙版栅格，让 PS 用「源+filter+蒙版」实时渲染
+  // 智能滤镜(motion blur 等)= 与原始 1:1，可变换、参数齐全(经纯往返验证无损)。
+  if (collectedLinkedFiles.length) {
+    (psd as any).linkedFiles = collectedLinkedFiles;
+  }
+  if (collectedFilterEffectsMasks.length) {
+    (psd as any).filterEffectsMasks = collectedFilterEffectsMasks;
   }
 
   const arrayBuffer = writePsd(psd, {
