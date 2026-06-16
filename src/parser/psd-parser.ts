@@ -649,6 +649,19 @@ async function imageDataToPng(
   return canvasToPng(downscaled);
 }
 
+async function pngToImageData(bytes: Uint8Array): Promise<ImageData> {
+  const blob = new Blob([bytes], { type: 'image/png' });
+  const bitmap = await createImageBitmap(blob);
+  const canvas = document.createElement('canvas');
+  canvas.width = bitmap.width;
+  canvas.height = bitmap.height;
+  const ctx = canvas.getContext('2d')!;
+  ctx.drawImage(bitmap, 0, 0);
+  const imageData = ctx.getImageData(0, 0, bitmap.width, bitmap.height);
+  bitmap.close();
+  return imageData;
+}
+
 // 模糊类智能滤镜：这类滤镜会让 PS 写入的图层 channel data（ag-psd 读到的像素）与
 // merged composite 不一致——channel data 是被模糊污染的缓存，导致导入后图层发糊。
 const BLUR_SMART_FILTER_TYPES = new Set([
@@ -3003,6 +3016,34 @@ async function encodeOriginalImageBase64(
   }
 }
 
+async function compositeGroupEffectsIntoOnlyChild(
+  group: SerializedLayer,
+  child: SerializedLayer,
+  images: Uint8Array[],
+  effectBundle: LayerEffectBundle,
+  patternOverlayMeta: PatternOverlayMeta | null,
+  resolvedPatternData: { rgba: Uint8ClampedArray; w: number; h: number } | null
+): Promise<boolean> {
+  if (child.imageIndex == null || !images[child.imageIndex]) return false;
+  if (!hasAnyEffect(effectBundle) && child.strokes.length === 0 && child.effects.length === 0) return false;
+
+  const existing = await pngToImageData(images[child.imageIndex]);
+  const { png, expand, overlayBlendMode } = await compositeLayerEffects(
+    existing,
+    effectBundle.fillOpacity,
+    effectBundle,
+    patternOverlayMeta,
+    resolvedPatternData
+  );
+
+  images[child.imageIndex] = png;
+  child.expandOffset = (child.expandOffset ?? 0) + expand;
+  if (overlayBlendMode) {
+    child.blendMode = convertBlendMode(overlayBlendMode);
+  }
+  return true;
+}
+
 async function serializeLayer(
   layer: Layer,
   images: Uint8Array[],
@@ -3589,28 +3630,47 @@ async function serializeLayer(
       }
     }
 
-    // PS 中 group 的 layer effects（stroke/shadow 等）会合成到整个 group 内容的
-    // 像素轮廓上。Figma/MasterGo 无法在 frame 上实现这种效果（frame stroke 只沿矩形边框）。
-    // 近似方案：将 group 的 enabled strokes/effects 下发给子节点（仅用于平台内显示）。
-    // round-trip 注意：组 effect 已由组自身的 rawEffectsData 完整保留并导出，下发到子层的
-    // 副本是冗余的——给被下发的子层打标记，导出端（无自有 rawEffectsData 时）据此剔除，
-    // 否则会被当成子层自有 effect 写回 PSD，产生伪投影/伪描边。
+    // PS 中 group 的 layer effects（stroke/shadow 等）会合成到整个 group 内容的像素 alpha 轮廓上。
+    // 对只有一个 raster 子层的 subGroup，直接把组 effect 烤进该子层 PNG：既保持 MasterGo 结构上
+    // 父组不显示矩形阴影，也避免旧逻辑把父组 effect 作为原生 effect 下放到子节点导致轮廓不一致。
+    // 多子层/非图片子层暂保留旧下放近似；导出端会按 inherited 标记剔除这些显示用副本。
     if (isSubGroup && serialized.children.length > 0) {
       const groupStrokes = serialized.strokes;
       const groupEffects = serialized.effects;
       if (groupStrokes.length > 0 || groupEffects.length > 0) {
-        for (const child of serialized.children) {
-          if (groupStrokes.length > 0) {
-            child.strokes = [...child.strokes, ...groupStrokes];
-            child.inheritedGroupStrokes = true;
-          }
-          if (groupEffects.length > 0) {
-            child.effects = [...child.effects, ...groupEffects];
-            child.inheritedGroupEffects = true;
+        let compositedIntoOnlyChild = false;
+        if (serialized.children.length === 1) {
+          try {
+            compositedIntoOnlyChild = await compositeGroupEffectsIntoOnlyChild(
+              serialized,
+              serialized.children[0],
+              images,
+              effectBundle,
+              patternOverlayMeta,
+              resolvedPatternData
+            );
+          } catch (e) {
+            logger.warn(`Failed to composite group effects into only child for "${serialized.name}": ${e instanceof Error ? e.message : e}`);
           }
         }
-        serialized.strokes = [];
-        serialized.effects = [];
+
+        if (compositedIntoOnlyChild) {
+          serialized.strokes = [];
+          serialized.effects = [];
+        } else {
+          for (const child of serialized.children) {
+            if (groupStrokes.length > 0) {
+              child.strokes = [...child.strokes, ...groupStrokes];
+              child.inheritedGroupStrokes = true;
+            }
+            if (groupEffects.length > 0) {
+              child.effects = [...child.effects, ...groupEffects];
+              child.inheritedGroupEffects = true;
+            }
+          }
+          serialized.strokes = [];
+          serialized.effects = [];
+        }
       }
     }
   }
