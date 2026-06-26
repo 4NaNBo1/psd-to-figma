@@ -28,6 +28,157 @@ const MIXED = typeof figma !== 'undefined' ? (figma as any).mixed : undefined;
 type LogFn = (level: 'info' | 'warn' | 'error', message: string) => void;
 type ProgressFn = (percent: number, message: string) => void;
 
+/**
+ * MasterGo 自动布局容器可通过 itemReverseZIndex 反转画布堆叠序（true 时第一层在最上）。
+ * PS children[0] 恒为栈底，仅在此情况下反转以匹配 MG 绘制顺序。
+ */
+function getNodeChildrenForExport(node: any): { kids: any[]; exportOrderReversed: boolean } {
+  const raw = node?.children;
+  if (!Array.isArray(raw) || raw.length === 0) return { kids: [], exportOrderReversed: false };
+  const autoLayout = isMasterGo && node.flexMode && node.flexMode !== 'NONE';
+  const exportOrderReversed = !!(autoLayout && node.itemReverseZIndex === true);
+  return {
+    kids: exportOrderReversed ? [...raw].reverse() : raw,
+    exportOrderReversed,
+  };
+}
+
+function nativeChildIndexFromExportIndex(
+  exportIndex: number,
+  childCount: number,
+  exportOrderReversed: boolean,
+): number {
+  return exportOrderReversed ? childCount - 1 - exportIndex : exportIndex;
+}
+
+function setNodeVisible(node: any, visible: boolean): void {
+  const prop = typeof node.isVisible === 'boolean' ? 'isVisible' : 'visible';
+  try { node[prop] = visible; } catch { /* ignore */ }
+}
+
+function isNativePassThroughOverlay(data: ExportNodeData): boolean {
+  if (!data.visible || data.blendMode !== 'PASS_THROUGH') return false;
+  if (data.children && data.children.length > 0) return false;
+  if (
+    data.rawPsdEffects || data.rawPsdOriginalImage || data.rawPsdPrePatternImage ||
+    data.rawPsdSmartObject || data.rawPsdVectorData
+  ) {
+    return false;
+  }
+  return true;
+}
+
+function canBakePassThroughInto(target: ExportNodeData): boolean {
+  return !(target.children && target.children.length > 0);
+}
+
+async function exportParentCompositeUpToChildIndex(
+  parentNode: any,
+  lastChildIndex: number,
+  exportOrderReversed: boolean,
+): Promise<string | undefined> {
+  const kids = parentNode?.children;
+  if (!Array.isArray(kids) || kids.length === 0) {
+    return exportNodeImage(parentNode);
+  }
+
+  const savedVisible: boolean[] = [];
+  for (let i = 0; i < kids.length; i++) {
+    savedVisible[i] = getNodeVisible(kids[i]);
+  }
+  const n = kids.length;
+  for (let ei = 0; ei < n; ei++) {
+    const mi = nativeChildIndexFromExportIndex(ei, n, exportOrderReversed);
+    setNodeVisible(kids[mi], ei <= lastChildIndex && savedVisible[mi]);
+  }
+  await yieldThread();
+
+  try {
+    return await exportNodeImage(parentNode);
+  } finally {
+    for (let i = 0; i < kids.length; i++) {
+      setNodeVisible(kids[i], savedVisible[i]);
+    }
+  }
+}
+
+async function bakePassThroughOverlays(
+  parentNode: any,
+  children: ExportNodeData[],
+  onLog: LogFn,
+  parentX: number,
+  parentY: number,
+  exportOrderReversed: boolean,
+): Promise<void> {
+  if (!children.length || !parentNode) return;
+
+  const ptIndices: number[] = [];
+  // 穿透叠加层：同组内叠在更底层之上的 PASS_THROUGH 叶子（index=0 的底层不算叠加层）。
+  for (let i = 1; i < children.length; i++) {
+    if (isNativePassThroughOverlay(children[i])) ptIndices.push(i);
+  }
+  if (ptIndices.length === 0) return;
+
+  const firstPt = ptIndices[0];
+  const bakeTarget = children[firstPt - 1];
+  if (!canBakePassThroughInto(bakeTarget)) return;
+
+  const contiguous = ptIndices.every((idx, k) => idx === firstPt + k);
+  if (!contiguous) {
+    onLog('warn', `Skipping pass-through bake: non-contiguous overlays in "${parentNode.name ?? 'group'}"`);
+    return;
+  }
+
+  const lastPt = ptIndices[ptIndices.length - 1];
+  const baked = await exportParentCompositeUpToChildIndex(parentNode, lastPt, exportOrderReversed);
+  if (!baked) return;
+
+  bakeTarget.imageBase64 = baked;
+  bakeTarget.passThroughBaked = true;
+
+  // 合成图来自 parentNode 整帧 exportAsync，须用父节点画布坐标/尺寸，不能沿用 bakeTarget
+  // （如 card_sdw）的较小 bbox，否则 Wings 等伸出父层的内容会被裁掉，兄弟 card 叠放错乱。
+  const parentAbsX = parentNode.absoluteTransform?.[0]?.[2] ?? parentNode.x ?? 0;
+  const parentAbsY = parentNode.absoluteTransform?.[1]?.[2] ?? parentNode.y ?? 0;
+  let bakeX = parentAbsX - parentX;
+  let bakeY = parentAbsY - parentY;
+  let bakeW = parentNode.width ?? bakeTarget.width;
+  let bakeH = parentNode.height ?? bakeTarget.height;
+  try {
+    const arb = parentNode.absoluteRenderBounds;
+    if (arb && Number.isFinite(arb.x) && Number.isFinite(arb.y)) {
+      bakeX = arb.x - parentX;
+      bakeY = arb.y - parentY;
+      bakeW = arb.width;
+      bakeH = arb.height;
+    }
+  } catch { /* ignore */ }
+  bakeTarget.x = bakeX;
+  bakeTarget.y = bakeY;
+  bakeTarget.width = bakeW;
+  bakeTarget.height = bakeH;
+
+  // 合成已含 [0..lastPt] 全部像素，除 bakeTarget 外全部隐藏，避免双层或残层干扰叠放。
+  for (let i = 0; i <= lastPt; i++) {
+    if (i === firstPt - 1) continue;
+    children[i].visible = false;
+    children[i].imageBase64 = undefined;
+  }
+
+  const overlayNames = ptIndices.map((i) => children[i].name).join(', ');
+  onLog('info', `Baked pass-through overlay(s) [${overlayNames}] into "${bakeTarget.name}"`);
+}
+
+function hasRoundTripImagePluginData(node: any): boolean {
+  if (typeof node.getPluginData !== 'function') return false;
+  return !!(
+    node.getPluginData('psd_original_image') ||
+    node.getPluginData('psd_pre_pattern_image') ||
+    node.getPluginData('psd_layer_mask_image') ||
+    node.getPluginData('psd_smart_object')
+  );
+}
+
 function uint8ArrayToBase64(bytes: Uint8Array): string {
   const CHUNK = 0x8000;
   const parts: string[] = [];
@@ -429,8 +580,10 @@ async function exportNodeImage(node: any, options?: { withoutStrokesAndEffects?:
         savedEffects = node.effects;
         node.effects = [];
       }
-      // 仅保留 IMAGE fill；去掉叠加的 SOLID/GRADIENT overlay fill。
-      if (Array.isArray(node.fills) && node.fills.some((f: any) => f && f.type !== 'IMAGE')) {
+      // 仅当同时存在 IMAGE fill 时才去掉叠加的 SOLID/GRADIENT overlay fill；
+      // 纯 SOLID/GRADIENT 形状层需保留 fill 才能导出可见像素。
+      const hasImageFill = Array.isArray(node.fills) && node.fills.some((f: any) => f && f.type === 'IMAGE');
+      if (hasImageFill && Array.isArray(node.fills) && node.fills.some((f: any) => f && f.type !== 'IMAGE')) {
         const imageOnly = node.fills.filter((f: any) => f && f.type === 'IMAGE');
         if (imageOnly.length !== node.fills.length) {
           savedFills = node.fills;
@@ -723,13 +876,15 @@ async function serializeNode(
     onLog('info', `Instance "${node.name}": exported as smart object`);
 
     if ('children' in node && node.children && Array.isArray(node.children)) {
+      const { kids: exportKids, exportOrderReversed } = getNodeChildrenForExport(node);
       data.children = [];
-      for (const child of node.children) {
+      for (const child of exportKids) {
         // 传画布原点（parentX/Y）保持不变，让所有节点的 data.x/y 都是相对画布原点的绝对偏移。
         // PSD layer.left/top 要求绝对坐标，group bbox=[0,0,0,0] 不影响子节点位置。
         const childData = await serializeNode(child, parentX, parentY, onLog, onProgress, processed, total, depth + 1, effectiveVisible);
         if (childData) data.children.push(childData);
       }
+      await bakePassThroughOverlays(node, data.children, onLog, parentX, parentY, exportOrderReversed);
     }
   } else if (nodeType === 'frame' || nodeType === 'group' || nodeType === 'component') {
     data.fills = extractFills(node);
@@ -738,11 +893,13 @@ async function serializeNode(
     data.cornerRadii = extractCornerRadii(node);
 
     if ('children' in node && node.children && Array.isArray(node.children)) {
+      const { kids: exportKids, exportOrderReversed } = getNodeChildrenForExport(node);
       data.children = [];
-      for (const child of node.children) {
+      for (const child of exportKids) {
         const childData = await serializeNode(child, parentX, parentY, onLog, onProgress, processed, total, depth + 1, effectiveVisible);
         if (childData) data.children.push(childData);
       }
+      await bakePassThroughOverlays(node, data.children, onLog, parentX, parentY, exportOrderReversed);
     }
 
     if (data.fills.some(f => f.type === 'IMAGE' && f.visible)) {
@@ -762,7 +919,12 @@ async function serializeNode(
     data.cornerRadii = extractCornerRadii(node);
 
     const hasImageFill = data.fills.some(f => f.type === 'IMAGE' && f.visible);
-    if (hasImageFill || !effectiveVisible) {
+    const hasRoundTripImage = hasRoundTripImagePluginData(node);
+    const hasVisiblePaintFill = data.fills.some(f =>
+      f.visible && (f.type === 'SOLID' || (f.type && f.type.startsWith('GRADIENT_')))
+    );
+    const willExportImage = hasImageFill || !effectiveVisible || (hasVisiblePaintFill && !hasRoundTripImage);
+    if (willExportImage) {
       // 去除 node 的 effects/strokes 与叠加 overlay fill 再导出，使 PNG 只含原始像素：
       // 整层原生化的位图层这些效果由 node 属性写回 PSD，不可重复烤进 PNG（难点 4）。
       // 栅格化层的 effects/strokes 已在导入时清空、无 overlay fill，此操作对其为无副作用。

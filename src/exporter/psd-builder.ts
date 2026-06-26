@@ -360,7 +360,16 @@ function buildEffects(node: ExportNodeData, availablePatternIds?: Set<string>): 
   // PSD 的 solidFill (Color Overlay) effect 会用纯色覆盖整个 layer 的内容，
   // 对 group/frame 而言会覆盖 children 视觉。仅对 leaf 节点才使用此 effect。
   const hasChildren = !!(node.children && node.children.length > 0);
-  if (solidFills.length > 0 && node.type !== 'text' && !hasChildren) {
+  const fillBakedInRaster = !!(
+    node.imageBase64 &&
+    !node.rawPsdOriginalImage &&
+    !node.rawPsdPrePatternImage &&
+    !node.rawPsdLayerMaskImage &&
+    !node.rawPsdSmartObject
+  );
+  // 纯色填充：即使像素已烘焙进 imageBase64，仍写 solidFill 作 PS 兼容兜底（与 raster 同色同透明度时不重复显色）。
+  // passThroughBaked 像素已含穿透叠加层合成，不可再写 solidFill。
+  if (solidFills.length > 0 && node.type !== 'text' && !hasChildren && !node.passThroughBaked) {
     result.solidFill = solidFills.map(f => ({
       enabled: true,
       color: toRGBA(f.color!),
@@ -370,7 +379,7 @@ function buildEffects(node: ExportNodeData, availablePatternIds?: Set<string>): 
   }
 
   const gradients = node.fills.filter(f => f.type.startsWith('GRADIENT_') && f.visible);
-  if (gradients.length > 0) {
+  if (gradients.length > 0 && !fillBakedInRaster && !node.passThroughBaked) {
     result.gradientOverlay = gradients.map(f => {
       const stops = f.gradientStops ?? [];
       const colorStops: ColorStop[] = stops.map(s => ({
@@ -507,10 +516,12 @@ async function buildLayer(node: ExportNodeData, parentClipRect?: { x: number; y:
     }
   }
 
-  // pass through 只在 group 上有效，应用到叶子节点会让 PS 报 "unsupported blending mode"
+  // PS 不支持叶子层 pass through；容器组若保留 pass through，子层会与组外下层处于同一
+  // 穿透叠放上下文，兄弟组（如 handcards 内多张 card）的帧级层序会错乱。
+  // 容器组改用 normal，使整组先合成再与兄弟组按层序叠放（与 MasterGo/Figma 帧隔离一致）。
   let effectiveBlendMode = node.blendMode;
   const isGroupForBM = !!(node.children && node.children.length > 0);
-  if (effectiveBlendMode === 'PASS_THROUGH' && !isGroupForBM) {
+  if (effectiveBlendMode === 'PASS_THROUGH') {
     effectiveBlendMode = 'NORMAL';
   }
 
@@ -1348,6 +1359,21 @@ async function buildLayer(node: ExportNodeData, parentClipRect?: { x: number; y:
   return layer;
 }
 
+function attachImageDataToLeafLayers(layers: Layer[]): void {
+  for (const layer of layers) {
+    if (layer.children && layer.children.length > 0) {
+      attachImageDataToLeafLayers(layer.children);
+      continue;
+    }
+    const canvas = layer.canvas as HTMLCanvasElement | undefined;
+    if (!canvas || canvas.width <= 0 || canvas.height <= 0) continue;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) continue;
+    layer.imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    delete layer.canvas;
+  }
+}
+
 export async function buildAndDownloadPsd(
   nodes: ExportNodeData[],
   width: number,
@@ -1384,6 +1410,8 @@ export async function buildAndDownloadPsd(
 
   onProgress(88, '生成 PSD 文件...');
 
+  attachImageDataToLeafLayers(children);
+
   // 手动按 layer 顺序叠加生成 composite，让 PS 打开时显示正确的预览
   // ag-psd 不会从 layers 自动合成，必须显式提供
   const compCanvas = document.createElement('canvas');
@@ -1395,10 +1423,20 @@ export async function buildAndDownloadPsd(
       if (l.hidden) continue;
       if (l.children && l.children.length > 0) {
         paintLayerToComposite(l.children);
-      } else if (((l as any).__clearComposite || (l as any).canvas) && (l.left != null) && (l.top != null)) {
-        // 完整还原智能对象用清晰币画 composite 预览(__clearComposite)，其余用图层 canvas。
+      } else if (((l as any).__clearComposite || (l as any).canvas || l.imageData) && (l.left != null) && (l.top != null)) {
+        // 完整还原智能对象用清晰币画 composite 预览(__clearComposite)，其余用图层 canvas/imageData。
         compCtx.globalAlpha = l.opacity ?? 1;
-        compCtx.drawImage((l as any).__clearComposite || (l as any).canvas, l.left, l.top);
+        if ((l as any).__clearComposite) {
+          compCtx.drawImage((l as any).__clearComposite, l.left, l.top);
+        } else if ((l as any).canvas) {
+          compCtx.drawImage((l as any).canvas, l.left, l.top);
+        } else if (l.imageData) {
+          const tmp = document.createElement('canvas');
+          tmp.width = l.imageData.width;
+          tmp.height = l.imageData.height;
+          tmp.getContext('2d')!.putImageData(l.imageData, 0, 0);
+          compCtx.drawImage(tmp, l.left, l.top);
+        }
         compCtx.globalAlpha = 1;
       }
     }
@@ -1440,6 +1478,8 @@ export async function buildAndDownloadPsd(
     //   - 文本层: pad 字符像素到 intended bbox 尺寸
     // 让 ag-psd 自动 trim 会去掉我们故意 pad 的透明像素，导致文本 layer bbox 变小（位置抖动）。
     trimImageData: false,
+    // 强制为每层写入透明度通道，提升 PS 对部分图层的兼容性。
+    noBackground: true,
   });
 
   onProgress(95, '准备下载...');

@@ -459,6 +459,8 @@ export interface ExportNodeData {
   inheritedGroupEffects?: boolean;
   /** 从节点 setPluginData('psd_inherited_group_stroke', ...) 读出的标记：本层 strokes 含父组下放副本。 */
   inheritedGroupStrokes?: boolean;
+  /** 像素已含同组 PASS_THROUGH 穿透叠加层的合成结果，勿再写 solidFill/gradientOverlay 以免双重应用。 */
+  passThroughBaked?: boolean;
 }
 
 export interface ExportSelectionInfo {
