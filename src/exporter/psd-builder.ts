@@ -83,6 +83,30 @@ function base64ToUint8Array(base64: string): Uint8Array {
  * 解码 node-serializer 传来的 psd_patterns JSON（SerializedPattern[]），还原为
  * ag-psd PatternInfo[]（data 从 base64 还原为 Uint8Array）。供写回 psd.patterns。
  */
+/** 校验内嵌智能对象源(PSD/PSB)结构是否完整，拒绝 pluginData 截断后的残缺字节。 */
+function isValidEmbeddedPsdData(data: Uint8Array): boolean {
+  if (data.length < 30) return false;
+  if (data[0] !== 0x38 || data[1] !== 0x42 || data[2] !== 0x50 || data[3] !== 0x53) return false;
+  const readU32 = (off: number) =>
+    ((data[off] << 24) | (data[off + 1] << 16) | (data[off + 2] << 8) | data[off + 3]) >>> 0;
+  let pos = 26;
+  if (pos + 4 > data.length) return false;
+  const colorModeLen = readU32(pos);
+  pos += 4 + colorModeLen;
+  if (colorModeLen % 2) pos++;
+  if (pos + 4 > data.length) return false;
+  const imgResLen = readU32(pos);
+  pos += 4 + imgResLen;
+  if (imgResLen % 2) pos++;
+  if (pos + 4 > data.length) return false;
+  const layerMaskLen = readU32(pos);
+  const expectedEnd = pos + 4 + layerMaskLen;
+  // layer info 声明 0 但尾部仍有大段孤儿数据 ⇒ 典型截断残片（如恰好 1MB 上限）。
+  if (layerMaskLen === 0 && data.length > expectedEnd + 64) return false;
+  if (expectedEnd > data.length) return false;
+  return true;
+}
+
 function decodePsdPatterns(json: string | undefined): { id: string; name: string; x: number; y: number; bounds: { x: number; y: number; w: number; h: number }; data: Uint8Array }[] | null {
   if (!json) return null;
   try {
@@ -328,6 +352,8 @@ function buildEffects(node: ExportNodeData, availablePatternIds?: Set<string>): 
     // 这些 group bevel 绝大多数是 enabled:false 的禁用样式槽、不可见，剔除对画面零影响。
     // 仅容器节点剔除；普通图层/文本的 bevel 写入正常，予以保留。
     if (isContainerNode && result.bevel) delete result.bevel;
+    // 容器/文本早退路径也必须过滤悬空 patternOverlay，否则 Patt 资源缺失时 PS 无法保存。
+    filterPatternOverlay(result, node, availablePatternIds);
     return Object.keys(result).length > 0 ? result : undefined;
   }
 
@@ -627,8 +653,17 @@ async function buildLayer(node: ExportNodeData, parentClipRect?: { x: number; y:
   //    PS 实时渲染 = 与原始 1:1。图层位图用 origImageB64(原始模糊 channel data，即 PS 的图层缓存)，
   //    与纯往返一致(PS 会用源重渲染覆盖它，缓存只是预览)。
   //  - 降级(无内嵌源)：退化为普通栅格层，用 node.imageBase64(导入重渲染的清晰币像素)避免光斑/报错。
-  const smartObjFullRestore = !!(smartObjData && smartObjData.filter && smartObjData.linkedSrcB64 && smartObjData.fullPlacedLayer);
-  const smartObjDowngrade = !!(smartObjData && smartObjData.filter && !(smartObjData.linkedSrcB64 && smartObjData.fullPlacedLayer));
+  let linkedSrcValid = false;
+  if (smartObjData?.linkedSrcB64) {
+    try {
+      const linkedBytes = base64ToUint8Array(smartObjData.linkedSrcB64);
+      linkedSrcValid = isValidEmbeddedPsdData(linkedBytes);
+    } catch {
+      linkedSrcValid = false;
+    }
+  }
+  const smartObjFullRestore = !!(smartObjData && smartObjData.filter && linkedSrcValid && smartObjData.fullPlacedLayer);
+  const smartObjDowngrade = !!(smartObjData && smartObjData.filter && !smartObjFullRestore);
   // round-trip：基底层若带「烘焙调整前原始像素」，用它替换烘焙后的位图。
   const effectiveImageBase64 = smartObjFullRestore
     ? (smartObjData!.origImageB64 ?? node.imageBase64)
@@ -1126,44 +1161,8 @@ async function buildLayer(node: ExportNodeData, parentClipRect?: { x: number; y:
           collectedFilterEffectsMasks.push(decodedMask);
         }
       }
-    } else {
-      // 无内嵌源(无滤镜的锐度重渲染智能对象，或带滤镜但无源的兜底)：placedLayer 几何对齐 bbox(轴对齐 1:1)。
-      // 沿用原始高分 transform 会让 PS 找不到源 → 变换报错 + 放大发糊；对齐 bbox 后 PS 把图层缓存当 1:1 源，自洽可变换。
-      // 带滤镜但无源时不写 filter(避免「滤镜+缺源」report program error)，参数仅存平台 plugin data 兜底。
-      const cw = (layer.canvas && layer.canvas.width) || (layerRight - layerLeft) || node.width;
-      const ch = (layer.canvas && layer.canvas.height) || (layerBottom - layerTop) || node.height;
-      const bx = layerLeft, by = layerTop;
-      layer.placedLayer = {
-        id: smartObjData.soId || nodeIdToGuid(node.id),
-        type: 'raster',
-        transform: [bx, by, bx + cw, by, bx + cw, by + ch, bx, by + ch],
-        width: cw,
-        height: ch,
-      };
-      if (smartObjData.placed) (layer.placedLayer as any).placed = smartObjData.placed;
-      (layer.placedLayer as any).warp = {
-        style: 'none', value: 0, perspective: 0, perspectiveOther: 0, rotate: 'horizontal',
-        bounds: {
-          top: { value: 0, units: 'Pixels' }, left: { value: 0, units: 'Pixels' },
-          bottom: { value: ch, units: 'Pixels' }, right: { value: cw, units: 'Pixels' },
-        },
-        uOrder: 4, vOrder: 4,
-      };
     }
-  } else if (node.isInstance && node.imageBase64 && !(node.children && node.children.length > 0)) {
-    // 仅叶子 instance（无 children）作为 smart object，有 children 的展开为 group
-    layer.placedLayer = {
-      id: nodeIdToGuid(node.id),
-      type: 'raster',
-      transform: [
-        node.x, node.y,
-        node.x + node.width, node.y,
-        node.x + node.width, node.y + node.height,
-        node.x, node.y + node.height,
-      ],
-      width: node.width,
-      height: node.height,
-    };
+    // 无有效内嵌源时不写 placedLayer，仅保留上方 canvas 栅格；否则 PS Save/Export As 会因缺少 lnk2 报 disk error。
   }
 
   if (node.children && node.children.length > 0) {
