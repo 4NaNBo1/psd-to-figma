@@ -22,12 +22,6 @@ Thumbs.db
 
 .kilo
 
-# CodeGraph index (local semantic code index)
-.codegraph/
-
 # Local MCP server config
 .mcp.json
 .mastergo/
-
-# Graphify semantic graph (local, rebuilt per machine — see .claude/skills/code-intel)
-graphify-out/
