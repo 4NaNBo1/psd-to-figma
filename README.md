@@ -2,7 +2,7 @@
 
 一个在 **Figma** 或 **MasterGo** 中双向打通 PSD 文件的插件：既可以将 `.psd` 作为可编辑图层导入，也可以将当前画布选中的节点导出为 `.psd`。
 
-[使用说明](#使用说明) · [导出 PSD](#导出-psd) · [开发说明](#开发说明) · [更新历史](#更新历史)
+[使用说明](#使用说明) · [导出 PSD](#导出-psd) · [配合 9-Slice 插件](#配合-9-slice-插件) · [开发说明](#开发说明) · [更新历史](#更新历史)
 
 当前版本：`v1.5.0`
 
@@ -12,6 +12,7 @@
 - 把画布选中的节点反向导出为可在 Photoshop 中打开的 `.psd` 文件
 - 同时支持 **Figma** 和 **MasterGo** 两个设计平台
 - 保留图层层级、文字样式、图层效果与混合模式；PSD 往返时尽量保留原稿的位置 / 字体 / 矢量等元数据
+- 与 [9-Slice 插件](https://github.com/4NaNBo1/9slice/releases) 配合，支持九宫 UI 切图的导入 / 导出往返与元数据保留（详见 [配合 9-Slice 插件](#配合-9-slice-插件)）
 - 完全在插件内部运行，不发起任何外部网络请求
 
 ## 使用说明
@@ -82,6 +83,75 @@
 - **导出超时**：单个节点的 `exportAsync` 上限为 15 秒，超时的节点会跳过位图导出但保留结构与样式信息。
 - **嵌套深度**：超过 50 层嵌套的子节点会被跳过，并在日志中给出告警。
 - **CMYK / 通道**：所有内容按 RGB 8-bit 写出，PSD 中的 alpha 通道、专色通道等不会被生成。
+
+## 配合 9-Slice 插件
+
+UI 切图里常见的九宫缩放（按钮底图、弹窗背景、气泡框等）在 Figma / MasterGo 中没有原生 `border-image` 属性。建议与本仓库配套的 **[9-Slice 插件](https://github.com/4NaNBo1/9slice/releases)** 一起使用：9-Slice 负责在设计工具里生成可缩放的九宫组件，本插件负责 PSD 与画布之间的双向打通，并在往返时保留切片元数据。
+
+> 9-Slice 插件下载：<https://github.com/4NaNBo1/9slice/releases/latest>
+
+### 为什么配合使用效果更好
+
+| 场景 | 只用本插件 | 配合 9-Slice |
+| --- | --- | --- |
+| 普通位图图层 | 导入 / 导出为单层 PNG，效果正常 | 无额外收益 |
+| 需要九宫缩放的 UI 切图 | 导出为 9 个切片矩形时，MasterGo 等平台常只保留 `topLeft` 像素，其余区域透明，PSD 里只剩碎片 | 9-Slice 生成标准九宫组件；本插件导出时**自动折叠回单层**并保留切片参数 |
+| PSD ↔ 设计工具往返 | 位图可还原，但切片信息会丢失 | 切片元数据随 PSD 图层名或 plugin data 一并往返，回到设计工具后可被 9-Slice 识别 |
+
+两个插件针对同一套 `nineSliceSettings` 元数据格式协作，避免手工拆图、手工记切片值。
+
+### 配合还原机制
+
+```
+PSD 图层（nineSliceSettings 编码于图层名）
+  ↓ 导入（本插件）
+矩形图层 + nineSliceSettings（sharedPluginData / pluginData）
+  ↓ 9-Slice 读取元数据，或用户手动 Create Component
+九宫组件（9 个子矩形：topLeft / top / … / bottomRight）
+  ↓ 导出（本插件）
+折叠为单层位图 + nineSliceSettings → 编码进 PSD 图层名
+  ↓ 再次导入
+还原 displayName + nineSliceSettings → 9-Slice 可继续编辑
+```
+
+**元数据内容**（JSON，`version: 1`）：
+
+- `imageSize`：原图宽高（像素）
+- `slices`：`{ top, right, bottom, left }` 四边切片距离
+
+**三条传递通道**（按优先级）：
+
+1. **同文件内 plugin data**：导入 PSD 时，本插件把元数据写入节点的 `nineSliceSettings`，并通过 `sharedPluginData('9slice', …)` 暴露给 9-Slice 读取。
+2. **PSD 图层名后缀**：导出 PSD 时，元数据经 Base64URL 编码后附在图层名末尾（以私有区段字符 `\uE000` 分隔，Photoshop 中仍显示正常名称）。再次导入时自动解码并写回 plugin data。这是**跨文件、跨同事**最可靠的通道。
+3. **从子节点几何推断**：若 plugin data 因跨插件隔离不可见，本插件会根据 9 个命名子矩形的布局反推 `slices`，并结合组件内存储的原图尺寸补全 `imageSize`。
+
+**导出时的折叠策略**（解决 MasterGo 切片导出透明的问题）：
+
+- 若该九宫组件旁存在**同名的隐藏 PSD 导入原层**（带 `psd_original_image` 等 round-trip 标记），优先用这层导出完整位图并继承 PSD 原始元数据，九宫组件本身不再单独输出。
+- 否则从组件的图片填充或 `exportAsync` 读取完整图源，合并为**一个 PSD 图层**，同时附带 `nineSliceSettings`。
+
+### 导入效果较好的做法
+
+1. **从本插件导出的 PSD 再导入**：若导出时成功写入了图层名后缀，导入日志会出现 `restored 9-slice metadata from PSD layer name`，矩形图层会自动带上 `nineSliceSettings`，9-Slice 可直接识别。
+2. **从 Photoshop 来的 PSD**：若图层名不含编码后缀，导入后仍得到普通位图；选中该图层，用 9-Slice 手动设置 `Top / Right / Bottom / Left` 并 **Create Component** 即可。
+3. **导入后立刻做九宫**：对带图片填充的矩形运行 9-Slice → **Create Component**。组件会出现在原图层右侧（命名形如 `图层名 / 9-Slice`），原图层可保留或隐藏。
+4. **不要改子图层名称**：9-Slice 生成的 9 个子矩形必须保持 `topLeft`、`top`、`topRight`、`left`、`center`、`right`、`bottomLeft`、`bottom`、`bottomRight` 命名，否则本插件无法通过几何推断切片。
+
+### 导出效果较好的做法
+
+1. **先建九宫再导出**：对需要交付给 Photoshop 或做 PSD 往返的 UI 切图，务必先用 9-Slice 生成组件，再选中包含该组件的 Frame / 编组导出。本插件会识别九宫结构并折叠为单层，而不是输出 9 张透明碎片。
+2. **保持组件结构完整**：导出前不要打散（ungroup）九宫组件，也不要删除 9 个子矩形；元数据读取依赖组件树或 plugin data。
+3. **PSD 往返链路**：`PSD → 本插件导入 → 9-Slice 编辑 → 本插件导出 → PSD` 是保真度最高的路径。若导入时保留了隐藏原层，导出会优先使用该层的完整位图与 PSD 元数据。
+4. **选中范围**：导出时选中整个 Frame 或编组即可；九宫组件作为子节点会被自动折叠，无需单独选中。
+5. **验收方式**：在 Photoshop 中打开导出的 PSD，图层应显示为**单层完整位图**（非 9 层透明碎片）；再次导入后，9-Slice 应能读取切片值并重新生成可缩放组件。
+
+### 9-Slice 插件快速上手
+
+1. 从 [9-Slice Releases](https://github.com/4NaNBo1/9slice/releases) 下载并安装（Figma 用 `manifest.json`，MasterGo 用 `manifest.mastergo.json`）。
+2. 选中带图片填充的图层，运行 9-Slice 插件。
+3. 调整 Top / Right / Bottom / Left 切线，点击 **Create Component**。
+4. 缩放生成的组件验证边缘与中心拉伸是否符合预期。
+5. 需要交付 PSD 时，用本插件 **导出 PSD** 即可。
 
 ## 开发说明
 

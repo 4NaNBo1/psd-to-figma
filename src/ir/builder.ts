@@ -1,5 +1,6 @@
 import type { SerializedLayer, SerializedPsd, SerializedShadow, SerializedStroke, SerializedCornerRadii, SerializedFill } from '../types/psd-types';
 import type { IRNode, IRFill, IRShadow, IRStroke, IRCornerRadii, IRTextProps, IRTextRange, IRGradientFill, IRSolidFill, IRColor } from './types';
+import { readPngDimensions } from '../exporter/nine-slice-collapse';
 
 const POSTSCRIPT_TO_FAMILY: Record<string, string> = {
   'PingFangSC': 'PingFang SC',
@@ -233,15 +234,26 @@ function buildOverlayFills(overlayFills: SerializedFill[] | undefined): IRFill[]
   return out;
 }
 
-function buildImageFill(images: string[], imageIndex: number | undefined, overlayFills?: SerializedFill[]): IRFill[] {
+function buildImageFill(
+  images: string[],
+  imageIndex: number | undefined,
+  overlayFills?: SerializedFill[],
+  targetSize?: { width: number; height: number },
+): IRFill[] {
   const overlays = buildOverlayFills(overlayFills);
   if (imageIndex === undefined || !images[imageIndex]) return overlays;
   const base64 = images[imageIndex];
   if (!base64 || base64.length === 0) return overlays;
   const bytes = base64ToUint8Array(base64);
   if (bytes.length === 0) return overlays;
+  const pngSize = readPngDimensions(bytes);
+  const scaleMode: 'FILL' | 'STRETCH' = (
+    targetSize && pngSize &&
+    pngSize.width === Math.round(targetSize.width) &&
+    pngSize.height === Math.round(targetSize.height)
+  ) ? 'STRETCH' : 'FILL';
   return [
-    { type: 'IMAGE' as const, imageBytes: bytes, scaleMode: 'FILL' as const },
+    { type: 'IMAGE' as const, imageBytes: bytes, scaleMode },
     ...overlays,
   ];
 }
@@ -464,7 +476,7 @@ function buildShapeNode(
   const h = layer.isSubGroup ? layer.height : Math.max(1, layer.height);
   const rectW = Math.max(1, w + expand * 2);
   const rectH = Math.max(1, h + expand * 2);
-  const fills = buildImageFill(images, layer.imageIndex, layer.overlayFills);
+  const fills = buildImageFill(images, layer.imageIndex, layer.overlayFills, { width: rectW, height: rectH });
 
   return {
     type: 'rectangle',
@@ -492,6 +504,7 @@ function buildShapeNode(
     rawPsdLayerMaskImage: layer.rawLayerMaskImage,
     inheritedGroupEffects: layer.inheritedGroupEffects,
     inheritedGroupStrokes: layer.inheritedGroupStrokes,
+    nineSliceSettings: layer.nineSliceSettings,
   };
 }
 

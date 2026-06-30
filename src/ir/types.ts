@@ -10,7 +10,7 @@ export interface IRColor {
 export interface IRImageFill {
   type: 'IMAGE';
   imageBytes: Uint8Array;
-  scaleMode: 'FILL' | 'FIT' | 'CROP' | 'TILE';
+  scaleMode: 'FILL' | 'FIT' | 'CROP' | 'TILE' | 'STRETCH';
 }
 
 export interface IRSolidFill {
@@ -220,4 +220,6 @@ export interface IRNode {
   inheritedGroupEffects?: boolean;
   /** 同上，针对从父组下放来的 strokes。renderer 写入 setPluginData('psd_inherited_group_stroke', '1')。 */
   inheritedGroupStrokes?: boolean;
+  /** 9-Slice 九宫元数据 JSON；renderer 写入 setPluginData('nineSliceSettings', ...)。 */
+  nineSliceSettings?: string;
 }

@@ -13,6 +13,10 @@ import type {
 import {
   findNineSliceHiddenSource,
   isNineSliceComponent,
+  NINE_SLICE_METADATA_KEY,
+  prescanNineSliceHiddenSources,
+  resolveNineSliceMetadataForExport,
+  serializeNineSliceSettingsPayload,
 } from './nine-slice-collapse';
 
 // Normalize platform TextCase ('UPPER'/'SMALL_CAPS'/'SMALL_CAPS_FORCED'/...) to our export case.
@@ -262,6 +266,13 @@ function attachPsdPluginData(node: any, data: ExportNodeData): void {
       if (lm) data.rawPsdLayerMask = lm;
       const lmi = node.getPluginData('psd_layer_mask_image');
       if (lmi) data.rawPsdLayerMaskImage = lmi;
+    }
+  } catch { /* ignore */ }
+
+  try {
+    if (typeof node.getPluginData === 'function') {
+      const ns = node.getPluginData(NINE_SLICE_METADATA_KEY);
+      if (ns) data.nineSliceSettings = ns;
     }
   } catch { /* ignore */ }
 }
@@ -746,6 +757,17 @@ function getNodeVisible(node: any): boolean {
   return true;
 }
 
+async function readNodeStoredImageBytes(node: any): Promise<Uint8Array | undefined> {
+  if (!node || !Array.isArray(node.fills)) return undefined;
+  const imagePaint = node.fills.find((f: any) => f?.type === 'IMAGE' && typeof f.imageRef === 'string');
+  if (!imagePaint || typeof api?.getImageByHref !== 'function') return undefined;
+  try {
+    return await api.getImageByHref(imagePaint.imageRef)?.getBytesAsync?.();
+  } catch {
+    return undefined;
+  }
+}
+
 async function exportNineSliceStoredImage(component: any): Promise<string | undefined> {
   if (Array.isArray(component.fills)) {
     const imagePaint = component.fills.find((f: any) => f?.type === 'IMAGE' && typeof f.imageRef === 'string');
@@ -804,13 +826,25 @@ async function serializeNineSliceCollapsed(
 
   attachPsdPluginData(imageNode, data);
 
-  if (hiddenSource) {
-    data.imageBase64 = await exportNodeImage(hiddenSource, { withoutStrokesAndEffects: true });
-  } else {
-    data.imageBase64 = await exportNineSliceStoredImage(component);
+  const hasRoundTripImage = !!(data.rawPsdOriginalImage || data.rawPsdPrePatternImage || data.rawPsdLayerMaskImage);
+  if (!hasRoundTripImage) {
+    if (hiddenSource) {
+      data.imageBase64 = await exportNodeImage(hiddenSource, { withoutStrokesAndEffects: true });
+    } else {
+      data.imageBase64 = await exportNineSliceStoredImage(component);
+    }
   }
 
-  onLog('info', `Collapsed 9-slice component "${component.name}" to single PSD layer${hiddenSource ? ' (from hidden PSD source)' : ''}`);
+  const nineSliceMeta = await resolveNineSliceMetadataForExport(
+    component,
+    hiddenSource,
+    readNodeStoredImageBytes,
+  );
+  if (nineSliceMeta) {
+    data.nineSliceSettings = serializeNineSliceSettingsPayload(nineSliceMeta);
+  }
+
+  onLog('info', `Collapsed 9-slice component "${component.name}" to single PSD layer${hiddenSource ? ' (from hidden PSD source)' : ''}${data.nineSliceSettings ? ' [nine-slice metadata preserved]' : ''}`);
   return data;
 }
 
@@ -1034,6 +1068,7 @@ async function serializeNode(
 
     if ('children' in node && node.children && Array.isArray(node.children)) {
       const { kids: exportKids, exportOrderReversed } = getNodeChildrenForExport(node);
+      prescanNineSliceHiddenSources(exportKids, skippedNodeIds, getNodeVisible);
       data.children = [];
       for (const child of exportKids) {
         // 传画布原点（parentX/Y）保持不变，让所有节点的 data.x/y 都是相对画布原点的绝对偏移。
@@ -1055,6 +1090,7 @@ async function serializeNode(
 
     if ('children' in node && node.children && Array.isArray(node.children)) {
       const { kids: exportKids, exportOrderReversed } = getNodeChildrenForExport(node);
+      prescanNineSliceHiddenSources(exportKids, skippedNodeIds, getNodeVisible);
       data.children = [];
       for (const child of exportKids) {
         const childData = await serializeNode(child, parentX, parentY, onLog, onProgress, processed, total, depth + 1, effectiveVisible, skippedNodeIds);

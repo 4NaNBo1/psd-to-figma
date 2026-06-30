@@ -240,6 +240,10 @@ export interface SerializedLayer {
    * 导出时用它作 canvas + 还原 rawLayerMask 为 layer.mask，PS 渲染 canvas×mask = 原始效果，避免双重裁剪。
    */
   rawLayerMaskImage?: string;
+  /**
+   * 9-Slice 九宫元数据 JSON。从 PSD 图层名 PUA 后缀解码；renderer 写入 nineSliceSettings plugin data。
+   */
+  nineSliceSettings?: string;
 }
 
 /**
@@ -461,6 +465,11 @@ export interface ExportNodeData {
   inheritedGroupStrokes?: boolean;
   /** 像素已含同组 PASS_THROUGH 穿透叠加层的合成结果，勿再写 solidFill/gradientOverlay 以免双重应用。 */
   passThroughBaked?: boolean;
+  /**
+   * 9-Slice 九宫元数据 JSON（与 nineSliceSettings plugin data 同格式）。
+   * 导出 PSD 时编码进图层名；导入时写回 setPluginData('nineSliceSettings')，供 9slice 插件还原。
+   */
+  nineSliceSettings?: string;
 }
 
 export interface ExportSelectionInfo {

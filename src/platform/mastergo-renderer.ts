@@ -1,5 +1,6 @@
 import type { IRNode, IRFill, IRShadow, IRStroke, IRCornerRadii, IRTextProps, IRTextRange, IRGradientFill, IRSolidFill } from '../ir/types';
 import type { PlatformRenderer, LogFn, ProgressFn, RenderOptions } from './types';
+import { writeNineSlicePluginData } from '../exporter/nine-slice-collapse';
 import { countIRNodes } from '../ir/builder';
 
 declare const mg: any;
@@ -736,6 +737,9 @@ async function renderNode(
         }
         if (irNode.rawPsdLayerMaskImage) {
           try { rect.setPluginData('psd_layer_mask_image', irNode.rawPsdLayerMaskImage); } catch { /* ignore */ }
+        }
+        if (irNode.nineSliceSettings) {
+          try { writeNineSlicePluginData(rect, irNode.nineSliceSettings); } catch { /* ignore */ }
         }
 
         onNodeCreated();

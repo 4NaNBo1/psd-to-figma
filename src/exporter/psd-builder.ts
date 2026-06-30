@@ -1,6 +1,7 @@
 import { writePsd } from 'ag-psd';
 import type { Psd, Layer, BlendMode, LayerEffectShadow, LayerEffectSolidFill, LayerEffectGradientOverlay, LayerEffectStroke, ColorStop, OpacityStop } from 'ag-psd';
 import type { ExportNodeData, ExportFillInfo, SerializedColor } from '../types/psd-types';
+import { encodeNineSliceLayerName } from './nine-slice-collapse';
 
 const BLEND_MODE_MAP: Record<string, BlendMode> = {
   'PASS_THROUGH': 'pass through',
@@ -552,7 +553,7 @@ async function buildLayer(node: ExportNodeData, parentClipRect?: { x: number; y:
   }
 
   const layer: Layer = {
-    name: node.name,
+    name: encodeNineSliceLayerName(node.name, node.nineSliceSettings),
     top: layerTop,
     left: layerLeft,
     bottom: layerBottom,

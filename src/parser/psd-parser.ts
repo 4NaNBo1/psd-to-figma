@@ -13,6 +13,7 @@ import type {
   SerializedGradientOverlay,
   LayerType,
 } from '../types/psd-types';
+import { decodeNineSliceLayerName } from '../exporter/nine-slice-collapse';
 import { convertEffects, convertStrokes } from '../converter/effect-converter';
 import { convertBlendMode } from '../converter/blend-converter';
 import { logger } from '../logger';
@@ -3112,9 +3113,12 @@ async function serializeLayer(
     relY = absY - parentTop;
   }
 
+  const rawLayerName = layer.name ?? 'Unnamed Layer';
+  const { displayName, settingsJson } = decodeNineSliceLayerName(rawLayerName);
+
   const serialized: SerializedLayer = {
-    id: `layer-${images.length}-${depth}-${layer.name ?? 'unnamed'}`,
-    name: layer.name ?? 'Unnamed Layer',
+    id: `layer-${images.length}-${depth}-${displayName ?? 'unnamed'}`,
+    name: displayName,
     type,
     x: relX,
     y: relY,
@@ -3129,6 +3133,11 @@ async function serializeLayer(
     effects: convertEffects(layer.effects),
     strokes: convertStrokes(layer.effects),
   };
+
+  if (settingsJson) {
+    serialized.nineSliceSettings = settingsJson;
+    logger.info(`Layer "${displayName}": restored 9-slice metadata from PSD layer name`);
+  }
 
   // 组矩形蒙版：frame 已落在蒙版框原点，蒙版相对 frame 是满框矩形（left/top 恒 0）。
   if (groupMask) {
