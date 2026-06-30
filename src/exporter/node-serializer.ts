@@ -10,6 +10,10 @@ import type {
   SerializedCornerRadii,
   SerializedTextCase,
 } from '../types/psd-types';
+import {
+  findNineSliceHiddenSource,
+  isNineSliceComponent,
+} from './nine-slice-collapse';
 
 // Normalize platform TextCase ('UPPER'/'SMALL_CAPS'/'SMALL_CAPS_FORCED'/...) to our export case.
 // figma TITLE/LOWER 与 PSD fontCaps 无对应（PSD fontCaps 只有 normal/small/all caps），按 ORIGINAL 处理。
@@ -177,6 +181,89 @@ function hasRoundTripImagePluginData(node: any): boolean {
     node.getPluginData('psd_layer_mask_image') ||
     node.getPluginData('psd_smart_object')
   );
+}
+
+function attachPsdPluginData(node: any, data: ExportNodeData): void {
+  try {
+    if (typeof node.getPluginData === 'function') {
+      const raw = node.getPluginData('psd_raw_effects');
+      if (raw) data.rawPsdEffects = raw;
+    }
+  } catch { /* ignore */ }
+
+  try {
+    if (typeof node.getPluginData === 'function') {
+      if (node.getPluginData('psd_inherited_group_fx')) data.inheritedGroupEffects = true;
+      if (node.getPluginData('psd_inherited_group_stroke')) data.inheritedGroupStrokes = true;
+    }
+  } catch { /* ignore */ }
+
+  try {
+    if (typeof node.getPluginData === 'function') {
+      const expRaw = node.getPluginData('psd_expand_offset');
+      if (expRaw) {
+        const exp = parseInt(expRaw, 10);
+        if (Number.isFinite(exp) && exp > 0) {
+          data.x += exp;
+          data.y += exp;
+          data.width = Math.max(1, data.width - exp * 2);
+          data.height = Math.max(1, data.height - exp * 2);
+          data.psdExpandOffset = exp;
+        }
+      }
+    }
+  } catch { /* ignore */ }
+
+  try {
+    if (typeof node.getPluginData === 'function') {
+      const vec = node.getPluginData('psd_vector_data');
+      if (vec) data.rawPsdVectorData = vec;
+    }
+  } catch { /* ignore */ }
+
+  try {
+    if (typeof node.getPluginData === 'function') {
+      const adj = node.getPluginData('psd_adjustments');
+      if (adj) data.rawPsdAdjustments = adj;
+    }
+  } catch { /* ignore */ }
+
+  try {
+    if (typeof node.getPluginData === 'function') {
+      const orig = node.getPluginData('psd_original_image');
+      if (orig) data.rawPsdOriginalImage = orig;
+    }
+  } catch { /* ignore */ }
+
+  try {
+    if (typeof node.getPluginData === 'function') {
+      const prePat = node.getPluginData('psd_pre_pattern_image');
+      if (prePat) data.rawPsdPrePatternImage = prePat;
+    }
+  } catch { /* ignore */ }
+
+  try {
+    if (typeof node.getPluginData === 'function') {
+      const so = node.getPluginData('psd_smart_object');
+      if (so) data.rawPsdSmartObject = so;
+    }
+  } catch { /* ignore */ }
+
+  try {
+    if (typeof node.getPluginData === 'function') {
+      const gm = node.getPluginData('psd_group_mask');
+      if (gm) data.rawPsdGroupMask = gm;
+    }
+  } catch { /* ignore */ }
+
+  try {
+    if (typeof node.getPluginData === 'function') {
+      const lm = node.getPluginData('psd_layer_mask');
+      if (lm) data.rawPsdLayerMask = lm;
+      const lmi = node.getPluginData('psd_layer_mask_image');
+      if (lmi) data.rawPsdLayerMaskImage = lmi;
+    }
+  } catch { /* ignore */ }
 }
 
 function uint8ArrayToBase64(bytes: Uint8Array): string {
@@ -659,6 +746,74 @@ function getNodeVisible(node: any): boolean {
   return true;
 }
 
+async function exportNineSliceStoredImage(component: any): Promise<string | undefined> {
+  if (Array.isArray(component.fills)) {
+    const imagePaint = component.fills.find((f: any) => f?.type === 'IMAGE' && typeof f.imageRef === 'string');
+    if (imagePaint && typeof api?.getImageByHref === 'function') {
+      try {
+        const img = api.getImageByHref(imagePaint.imageRef);
+        const bytes: Uint8Array | undefined = await img?.getBytesAsync?.();
+        if (bytes?.length) return uint8ArrayToBase64(bytes);
+      } catch { /* ignore */ }
+    }
+  }
+  return exportNodeImage(component, { withoutStrokesAndEffects: true });
+}
+
+/**
+ * 9-Slice 插件把单张位图拆成九宫组件；MasterGo exportAsync 对切片矩形常导出透明 PNG
+ * （仅 topLeft 有像素）。导出 PSD 时折叠回单层：优先用隐藏的 PSD 导入原层（含 round-trip 元数据），
+ * 否则读组件内存储的完整图源。
+ */
+async function serializeNineSliceCollapsed(
+  component: any,
+  parentX: number,
+  parentY: number,
+  onLog: LogFn,
+  effectiveVisible: boolean,
+  skippedNodeIds: Set<string>,
+): Promise<ExportNodeData | null> {
+  const hiddenSource = findNineSliceHiddenSource(component, getNodeVisible);
+  const posNode = hiddenSource ?? component;
+  const imageNode = hiddenSource ?? component;
+
+  if (hiddenSource) skippedNodeIds.add(hiddenSource.id);
+
+  let absX = posNode.absoluteTransform?.[0]?.[2] ?? posNode.x ?? 0;
+  let absY = posNode.absoluteTransform?.[1]?.[2] ?? posNode.y ?? 0;
+
+  const data: ExportNodeData = {
+    id: component.id,
+    name: component.name ?? 'Unnamed',
+    type: 'rectangle',
+    x: absX - parentX,
+    y: absY - parentY,
+    width: posNode.width ?? component.width ?? 0,
+    height: posNode.height ?? component.height ?? 0,
+    opacity: component.opacity ?? 1,
+    blendMode: component.blendMode ?? 'NORMAL',
+    visible: effectiveVisible,
+    clipsContent: false,
+    isMask: false,
+    isInstance: false,
+    fills: extractFills(component),
+    strokes: extractStrokes(component),
+    effects: extractEffects(component),
+    cornerRadii: extractCornerRadii(component),
+  };
+
+  attachPsdPluginData(imageNode, data);
+
+  if (hiddenSource) {
+    data.imageBase64 = await exportNodeImage(hiddenSource, { withoutStrokesAndEffects: true });
+  } else {
+    data.imageBase64 = await exportNineSliceStoredImage(component);
+  }
+
+  onLog('info', `Collapsed 9-slice component "${component.name}" to single PSD layer${hiddenSource ? ' (from hidden PSD source)' : ''}`);
+  return data;
+}
+
 async function serializeNode(
   node: any,
   parentX: number,
@@ -669,8 +824,10 @@ async function serializeNode(
   total: number,
   depth: number = 0,
   parentVisible: boolean = true,
+  skippedNodeIds: Set<string> = new Set(),
 ): Promise<ExportNodeData | null> {
   if (!node || typeof node !== 'object') return null;
+  if (skippedNodeIds.has(node.id)) return null;
   if (depth > MAX_DEPTH) {
     onLog('warn', `Skipping "${node.name}": exceeded max nesting depth`);
     return null;
@@ -881,12 +1038,16 @@ async function serializeNode(
       for (const child of exportKids) {
         // 传画布原点（parentX/Y）保持不变，让所有节点的 data.x/y 都是相对画布原点的绝对偏移。
         // PSD layer.left/top 要求绝对坐标，group bbox=[0,0,0,0] 不影响子节点位置。
-        const childData = await serializeNode(child, parentX, parentY, onLog, onProgress, processed, total, depth + 1, effectiveVisible);
+        const childData = await serializeNode(child, parentX, parentY, onLog, onProgress, processed, total, depth + 1, effectiveVisible, skippedNodeIds);
         if (childData) data.children.push(childData);
       }
       await bakePassThroughOverlays(node, data.children, onLog, parentX, parentY, exportOrderReversed);
     }
   } else if (nodeType === 'frame' || nodeType === 'group' || nodeType === 'component') {
+    if (nodeType === 'component' && isNineSliceComponent(node)) {
+      return serializeNineSliceCollapsed(node, parentX, parentY, onLog, effectiveVisible, skippedNodeIds);
+    }
+
     data.fills = extractFills(node);
     data.strokes = extractStrokes(node);
     data.effects = extractEffects(node);
@@ -896,7 +1057,7 @@ async function serializeNode(
       const { kids: exportKids, exportOrderReversed } = getNodeChildrenForExport(node);
       data.children = [];
       for (const child of exportKids) {
-        const childData = await serializeNode(child, parentX, parentY, onLog, onProgress, processed, total, depth + 1, effectiveVisible);
+        const childData = await serializeNode(child, parentX, parentY, onLog, onProgress, processed, total, depth + 1, effectiveVisible, skippedNodeIds);
         if (childData) data.children.push(childData);
       }
       await bakePassThroughOverlays(node, data.children, onLog, parentX, parentY, exportOrderReversed);
@@ -934,125 +1095,7 @@ async function serializeNode(
     data.imageBase64 = await exportNodeImage(node);
   }
 
-  // 读取 import 时通过 setPluginData 写入的原始 PSD effects 元数据
-  // (bevel/satin/glow/pattern/多 stroke 的 fillType=gradient 等),
-  // 让 figma/mastergo → PSD 回转时能还原 figma/mastergo 无法表达的高级效果。
-  try {
-    if (typeof node.getPluginData === 'function') {
-      const raw = node.getPluginData('psd_raw_effects');
-      if (raw) {
-        data.rawPsdEffects = raw;
-      }
-    }
-  } catch { /* ignore */ }
-
-  // 读取 psd_inherited_group_fx / psd_inherited_group_stroke：标记本层 effects/strokes 含
-  // 父组下放副本（见 psd-parser 的 isSubGroup 下放逻辑）。导出 buildEffects 在本层无
-  // rawPsdEffects 兜底时据此剔除这些下放副本，避免伪投影/伪描边写回 PSD。
-  try {
-    if (typeof node.getPluginData === 'function') {
-      if (node.getPluginData('psd_inherited_group_fx')) data.inheritedGroupEffects = true;
-      if (node.getPluginData('psd_inherited_group_stroke')) data.inheritedGroupStrokes = true;
-    }
-  } catch { /* ignore */ }
-
-  // 读取 psd_expand_offset：psd-parser 为了让 stroke 像素完整保留，在 import 时把
-  // 位图层向四周扩展了 expand 像素；export 时这里要把这个扩展还原回去，让 PSD layer 的 bbox
-  // 与原始一致（PSD effects 由 PS 重新计算 stroke 范围，不需要 expand）。
-  try {
-    if (typeof node.getPluginData === 'function') {
-      const expRaw = node.getPluginData('psd_expand_offset');
-      if (expRaw) {
-        const exp = parseInt(expRaw, 10);
-        if (Number.isFinite(exp) && exp > 0) {
-          data.x += exp;
-          data.y += exp;
-          data.width = Math.max(1, data.width - exp * 2);
-          data.height = Math.max(1, data.height - exp * 2);
-          data.psdExpandOffset = exp;
-        }
-      }
-    }
-  } catch { /* ignore */ }
-
-  // 读取 psd_vector_data：还原 PSD shape layer 的矢量形状（vectorMask/vectorFill/vectorOrigination）
-  // 让 PS appearance 面板能显示 Fill/Stroke/圆角/精确坐标。
-  try {
-    if (typeof node.getPluginData === 'function') {
-      const vec = node.getPluginData('psd_vector_data');
-      if (vec) {
-        data.rawPsdVectorData = vec;
-      }
-    }
-  } catch { /* ignore */ }
-
-  // 读取 psd_adjustments：还原 PSD 调整图层（brightness/contrast, hue/saturation 等）
-  try {
-    if (typeof node.getPluginData === 'function') {
-      const adj = node.getPluginData('psd_adjustments');
-      if (adj) {
-        data.rawPsdAdjustments = adj;
-      }
-    }
-  } catch { /* ignore */ }
-
-  // 读取 psd_original_image：基底层「烘焙调整前原始像素」，导出时用它替换基底位图
-  // 再加回调整图层，避免调整双重应用（颜色偏移）。
-  try {
-    if (typeof node.getPluginData === 'function') {
-      const orig = node.getPluginData('psd_original_image');
-      if (orig) {
-        data.rawPsdOriginalImage = orig;
-      }
-    }
-  } catch { /* ignore */ }
-
-  // 读取 psd_pre_pattern_image：纯 patternOverlay 层「烤 pattern 前原始像素」，
-  // 导出时用它替换位图 + 保留 patternOverlay effect + 写回 pattern 资源，避免双重叠加。
-  try {
-    if (typeof node.getPluginData === 'function') {
-      const prePat = node.getPluginData('psd_pre_pattern_image');
-      if (prePat) {
-        data.rawPsdPrePatternImage = prePat;
-      }
-    }
-  } catch { /* ignore */ }
-
-  // 读取 psd_smart_object：智能对象（带模糊滤镜，导入时已重渲染清晰像素）的 round-trip 数据，
-  // 导出时用原始模糊像素 + transform 重建 placedLayer 智能对象图层。
-  try {
-    if (typeof node.getPluginData === 'function') {
-      const so = node.getPluginData('psd_smart_object');
-      if (so) {
-        data.rawPsdSmartObject = so;
-      }
-    }
-  } catch { /* ignore */ }
-
-  // 读取 psd_group_mask：组的矩形图层蒙版（滚动视口裁剪），导出时在组 layer 上重建。
-  try {
-    if (typeof node.getPluginData === 'function') {
-      const gm = node.getPluginData('psd_group_mask');
-      if (gm) {
-        data.rawPsdGroupMask = gm;
-      }
-    }
-  } catch { /* ignore */ }
-
-  // 读取 psd_layer_mask / psd_layer_mask_image：普通光栅层的可编辑 layer mask 数据 + 烘焙前原始像素。
-  // 导出时用原始像素作 canvas + 在该层重建 layer.mask，还原可编辑蒙版且避免 mask 双重裁剪。
-  try {
-    if (typeof node.getPluginData === 'function') {
-      const lm = node.getPluginData('psd_layer_mask');
-      if (lm) {
-        data.rawPsdLayerMask = lm;
-      }
-      const lmi = node.getPluginData('psd_layer_mask_image');
-      if (lmi) {
-        data.rawPsdLayerMaskImage = lmi;
-      }
-    }
-  } catch { /* ignore */ }
+  attachPsdPluginData(node, data);
 
   return data;
 }
@@ -1283,6 +1326,7 @@ export async function serializeSelection(
 
   const nodes: ExportNodeData[] = [];
   const processed = { count: 0 };
+  const skippedNodeIds = new Set<string>();
 
   let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
   for (const node of selection) {
@@ -1295,7 +1339,7 @@ export async function serializeSelection(
   }
 
   for (const node of selection) {
-    const nodeData = await serializeNode(node, minX, minY, onLog, onProgress, processed, totalNodes);
+    const nodeData = await serializeNode(node, minX, minY, onLog, onProgress, processed, totalNodes, 0, true, skippedNodeIds);
     if (nodeData) nodes.push(nodeData);
   }
 
