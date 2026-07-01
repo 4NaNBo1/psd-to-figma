@@ -1,6 +1,6 @@
 import type { IRNode, IRFill, IRShadow, IRStroke, IRCornerRadii, IRTextProps, IRTextRange, IRGradientFill, IRSolidFill } from '../ir/types';
 import type { PlatformRenderer, LogFn, ProgressFn, RenderOptions } from './types';
-import { writeNineSlicePluginData } from '../exporter/nine-slice-collapse';
+import { writeNineSlicePluginDataForImport } from '../exporter/nine-slice-collapse';
 import { countIRNodes } from '../ir/builder';
 
 const FALLBACK_FONT: FontName = { family: 'Inter', style: 'Regular' };
@@ -637,6 +637,9 @@ async function renderNode(
         if (irNode.rawPsdOriginalImage) {
           try { rect.setPluginData('psd_original_image', irNode.rawPsdOriginalImage); } catch { /* ignore */ }
         }
+        if (irNode.rawPsdChannelImage) {
+          try { rect.setPluginData('psd_channel_image', irNode.rawPsdChannelImage); } catch { /* ignore */ }
+        }
         if (irNode.rawPsdPrePatternImage) {
           try { rect.setPluginData('psd_pre_pattern_image', irNode.rawPsdPrePatternImage); } catch { /* ignore */ }
         }
@@ -650,7 +653,9 @@ async function renderNode(
           try { rect.setPluginData('psd_layer_mask_image', irNode.rawPsdLayerMaskImage); } catch { /* ignore */ }
         }
         if (irNode.nineSliceSettings) {
-          try { writeNineSlicePluginData(rect, irNode.nineSliceSettings); } catch { /* ignore */ }
+          try {
+            writeNineSlicePluginDataForImport(rect, irNode.nineSliceSettings);
+          } catch { /* ignore */ }
         }
 
         onNodeCreated();

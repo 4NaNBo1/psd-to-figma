@@ -1,0 +1,41 @@
+---
+description: "Debug 模式埋点：Figma/MasterGo 插件主线程无 fetch，必须用 debug-ingest 中继"
+alwaysApply: true
+---
+
+# Debug 模式埋点（Figma / MasterGo 插件）
+
+## 禁止在主线程直接 `fetch`
+
+本项目的插件分两个运行环境：
+
+| 代码位置 | 打包进 | 运行环境 | `fetch` |
+| --- | --- | --- | --- |
+| `src/ui.ts`、`src/parser/psd-parser.ts`、`src/exporter/psd-builder.ts` | `ui.html` | 浏览器 UI iframe | ✅ 可用 |
+| `src/code.ts`、`src/ir/builder.ts`、`src/platform/*-renderer.ts` | `code.js` | 插件主线程沙箱 | ❌ **不可用**（会报 `'fetch' is not defined`） |
+
+**禁止**在 `code.js` 侧（主线程）直接写 `fetch('http://127.0.0.1:7623/ingest/...')`。
+
+## 正确做法：使用 `src/debug-ingest.ts`
+
+```typescript
+import { ingestDebugLog } from '../debug-ingest';
+
+// #region agent log
+ingestDebugLog({
+  hypothesisId: 'A',
+  location: 'my-file.ts:42',
+  message: 'what happened',
+  data: { key: value },
+});
+// #endregion
+```
+
+- **UI iframe**：`ingestDebugLog` 内部直接 `fetch` POST。
+- **主线程**：写入 `globalThis.__debugIngestQueue`；`code.ts` 在 `buildIRTree` / `render` 后调用 `flushDebugIngestToUi()` → `ui.ts` 的 `debug-ingest` 消息 → `postDebugIngestEntries()` 再 `fetch`。
+
+## 其他约束
+
+- 埋点必须用 `// #region agent log` / `// #endregion` 包裹，验证通过后删除。
+- 不要用 `console.*` 代替（见 `logging-rules.mdc`）。
+- 验证完成后删除 `debug-ingest.ts` 及所有 `#region agent log` 块。

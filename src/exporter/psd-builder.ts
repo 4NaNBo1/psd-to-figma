@@ -1,7 +1,7 @@
 import { writePsd } from 'ag-psd';
 import type { Psd, Layer, BlendMode, LayerEffectShadow, LayerEffectSolidFill, LayerEffectGradientOverlay, LayerEffectStroke, ColorStop, OpacityStop } from 'ag-psd';
 import type { ExportNodeData, ExportFillInfo, SerializedColor } from '../types/psd-types';
-import { encodeNineSliceLayerName } from './nine-slice-collapse';
+import { encodeNineSliceLayerName, parseNineSliceSettingsJson } from './nine-slice-collapse';
 
 const BLEND_MODE_MAP: Record<string, BlendMode> = {
   'PASS_THROUGH': 'pass through',
@@ -152,6 +152,39 @@ function pngToCanvas(pngBytes: Uint8Array): Promise<HTMLCanvasElement> {
     };
     img.src = url;
   });
+}
+
+/** 等比放大后居中裁切到目标尺寸（避免非等比拉伸导致圆角变形）。 */
+function fitCanvasCoverCrop(source: HTMLCanvasElement, targetW: number, targetH: number): HTMLCanvasElement {
+  const tw = Math.max(1, Math.round(targetW));
+  const th = Math.max(1, Math.round(targetH));
+  if (source.width === tw && source.height === th) return source;
+  const scale = Math.max(tw / source.width, th / source.height);
+  const dw = source.width * scale;
+  const dh = source.height * scale;
+  const ox = (tw - dw) / 2;
+  const oy = (th - dh) / 2;
+  const canvas = document.createElement('canvas');
+  canvas.width = tw;
+  canvas.height = th;
+  const ctx = canvas.getContext('2d')!;
+  ctx.drawImage(source, 0, 0, source.width, source.height, ox, oy, dw, dh);
+  return canvas;
+}
+
+/** 从较大源图居中裁切到 layer bbox（9-slice 源图含圆角保护区，写入 PSD 时裁回逻辑尺寸）。 */
+function centerCropCanvas(source: HTMLCanvasElement, targetW: number, targetH: number): HTMLCanvasElement {
+  const tw = Math.max(1, Math.round(targetW));
+  const th = Math.max(1, Math.round(targetH));
+  if (source.width === tw && source.height === th) return source;
+  const cropped = document.createElement('canvas');
+  cropped.width = tw;
+  cropped.height = th;
+  const ctx = cropped.getContext('2d')!;
+  const ox = Math.max(0, Math.floor((source.width - tw) / 2));
+  const oy = Math.max(0, Math.floor((source.height - th) / 2));
+  ctx.drawImage(source, ox, oy, tw, th, 0, 0, tw, th);
+  return cropped;
 }
 
 /**
@@ -670,14 +703,14 @@ async function buildLayer(node: ExportNodeData, parentClipRect?: { x: number; y:
     ? (smartObjData!.origImageB64 ?? node.imageBase64)
     : smartObjDowngrade
       ? node.imageBase64
-      : (node.rawPsdPrePatternImage ?? node.rawPsdOriginalImage ?? smartObjData?.origImageB64 ?? node.rawPsdLayerMaskImage ?? node.imageBase64);
+      : (node.rawPsdPrePatternImage ?? node.rawPsdChannelImage ?? node.rawPsdOriginalImage ?? smartObjData?.origImageB64 ?? node.rawPsdLayerMaskImage ?? node.imageBase64);
   // round-trip 原始像素来源（prePattern/origImage/smartObjOrig/layerMask）保存的是「未扩展」的原始
   // layer bbox 像素；只有合成图 imageBase64 在导入时被 expandOffset 扩展过。
   // 完整还原用 origImageB64(未扩展)；降级用 node.imageBase64(已 expand，不算 unexpanded)。
   const usingUnexpandedRawImage = smartObjFullRestore
     ? true
     : (!smartObjDowngrade &&
-      !!(node.rawPsdPrePatternImage || node.rawPsdOriginalImage || smartObjData?.origImageB64 || node.rawPsdLayerMaskImage));
+      !!(node.rawPsdPrePatternImage || node.rawPsdChannelImage || node.rawPsdOriginalImage || smartObjData?.origImageB64 || node.rawPsdLayerMaskImage));
   if (!usedRawTextImage && effectiveImageBase64 && !(isTextLayer && !shouldUseTextCanvas)) {
     try {
       const pngBytes = base64ToUint8Array(effectiveImageBase64);
@@ -736,7 +769,16 @@ async function buildLayer(node: ExportNodeData, parentClipRect?: { x: number; y:
         cctx.drawImage(rawCanvas, exp, exp, innerW, innerH, 0, 0, innerW, innerH);
         layer.canvas = cropped;
       } else {
-        layer.canvas = rawCanvas;
+        const targetW = Math.max(1, Math.round(layerRight - layerLeft));
+        const targetH = Math.max(1, Math.round(layerBottom - layerTop));
+        if (rawCanvas.width !== targetW || rawCanvas.height !== targetH) {
+          // 9-slice 元数据里的 imageSize 大于 layer bbox；若误入大图，居中裁切，禁止 coverCrop 压扁圆角。
+          layer.canvas = node.nineSliceSettings
+            ? centerCropCanvas(rawCanvas, targetW, targetH)
+            : fitCanvasCoverCrop(rawCanvas, targetW, targetH);
+        } else {
+          layer.canvas = rawCanvas;
+        }
       }
     } catch { /* leave without image data */ }
   }

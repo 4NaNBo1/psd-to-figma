@@ -476,7 +476,14 @@ function buildShapeNode(
   const h = layer.isSubGroup ? layer.height : Math.max(1, layer.height);
   const rectW = Math.max(1, w + expand * 2);
   const rectH = Math.max(1, h + expand * 2);
-  const fills = buildImageFill(images, layer.imageIndex, layer.overlayFills, { width: rectW, height: rectH });
+  const fillTarget = (() => {
+    if (layer.imageIndex == null || !images[layer.imageIndex]) {
+      return { width: rectW, height: rectH };
+    }
+    const dims = readPngDimensions(base64ToUint8Array(images[layer.imageIndex]!));
+    return dims ?? { width: rectW, height: rectH };
+  })();
+  const fills = buildImageFill(images, layer.imageIndex, layer.overlayFills, fillTarget);
 
   return {
     type: 'rectangle',
@@ -498,6 +505,7 @@ function buildShapeNode(
     rawPsdVectorData: layer.rawVectorData,
     rawPsdAdjustments: layer.rawPsdAdjustments,
     rawPsdOriginalImage: layer.rawPsdOriginalImage,
+    rawPsdChannelImage: layer.rawPsdChannelImage,
     rawPsdPrePatternImage: layer.rawPsdPrePatternImage,
     rawPsdSmartObject: layer.rawPsdSmartObject,
     psdLayerMask: layer.rawLayerMask ? JSON.stringify(layer.rawLayerMask) : undefined,

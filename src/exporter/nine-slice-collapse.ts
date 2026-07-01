@@ -176,6 +176,7 @@ export function hasPsdRoundTripMarkers(node: any): boolean {
   return !!(
     node.getPluginData('psd_raw_effects') ||
     node.getPluginData('psd_original_image') ||
+    node.getPluginData('psd_channel_image') ||
     node.getPluginData('psd_pre_pattern_image') ||
     node.getPluginData('psd_layer_mask_image') ||
     node.getPluginData('psd_smart_object')
@@ -223,8 +224,59 @@ export async function resolveNineSliceMetadataForExport(
   return { version: 1, imageSize, slices };
 }
 
+/** 将九宫元数据的 imageSize / slices 对齐到实际位图像素尺寸（导入或导出前校正）。 */
+export function normalizeNineSliceSettingsForImage(
+  settingsJson: string,
+  imageWidth: number,
+  imageHeight: number,
+): string {
+  const payload = parseNineSliceSettingsJson(settingsJson);
+  if (!payload) return settingsJson;
+  const { imageSize, slices } = payload;
+  if (imageSize.width === imageWidth && imageSize.height === imageHeight) return settingsJson;
+  if (imageSize.width <= 0 || imageSize.height <= 0 || imageWidth <= 0 || imageHeight <= 0) {
+    return settingsJson;
+  }
+  const sx = imageWidth / imageSize.width;
+  const sy = imageHeight / imageSize.height;
+  return serializeNineSliceSettingsPayload({
+    version: 1,
+    imageSize: { width: imageWidth, height: imageHeight },
+    slices: {
+      top: roundSlice(slices.top * sy),
+      right: roundSlice(slices.right * sx),
+      bottom: roundSlice(slices.bottom * sy),
+      left: roundSlice(slices.left * sx),
+    },
+  });
+}
+
 export function writeNineSlicePluginData(node: any, settingsJson: string): void {
   if (!node || typeof settingsJson !== 'string' || !settingsJson) return;
+  try {
+    if (typeof node.setSharedPluginData === 'function') {
+      node.setSharedPluginData(NINE_SLICE_SHARED_NAMESPACE, NINE_SLICE_METADATA_KEY, settingsJson);
+    }
+  } catch { /* ignore */ }
+  try {
+    if (typeof node.setPluginData === 'function') {
+      node.setPluginData(NINE_SLICE_METADATA_KEY, settingsJson);
+    }
+  } catch { /* ignore */ }
+}
+
+/**
+ * PSD 导入：写入九宫元数据供跨插件读取与导出往返。
+ * - sharedPluginData('9slice', …)：9-Slice 插件可读（private pluginData 跨插件不可见）
+ * - private pluginData：本插件折叠导出 PSD 时读取
+ * metadata 原样写入，不按画布 fill 尺寸缩放（imageSize 描述拉伸资产，非显示尺寸）。
+ */
+export function writeNineSlicePluginDataForImport(
+  node: any,
+  settingsJson: string,
+): void {
+  if (!node || typeof settingsJson !== 'string' || !settingsJson) return;
+  if (!parseNineSliceSettingsJson(settingsJson)) return;
   try {
     if (typeof node.setSharedPluginData === 'function') {
       node.setSharedPluginData(NINE_SLICE_SHARED_NAMESPACE, NINE_SLICE_METADATA_KEY, settingsJson);

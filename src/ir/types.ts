@@ -192,6 +192,11 @@ export interface IRNode {
    */
   rawPsdPrePatternImage?: string;
   /**
+   * PSD 图层 channel 原始像素 base64 PNG（效果合成前，尺寸 = layer bbox）。
+   * renderer 写入 setPluginData('psd_channel_image', ...)，9-slice 折叠导出时写回 PSD channel。
+   */
+  rawPsdChannelImage?: string;
+  /**
    * 智能对象 round-trip 数据 JSON（{ origImageB64, transform, soId, width, height, filter }）。
    * renderer 写入 setPluginData('psd_smart_object', ...)，导出时用原始模糊像素 + transform 重建
    * placedLayer 智能对象图层。仅智能对象带模糊类智能滤镜（重渲染清晰像素）的层有。

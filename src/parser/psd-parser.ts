@@ -3017,6 +3017,18 @@ async function encodeOriginalImageBase64(
   }
 }
 
+async function savePsdChannelImageForRoundTrip(
+  serialized: SerializedLayer,
+  effectiveImageData: { data: Uint8ClampedArray | Uint8Array; width: number; height: number },
+): Promise<void> {
+  if (serialized.type === 'text') return;
+  try {
+    serialized.rawPsdChannelImage = uint8ArrayToBase64(await imageDataToPng(effectiveImageData));
+  } catch (e) {
+    logger.warn(`Failed to save PSD channel image for "${serialized.name}": ${e instanceof Error ? e.message : e}`);
+  }
+}
+
 async function compositeGroupEffectsIntoOnlyChild(
   group: SerializedLayer,
   child: SerializedLayer,
@@ -3413,6 +3425,7 @@ async function serializeLayer(
     try {
       const maskedData = applyLayerMask(layer.imageData, layer);
       const effectiveImageData = maskedData ?? layer.imageData;
+      await savePsdChannelImageForRoundTrip(serialized, effectiveImageData);
       // 整层原生化闸门：所有效果都能与 PS 像素级一致地用平台属性表达时，保留 effects/strokes/
       // overlay fill 为可编辑、不烤进位图；否则退回栅格化（needsComposite）。二者互斥。
       const native = ENABLE_EFFECT_NATIVIZATION && hasAnyEffect(effectBundle) &&
@@ -3506,6 +3519,7 @@ async function serializeLayer(
       const rawCanvasData = cctx.getImageData(0, 0, cvs.width, cvs.height);
       const maskedCanvasData = applyLayerMask(rawCanvasData, layer);
       const effectiveCanvasData = maskedCanvasData ?? rawCanvasData;
+      await savePsdChannelImageForRoundTrip(serialized, effectiveCanvasData);
       // 整层原生化闸门（与 image 分支对称，逻辑须一致）。
       const native = ENABLE_EFFECT_NATIVIZATION && hasAnyEffect(effectBundle) && cvs.width > 0 && cvs.height > 0 &&
         canNativizeLayer(layer, effectBundle, patternOverlayMeta, effectiveCanvasData);

@@ -221,6 +221,11 @@ export interface SerializedLayer {
    */
   rawPsdPrePatternImage?: string;
   /**
+   * PSD 图层 channel 原始像素（效果合成之前）的 base64 PNG，尺寸 = layer bbox。
+   * 9-slice 折叠导出时写回 PSD channel，避免用 533×181 拉伸图或 exportAsync 重渲染导致圆角/纹理失真。
+   */
+  rawPsdChannelImage?: string;
+  /**
    * 智能对象（placedLayer）带启用的模糊类智能滤镜（如动感模糊）时的 round-trip 数据 JSON。
    * 这类图层 ag-psd 读到的 channel data 是被模糊污染的缓存，导入时已改用「智能对象源 +
    * 仿射变换」渲染出清晰像素；此字段保存原始模糊像素 + placedLayer/滤镜元信息，
@@ -433,6 +438,8 @@ export interface ExportNodeData {
    * 导出时用它替换图层位图 + 保留 patternOverlay effect + 写回 pattern 资源，避免 pattern 双重应用。
    */
   rawPsdPrePatternImage?: string;
+  /** 从 setPluginData('psd_channel_image') 读出的 PSD channel 原始像素（效果合成前）。 */
+  rawPsdChannelImage?: string;
   /**
    * 从节点 setPluginData('psd_smart_object', ...) 读出的智能对象 round-trip 数据 JSON
    * （{ origImageB64, transform, soId, width, height, filter }）。

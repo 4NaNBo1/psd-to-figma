@@ -234,6 +234,13 @@ function attachPsdPluginData(node: any, data: ExportNodeData): void {
 
   try {
     if (typeof node.getPluginData === 'function') {
+      const ch = node.getPluginData('psd_channel_image');
+      if (ch) data.rawPsdChannelImage = ch;
+    }
+  } catch { /* ignore */ }
+
+  try {
+    if (typeof node.getPluginData === 'function') {
       const orig = node.getPluginData('psd_original_image');
       if (orig) data.rawPsdOriginalImage = orig;
     }
@@ -303,6 +310,13 @@ function uint8ArrayToBase64(bytes: Uint8Array): string {
     chunks.push(lookup[n >> 10] + lookup[(n >> 4) & 63] + lookup[(n << 2) & 63] + '=');
   }
   return chunks.join('');
+}
+
+function base64ToUint8Array(base64: string): Uint8Array {
+  const binary = globalThis.atob ? globalThis.atob(base64) : '';
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes;
 }
 
 function mapNodeType(node: any): ExportNodeType {
@@ -826,15 +840,6 @@ async function serializeNineSliceCollapsed(
 
   attachPsdPluginData(imageNode, data);
 
-  const hasRoundTripImage = !!(data.rawPsdOriginalImage || data.rawPsdPrePatternImage || data.rawPsdLayerMaskImage);
-  if (!hasRoundTripImage) {
-    if (hiddenSource) {
-      data.imageBase64 = await exportNodeImage(hiddenSource, { withoutStrokesAndEffects: true });
-    } else {
-      data.imageBase64 = await exportNineSliceStoredImage(component);
-    }
-  }
-
   const nineSliceMeta = await resolveNineSliceMetadataForExport(
     component,
     hiddenSource,
@@ -842,6 +847,36 @@ async function serializeNineSliceCollapsed(
   );
   if (nineSliceMeta) {
     data.nineSliceSettings = serializeNineSliceSettingsPayload(nineSliceMeta);
+  }
+
+  const hasRoundTripImage = !!(data.rawPsdOriginalImage || data.rawPsdPrePatternImage || data.rawPsdLayerMaskImage || data.rawPsdChannelImage);
+  if (nineSliceMeta && data.rawPsdChannelImage) {
+    data.imageBase64 = data.rawPsdChannelImage;
+  } else if (!hasRoundTripImage) {
+    if (nineSliceMeta) {
+      // 无 channel 往返数据时回退：hidden 源无效果导出（不可用 533×181 九宫存储图写 PSD channel）。
+      const exportNode = hiddenSource ?? component;
+      data.imageBase64 = await exportNodeImage(exportNode, { withoutStrokesAndEffects: true });
+      if (!data.imageBase64 && hiddenSource) {
+        data.imageBase64 = await exportNodeImage(component, { withoutStrokesAndEffects: true });
+      }
+    } else {
+      let storedBytes: Uint8Array | undefined;
+      for (const n of [component, hiddenSource]) {
+        if (!n) continue;
+        storedBytes = await readNodeStoredImageBytes(n);
+        if (storedBytes?.length) break;
+      }
+      if (storedBytes?.length) {
+        data.imageBase64 = uint8ArrayToBase64(storedBytes);
+      } else {
+        const exportNode = hiddenSource ?? component;
+        data.imageBase64 = await exportNodeImage(exportNode, { withoutStrokesAndEffects: true });
+        if (!data.imageBase64 && !hiddenSource) {
+          data.imageBase64 = await exportNineSliceStoredImage(component);
+        }
+      }
+    }
   }
 
   onLog('info', `Collapsed 9-slice component "${component.name}" to single PSD layer${hiddenSource ? ' (from hidden PSD source)' : ''}${data.nineSliceSettings ? ' [nine-slice metadata preserved]' : ''}`);
