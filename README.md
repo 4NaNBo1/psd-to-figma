@@ -4,7 +4,7 @@
 
 [使用说明](#使用说明) · [导出 PSD](#导出-psd) · [配合 9-Slice 插件](#配合-9-slice-插件) · [开发说明](#开发说明) · [更新历史](#更新历史)
 
-当前版本：`v1.5.0`
+当前版本：`v1.6.1`
 
 ## 功能特性
 
@@ -168,6 +168,19 @@ npm run watch      # 监听文件变化
 > 插件采用 IR（中间表示）架构：`parser → IR → platform renderer` 用于导入，`node-serializer → psd-builder` 用于导出。新增设计平台只需在 `src/platform/` 下实现 `PlatformRenderer` 接口。
 
 ## 更新历史
+
+### v1.6.1
+
+- 与 [9-Slice 插件](https://github.com/4NaNBo1/9slice/releases) 打通：导出时自动将九宫组件折叠为单层位图，避免 MasterGo 等平台切片导出透明碎片。
+- 支持 `nineSliceSettings` 元数据往返：经 plugin data、PSD 图层名 Base64URL 编码与几何推断三条通道传递。
+- 修复 9-Slice 导出往返时 PSD 通道像素保留问题，提高位图保真度。
+- 校验嵌入式智能对象源数据，跳过无效的 `placedLayer` 写入。
+- 修复 PSD 导出时透传叠加层烘焙与 MasterGo 图层层叠顺序问题。
+- 移除 codegraph / graphify 代码智能分析工具链。
+
+### v1.6.0
+
+- 将单子图层组的效果合成进栅格图层，修复导出后效果丢失问题。
 
 ### v1.5.0
 
