@@ -137,19 +137,24 @@ index 2e62b06..2168904 100644
      // discard if read in 'lrFX' section
      target.effects = (0, descriptor_1.parseEffects)(desc, !!reader.logMissingFeatures);
 diff --git a/node_modules/ag-psd/dist/helpers.js b/node_modules/ag-psd/dist/helpers.js
-index e18ef7b..f03d93f 100644
+index e18ef7b..ef42e6d 100644
 --- a/node_modules/ag-psd/dist/helpers.js
 +++ b/node_modules/ag-psd/dist/helpers.js
-@@ -54,6 +54,9 @@ function revMap(map) {
+@@ -54,8 +54,14 @@ function revMap(map) {
  exports.revMap = revMap;
  function createEnum(prefix, def, map) {
      var rev = revMap(map);
-+    // Patch: ag-psd missing abbreviated blend mode keys (lddg=linearDodge, lbrn=linearBurn)
-+    var _extraAliases = { 'lddg': 'linearDodge', 'lbrn': 'linearBurn' };
++    // Patch: ag-psd missing abbreviated blend mode keys (lddg=linearDodge, lbrn=linearBurn, normal=norm)
++    var _extraAliases = { 'lddg': 'linearDodge', 'lbrn': 'linearBurn', 'normal': 'norm' };
 +    for (var _ak in _extraAliases) { if (!rev[_ak] && rev[_extraAliases[_ak]]) rev[_ak] = rev[_extraAliases[_ak]]; }
      var decode = function (val) {
          var value = val.split('.')[1];
++        // Patch: PSD lfx2 descriptors sometimes use map keys (e.g. BlnM.normal) instead of abbrev (BlnM.Nrml).
++        if (value && map[value])
++            return value;
          if (value && !rev[value])
+             throw new Error("Unrecognized value for enum: '".concat(val, "'"));
+         return rev[value] || def;
 diff --git a/node_modules/ag-psd/src/additionalInfo.ts b/node_modules/ag-psd/src/additionalInfo.ts
 index 3c9a774..2633b90 100644
 --- a/node_modules/ag-psd/src/additionalInfo.ts

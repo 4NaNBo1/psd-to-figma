@@ -4,7 +4,7 @@
 
 [使用说明](#使用说明) · [导出 PSD](#导出-psd) · [配合 9-Slice 插件](#配合-9-slice-插件) · [开发说明](#开发说明) · [更新历史](#更新历史)
 
-当前版本：`v1.6.1`
+当前版本：`v1.6.2`
 
 ## 功能特性
 
@@ -168,6 +168,12 @@ npm run watch      # 监听文件变化
 > 插件采用 IR（中间表示）架构：`parser → IR → platform renderer` 用于导入，`node-serializer → psd-builder` 用于导出。新增设计平台只需在 `src/platform/` 下实现 `PlatformRenderer` 接口。
 
 ## 更新历史
+
+### v1.6.2
+
+- 修复部分 PSD 导入时图层效果（lfx2）混合模式枚举解析失败的问题。
+- 兼容 `BlnM.normal` 等使用完整键名（而非 `BlnM.Nrml` 缩写）的描述符格式。
+- 补充 `normal`、`lddg`、`lbrn` 等混合模式缩写别名。
 
 ### v1.6.1
 
