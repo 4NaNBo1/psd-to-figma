@@ -33,8 +33,8 @@
 ### 安装到 MasterGo
 
 1. 解压下载的压缩包到本地任意目录。
-2. 打开 [MasterGo 桌面客户端](https://mastergo.com/resource)。
-3. 在菜单栏选择 **插件 → 开发模式 → 导入插件（manifest.json）**。
+2. 打开 MasterGo 桌面客户端。
+3. 在菜单栏选择 **插件 → 开发者模式 → 创建/添加插件 → 点击或拖动上传（manifest.mastergo.json）文件**。
 4. 选择解压目录中的 `manifest.mastergo.json` 文件，完成导入。
 
 ### 使用插件
