@@ -234,6 +234,22 @@ function buildOverlayFills(overlayFills: SerializedFill[] | undefined): IRFill[]
   return out;
 }
 
+function buildBase64ImageFill(
+  base64: string | undefined,
+  targetSize?: { width: number; height: number },
+): IRFill[] {
+  if (!base64 || base64.length === 0) return [];
+  const bytes = base64ToUint8Array(base64);
+  if (bytes.length === 0) return [];
+  const pngSize = readPngDimensions(bytes);
+  const scaleMode: 'FILL' | 'STRETCH' = (
+    targetSize && pngSize &&
+    pngSize.width === Math.round(targetSize.width) &&
+    pngSize.height === Math.round(targetSize.height)
+  ) ? 'STRETCH' : 'FILL';
+  return [{ type: 'IMAGE' as const, imageBytes: bytes, scaleMode }];
+}
+
 function buildImageFill(
   images: string[],
   imageIndex: number | undefined,
@@ -242,20 +258,8 @@ function buildImageFill(
 ): IRFill[] {
   const overlays = buildOverlayFills(overlayFills);
   if (imageIndex === undefined || !images[imageIndex]) return overlays;
-  const base64 = images[imageIndex];
-  if (!base64 || base64.length === 0) return overlays;
-  const bytes = base64ToUint8Array(base64);
-  if (bytes.length === 0) return overlays;
-  const pngSize = readPngDimensions(bytes);
-  const scaleMode: 'FILL' | 'STRETCH' = (
-    targetSize && pngSize &&
-    pngSize.width === Math.round(targetSize.width) &&
-    pngSize.height === Math.round(targetSize.height)
-  ) ? 'STRETCH' : 'FILL';
-  return [
-    { type: 'IMAGE' as const, imageBytes: bytes, scaleMode },
-    ...overlays,
-  ];
+  const imageFills = buildBase64ImageFill(images[imageIndex], targetSize);
+  return [...imageFills, ...overlays];
 }
 
 function buildTextProps(layer: SerializedLayer): IRTextProps | undefined {
@@ -414,7 +418,7 @@ function buildTextNode(
 ): IRNode {
   const textProps = buildTextProps(layer);
 
-  // 文本「平台不可渲染效果」回退栅格化（textRasterized）：合成图已含字形+全部效果，
+  // 文本像素准确显示（textRasterized）：合成图已含字形+全部效果，
   // 几何按合成图（含 expand）摆放、fills 用合成图、effects/strokes 置空（避免平台再叠一层）；
   // 节点仍是 text 类型，textProps 保留全部 round-trip 源数据（含 rasterized:true）供导出还原文本层。
   if (layer.textRasterized) {
@@ -543,25 +547,71 @@ function buildChildrenWithClipping(
       //   - baseDisplay：归零定位、正常显示，承载基底层颜色/效果，保证 #ffffe7 这类底色可见；
       //   - baseMask：基底副本，仅作 alpha 蒙版（isMask），按图片 alpha 形状裁剪后续被剪贴层。
       // 蒙版只裁排在它「之后」的兄弟，故 baseDisplay 在前不受裁剪。
-      const baseDisplay: IRNode = { ...baseNode, x: 0, y: 0 };
-      const baseMask: IRNode = {
+      const baseExpand = child.expandOffset ?? 0;
+      const rawMaskFills = buildBase64ImageFill(child.rawPsdChannelImage, {
+        width: Math.max(1, child.width),
+        height: Math.max(1, child.height),
+      });
+      const hasRawAlphaMask = rawMaskFills.length > 0;
+      const effectOverlayFills = buildImageFill(images, child.clippingEffectOverlayImageIndex, undefined, {
+        width: baseNode.width,
+        height: baseNode.height,
+      });
+      const hasEffectOverlay = effectOverlayFills.length > 0 && hasRawAlphaMask;
+      const baseDisplay: IRNode = hasEffectOverlay ? {
         ...baseNode,
-        x: 0,
-        y: 0,
-        name: baseNode.name + ' (mask)',
-        isMask: true,
-        // 蒙版只需提供形状 alpha，剥离效果/描边避免干扰（填充保留以提供 alpha 形状）。
+        x: baseExpand,
+        y: baseExpand,
+        width: Math.max(1, child.width),
+        height: Math.max(1, child.height),
+        fills: rawMaskFills,
         effects: [],
         strokes: [],
+        cornerRadii: undefined,
+      } : { ...baseNode, x: 0, y: 0 };
+      const baseMask: IRNode = {
+        ...baseNode,
+        // 合成后的 baseNode 图片可能已经包含 outer glow / outside stroke / bevel 等效果，
+        // 这些效果会扩张甚至填满 bbox，不能再拿来当 PSD clipping mask 的 alpha。
+        // 优先使用效果合成前保存的 channel PNG，且放回 expand 前的原始图层位置。
+        x: hasRawAlphaMask ? baseExpand : 0,
+        y: hasRawAlphaMask ? baseExpand : 0,
+        width: hasRawAlphaMask ? Math.max(1, child.width) : baseNode.width,
+        height: hasRawAlphaMask ? Math.max(1, child.height) : baseNode.height,
+        name: baseNode.name + ' (mask)',
+        isMask: true,
+        fills: hasRawAlphaMask ? rawMaskFills : baseNode.fills,
+        // 蒙版只需提供原始像素 alpha，剥离效果/描边/圆角属性，避免二次改变蒙版轮廓。
+        effects: [],
+        strokes: [],
+        cornerRadii: hasRawAlphaMask ? undefined : baseNode.cornerRadii,
       };
       const clipChildren: IRNode[] = [baseDisplay, baseMask];
 
-      const baseExpand = child.expandOffset ?? 0;
       for (const clippedLayer of clippedLayers) {
         const clippedNode = buildLayerNode(clippedLayer, images, depth);
         clippedNode.x = clippedLayer.x - child.x + baseExpand;
         clippedNode.y = clippedLayer.y - child.y + baseExpand;
         clipChildren.push(clippedNode);
+      }
+
+      if (hasEffectOverlay) {
+        clipChildren.push({
+          type: 'rectangle',
+          name: baseNode.name + ' (effects overlay)',
+          x: 0,
+          y: 0,
+          width: baseNode.width,
+          height: baseNode.height,
+          opacity: baseNode.opacity,
+          blendMode: baseNode.blendMode,
+          visible: baseNode.visible,
+          clipsContent: false,
+          isImportHelper: true,
+          fills: effectOverlayFills,
+          effects: [],
+          strokes: [],
+        });
       }
 
       const clipFrame: IRNode = {
@@ -596,6 +646,8 @@ function buildChildrenWithClipping(
 
 export function buildIRTree(psd: SerializedPsd): IRNode {
   const children = buildChildrenWithClipping(psd.layers, psd.images, 1);
+
+
 
   const rootFrame: IRNode = {
     type: 'frame',

@@ -154,6 +154,12 @@ export interface SerializedLayer {
   children?: SerializedLayer[];
   textData?: SerializedTextData;
   imageIndex?: number;
+  /**
+   * 当本层是 PSD clipping chain 的基底且 effects 已栅格化时，保存一张“仅效果”叠加图。
+   * builder 将原始 channel 放在被剪贴层下方、此图放在上方，从而保持 PS 的顺序：
+   * base content → clipped content → base layer effects。
+   */
+  clippingEffectOverlayImageIndex?: number;
   effects: SerializedShadow[];
   strokes: SerializedStroke[];
   /**
@@ -164,9 +170,9 @@ export interface SerializedLayer {
   cornerRadii?: SerializedCornerRadii;
   expandOffset?: number;
   /**
-   * 标记：本文本层因含「平台渲染不出」的效果（如 spread 实色外扩阴影、warp 弧形）而被栅格化——
-   * effects/strokes 已用 compositeLayerEffects 烤进 imageIndex 指向的合成图。节点仍按文本层
-   * 导出（textData/rawEffectsData 完整保留），仅画布显示改用合成图。详见 textEffectsRenderable。
+   * 标记：本文本层画布显示使用 PSD 原始字形像素（带效果时先合成 Layer Style）。
+   * 节点仍按文本层导出，textData/rawImage/rawEffectsData 完整保留；透明 TextNode 负责编辑与往返，
+   * 兄弟 raster companion 负责像素准确显示。
    */
   textRasterized?: boolean;
   /**

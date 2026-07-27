@@ -300,7 +300,7 @@ async function createStyledTextNode(
     }
   }
 
-  // 文本「平台不可渲染效果」回退栅格化（tp.rasterized）：节点仍是 TextNode（保 characters 供导出
+  // 文本像素准确显示（tp.rasterized）：节点仍是 TextNode（保 characters 供导出
   // 识别为文本层），但画布显示改用合成图 IMAGE fill（已含字形+spread 阴影/描边/warp 等平台渲染不出
   // 的效果）。跳过 gradientOverlay / applyEffects / stroke / alignTextPosition（合成图已包含），
   // resize 到 IR 尺寸（含 expand）使合成图铺满。round-trip 元数据照常写入（见下方 setPluginData）。
@@ -331,7 +331,7 @@ async function createStyledTextNode(
 
     // 兄弟 rectangle 承载合成图显示（含字形+spread 阴影/描边）。几何 = IR 文本几何（含 expand），
     // 标记 psd_raster_companion 让导出端跳过（不进 PSD，由透明文本节点导出文本层）。
-    if (irNode.fills.length > 0) {
+    if (irNode.visible && irNode.fills.length > 0) {
       const paints: Paint[] = [];
       for (const fill of irNode.fills) {
         const paint = irFillToPaint(fill, onLog, irNode.name);
@@ -345,6 +345,9 @@ async function createStyledTextNode(
         companion.y = irNode.y;
         companion.resize(Math.max(1, irNode.width), Math.max(1, irNode.height));
         companion.fills = paints;
+        companion.visible = irNode.visible;
+        if (irNode.opacity !== 1) companion.opacity = irNode.opacity;
+        companion.blendMode = irNode.blendMode as BlendMode;
         if (tp.rotation) companion.rotation = tp.rotation;
         try { companion.setPluginData('psd_raster_companion', '1'); } catch { /* ignore */ }
       }
@@ -675,6 +678,10 @@ async function renderNode(
       } catch (e) {
         onLog('warn', `Failed to set mask on "${irNode.name}": ${e instanceof Error ? e.message : e}`);
       }
+    }
+
+    if (irNode.isImportHelper && node) {
+      try { node.setPluginData('psd_import_helper', '1'); } catch { /* ignore */ }
     }
 
     return node;

@@ -24,12 +24,14 @@ PSD 剪贴蒙版（`layer.clipping = true`）的语义：被剪贴层只显示�
 
 ```
 clip group (frame, clipsContent=false)
-├── baseDisplay        ← 基底副本，正常显示，承载颜色/效果（保证 #ffffe7 这类底色可见）
-├── baseMask (isMask)  ← 基底副本，作 alpha 蒙版，按图片 alpha 形状裁剪后续被剪贴层
-└── 被剪贴层...          ← 被 baseMask 裁剪（蒙版只裁排在其后的兄弟）
+├── baseDisplay        ← 效果合成前的原始 channel，显示基底内容
+├── baseMask (isMask)  ← 同一原始 channel，仅用 alpha 裁剪后续被剪贴层
+├── 被剪贴层...          ← 被 baseMask 裁剪（蒙版只裁排在其后的兄弟）
+└── effects overlay    ← 仅含基底 layer effects，覆盖在 clipped 内容上方
 ```
 
-- `baseMask` 剥离 effects/strokes，仅保留 fill 以提供 alpha 形状。
+- `baseMask` 使用 effects 合成前保存的 `rawPsdChannelImage`，避免 outer glow / outside stroke 扩张蒙版轮廓。
+- 当基底效果已栅格化时，解析器额外生成“仅效果”叠加图，按 Photoshop 的 `base content → clipped content → base effects` 顺序放在最上方；该辅助节点带 `psd_import_helper` 标记，导出时跳过。
 - 显示职责给 `baseDisplay`、裁剪职责给 `baseMask`，二者解耦，因此不再依赖「mask 自身是否显示」这一平台行为。
 
 IR 通过 `IRNode.isMask` 字段（[src/ir/types.ts](../src/ir/types.ts)）标记 `baseMask`，两个 renderer 对称消费：

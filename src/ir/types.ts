@@ -141,6 +141,8 @@ export interface IRNode {
   /** PSD 剪贴蒙版基底层标记。渲染器把该节点设为 isMask，用其 alpha 形状裁剪
    *  clip group 内排在其后的兄弟节点（对应 PS 剪贴蒙版）。 */
   isMask?: boolean;
+  /** 仅用于导入画布显示的辅助节点；导出 PSD 时跳过。 */
+  isImportHelper?: boolean;
 
   fills: IRFill[];
   effects: IRShadow[];

@@ -1394,12 +1394,13 @@ interface ShadowCompositeInfo {
   g: number;
   b: number;
   opacity: number;
+  blendMode?: string;
 }
 
 // 兼容旧名（外部调用点）
 type DropShadowCompositeInfo = ShadowCompositeInfo;
 
-function readShadowList(items: { enabled?: boolean; angle?: number; distance?: { value?: number }; size?: { value?: number }; choke?: { value?: number }; color?: any; opacity?: number }[] | undefined): ShadowCompositeInfo[] {
+function readShadowList(items: { enabled?: boolean; angle?: number; distance?: { value?: number }; size?: { value?: number }; choke?: { value?: number }; color?: any; opacity?: number; blendMode?: string }[] | undefined): ShadowCompositeInfo[] {
   if (!items) return [];
   const result: ShadowCompositeInfo[] = [];
   for (const s of items) {
@@ -1418,6 +1419,7 @@ function readShadowList(items: { enabled?: boolean; angle?: number; distance?: {
       g: Math.round(('g' in (c ?? {})) ? (c as { g: number }).g : 0),
       b: Math.round(('b' in (c ?? {})) ? (c as { b: number }).b : 0),
       opacity: s.opacity ?? 1,
+      blendMode: s.blendMode,
     });
   }
   return result;
@@ -1434,7 +1436,7 @@ function getEnabledInnerShadows(layer: Layer): ShadowCompositeInfo[] {
 }
 
 // Outer/Inner Glow: 没有 angle/distance（即偏移=0），用 size 当 blur+spread，choke 当 spread
-function readGlow(g: { enabled?: boolean; size?: { value?: number }; choke?: { value?: number }; color?: any; opacity?: number } | undefined): ShadowCompositeInfo | null {
+function readGlow(g: { enabled?: boolean; size?: { value?: number }; choke?: { value?: number }; color?: any; opacity?: number; blendMode?: string } | undefined): ShadowCompositeInfo | null {
   if (!g || !g.enabled) return null;
   const size = g.size?.value ?? 0;
   const chokePct = (g.choke?.value ?? 0) / 100;
@@ -1442,12 +1444,13 @@ function readGlow(g: { enabled?: boolean; size?: { value?: number }; choke?: { v
   return {
     offsetX: 0,
     offsetY: 0,
-    blur: size * (1 - chokePct),
+    blur: size * (1 - chokePct) * 0.5,
     spread: size * chokePct,
     r: Math.round(('r' in (c ?? {})) ? (c as { r: number }).r : 0),
     g: Math.round(('g' in (c ?? {})) ? (c as { g: number }).g : 0),
     b: Math.round(('b' in (c ?? {})) ? (c as { b: number }).b : 0),
     opacity: g.opacity ?? 1,
+    blendMode: g.blendMode,
   };
 }
 
@@ -1486,10 +1489,10 @@ interface BevelInfo {
   altitude: number;
   /** direction：'up' = highlight 在亮面，'down' = 反转 */
   direction: 'up' | 'down';
-  /** strength：高光/阴影强度（0~100 → 0~1） */
+  /** Photoshop Depth；ag-psd 已归一为倍率（1=100%，5.01=501%）。 */
   strength: number;
-  highlightR: number; highlightG: number; highlightB: number; highlightOpacity: number;
-  shadowR: number; shadowG: number; shadowB: number; shadowOpacity: number;
+  highlightR: number; highlightG: number; highlightB: number; highlightOpacity: number; highlightBlendMode?: string;
+  shadowR: number; shadowG: number; shadowB: number; shadowOpacity: number; shadowBlendMode?: string;
 }
 
 function getEnabledBevel(layer: Layer): BevelInfo | null {
@@ -1505,15 +1508,18 @@ function getEnabledBevel(layer: Layer): BevelInfo | null {
     angle: b.angle ?? 120,
     altitude: b.altitude ?? 30,
     direction: (b.direction === 'down' ? 'down' : 'up'),
-    strength: Math.max(0, Math.min(1, (b.strength ?? 100) / 100)),
+    // ag-psd 已把 Photoshop 的 Depth 百分比归一为倍率：5.01 表示 501%，不是 5.01%。
+    strength: Math.max(0, b.strength ?? 1),
     highlightR: Math.round(hc.r ?? 255),
     highlightG: Math.round(hc.g ?? 255),
     highlightB: Math.round(hc.b ?? 255),
     highlightOpacity: b.highlightOpacity ?? 0.75,
+    highlightBlendMode: b.highlightBlendMode,
     shadowR: Math.round(sc.r ?? 0),
     shadowG: Math.round(sc.g ?? 0),
     shadowB: Math.round(sc.b ?? 0),
     shadowOpacity: b.shadowOpacity ?? 0.75,
+    shadowBlendMode: b.shadowBlendMode,
   };
 }
 
@@ -1953,6 +1959,22 @@ function blendChannel(mode: string | undefined, base: number, blend: number): nu
   return Math.round(Math.max(0, Math.min(1, r)) * 255);
 }
 
+/** 按指定 blend mode 和 opacity 把纯色混入现有 RGB（不改变 alpha）。 */
+function blendColorIntoRgb(
+  pixels: Uint8ClampedArray, idx: number,
+  r: number, g: number, b: number,
+  opacity: number, blendMode?: string,
+): void {
+  const f = Math.max(0, Math.min(1, opacity));
+  if (f <= 0) return;
+  const br = blendChannel(blendMode, pixels[idx], r);
+  const bg = blendChannel(blendMode, pixels[idx + 1], g);
+  const bb = blendChannel(blendMode, pixels[idx + 2], b);
+  pixels[idx] = Math.round(pixels[idx] * (1 - f) + br * f);
+  pixels[idx + 1] = Math.round(pixels[idx + 1] * (1 - f) + bg * f);
+  pixels[idx + 2] = Math.round(pixels[idx + 2] * (1 - f) + bb * f);
+}
+
 function applyPatternOverlayToPixels(
   pixels: Uint8ClampedArray,
   w: number, h: number,
@@ -2125,7 +2147,7 @@ function outsideDistanceField(alpha: Uint8Array, w: number, h: number): Float32A
 /**
  * 将带 sigma 的高斯模糊近似为 3 次 box blur。
  */
-function blurFloat(src: Float32Array, w: number, h: number, radius: number): Float32Array {
+function blurFloat(src: Float32Array, w: number, h: number, radius: number, zeroPad = false): Float32Array {
   if (radius <= 0) return src;
   let current = src;
   const passes = 3;
@@ -2140,7 +2162,7 @@ function blurFloat(src: Float32Array, w: number, h: number, radius: number): Flo
           sum += current[y * w + nx];
           count++;
         }
-        tmp[y * w + x] = sum / count;
+        tmp[y * w + x] = sum / (zeroPad ? (2 * r + 1) : count);
       }
     }
     const out = new Float32Array(w * h);
@@ -2152,7 +2174,7 @@ function blurFloat(src: Float32Array, w: number, h: number, radius: number): Flo
           sum += tmp[ny * w + x];
           count++;
         }
-        out[y * w + x] = sum / count;
+        out[y * w + x] = sum / (zeroPad ? (2 * r + 1) : count);
       }
     }
     current = out;
@@ -2171,8 +2193,10 @@ function bevelHeightField(
   const insideD = insideDistanceField(alpha, w, h);
   const outsideD = outsideDistanceField(alpha, w, h);
   for (let i = 0; i < w * h; i++) {
-    const di = insideD[i];
-    const dout = outsideD[i];
+    // Distance transform assigns the first opaque edge pixel distance=1. Photoshop bevel starts at
+    // distance 0 on that pixel, so subtract one to avoid shifting the entire relief one pixel outward.
+    const di = Math.max(0, insideD[i] - 1);
+    const dout = Math.max(0, outsideD[i] - 1);
     if (style === 'outer bevel') {
       // 外斜面：形状外靠近边缘的环带升起
       if (alpha[i] >= 128) {
@@ -2215,7 +2239,6 @@ function bevelLighting(
   // 光源方向：在屏幕平面上 angle 决定 x/y 投影，altitude 决定 z
   const lx = Math.cos(a) * Math.cos(alt);
   const ly = -Math.sin(a) * Math.cos(alt);
-  const lz = Math.sin(alt);
   const dirSign = direction === 'up' ? 1 : -1;
 
   const highlight = new Float32Array(w * h);
@@ -2229,18 +2252,23 @@ function bevelLighting(
       const xR = x < w - 1 ? height[i + 1] : height[i];
       const yT = y > 0 ? height[i - w] : height[i];
       const yB = y < h - 1 ? height[i + w] : height[i];
-      let nx = (xL - xR) * dirSign;
-      let ny = (yT - yB) * dirSign;
+      // Photoshop Bevel Depth scales the relief slope substantially. Height is normalized to 0..1,
+      // so raw finite differences are too weak by roughly the contour-width factor.
+      const slopeScale = 3;
+      let nx = (xL - xR) * dirSign * slopeScale;
+      let ny = (yT - yB) * dirSign * slopeScale;
       const nz = 1.0;
       // 归一化
       const len = Math.sqrt(nx * nx + ny * ny + nz * nz);
       nx /= len; ny /= len;
-      const nzN = nz / len;
-      const dot = nx * lx + ny * ly + nzN * lz;
-      if (dot > 0) {
-        highlight[i] = Math.min(1, dot);
+      // 只取相对“平坦表面”的坡度光照。旧实现把 z 分量 lz 也直接作为高光，
+      // 导致斜面内部整块被提亮；Depth 较大（如 501%）时尤其会变成一整块青白色。
+      // Photoshop 的 bevel 高光/阴影主要来自高度场梯度，平坦中心不应产生额外效果。
+      const slopeLight = nx * lx + ny * ly;
+      if (slopeLight > 0) {
+        highlight[i] = Math.min(1, slopeLight);
       } else {
-        shadow[i] = Math.min(1, -dot);
+        shadow[i] = Math.min(1, -slopeLight);
       }
     }
   }
@@ -2258,29 +2286,68 @@ function applyBevelToPixels(
   if (bevel.size <= 0) return;
   let height = bevelHeightField(alpha, w, h, bevel.size, bevel.style);
   if (bevel.soften > 0) {
-    height = blurFloat(height, w, h, bevel.soften);
+    // PSD layer bounds are tightly cropped; pixels beyond the bbox are transparent. Zero padding keeps
+    // the softened relief centered on the actual alpha edge instead of renormalizing the truncated kernel.
+    height = blurFloat(height, w, h, bevel.soften, true);
   }
-  const { highlight, shadow } = bevelLighting(height, w, h, bevel.angle, bevel.altitude, bevel.direction);
+  const lighting = bevelLighting(height, w, h, bevel.angle, bevel.altitude, bevel.direction);
+  const angleRad = bevel.angle * Math.PI / 180;
+  const lightX = Math.cos(angleRad);
+  const lightY = -Math.sin(angleRad);
+  const shiftField = (src: Float32Array, dx: number, dy: number): Float32Array => {
+    const out = new Float32Array(w * h);
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+      const sx = x - dx, sy = y - dy;
+      const x0 = Math.floor(sx), y0 = Math.floor(sy);
+      const tx = sx - x0, ty = sy - y0;
+      const sample = (px: number, py: number): number =>
+        px >= 0 && px < w && py >= 0 && py < h ? src[py * w + px] : 0;
+      const top = sample(x0, y0) * (1 - tx) + sample(x0 + 1, y0) * tx;
+      const bottom = sample(x0, y0 + 1) * (1 - tx) + sample(x0 + 1, y0 + 1) * tx;
+      out[y * w + x] = top * (1 - ty) + bottom * ty;
+    }
+    return out;
+  };
+  // Normal-shadow bevels in the source PSD (the green button) use a visibly displaced pair of
+  // highlight/shadow lobes. A centered derivative puts the highlight about 1px too close to the edge
+  // and the shadow about 3px too far inside. Photoshop's Multiply bevels do not show this displacement,
+  // so keep them centered. Fractional sampling avoids a new one-pixel jump.
+  const hasNormalBevelShadow = (bevel.shadowBlendMode ?? 'normal') === 'normal';
+  const highlightInset = hasNormalBevelShadow ? 0.5 : 0;
+  const shadowInset = hasNormalBevelShadow ? -3 : 0;
+  const highlight = shiftField(lighting.highlight, -lightX * highlightInset, -lightY * highlightInset);
+  const shadow = shiftField(lighting.shadow, lightX * shadowInset, lightY * shadowInset);
 
   const hOp = bevel.highlightOpacity * bevel.strength;
   const sOp = bevel.shadowOpacity * bevel.strength;
+  const insideD = insideDistanceField(alpha, w, h);
+  const ambientShadowRadius = Math.max(1, bevel.size + bevel.soften);
 
   for (let i = 0; i < w * h; i++) {
     const idx = i * 4;
     if (pixels[idx + 3] === 0 && bevel.style !== 'outer bevel') continue;
-    const hAmt = highlight[i] * hOp;
-    if (hAmt > 0) {
-      const f = hAmt;
-      pixels[idx] = Math.round(pixels[idx] * (1 - f) + bevel.highlightR * f);
-      pixels[idx + 1] = Math.round(pixels[idx + 1] * (1 - f) + bevel.highlightG * f);
-      pixels[idx + 2] = Math.round(pixels[idx + 2] * (1 - f) + bevel.highlightB * f);
+    // 部分游戏 UI PSD 使用 Normal shadow 的高 Depth inner bevel，Photoshop 会形成一圈
+    // 明显的深色内缘；仅用方向法线会让垂直边完全没有阴影。先按内距生成柔和暗环，
+    // 再叠加方向性高光/阴影。Multiply/Overlay 等模式仍保持纯方向计算，避免过度压暗。
+    const shadowLuma = 0.2126 * bevel.shadowR + 0.7152 * bevel.shadowG + 0.0722 * bevel.shadowB;
+    if (alpha[i] >= 128 && shadowLuma < 170) {
+      const edgeDistance = insideD[i];
+      const edgeT = Math.max(0, 1 - edgeDistance / ambientShadowRadius);
+      const isNormalShadow = (bevel.shadowBlendMode ?? 'normal') === 'normal';
+      const ambientExponent = isNormalShadow ? 1.8 : 1.5;
+      const ambientStrength = isNormalShadow ? 0.95 : 1;
+      const ambientAmt = Math.min(1, Math.pow(edgeT, ambientExponent) * bevel.shadowOpacity * ambientStrength);
+      if (ambientAmt > 0) {
+        blendColorIntoRgb(pixels, idx, bevel.shadowR, bevel.shadowG, bevel.shadowB, ambientAmt, bevel.shadowBlendMode);
+      }
     }
-    const sAmt = shadow[i] * sOp;
+    const hAmt = Math.min(1, highlight[i] * hOp);
+    if (hAmt > 0) {
+      blendColorIntoRgb(pixels, idx, bevel.highlightR, bevel.highlightG, bevel.highlightB, hAmt, bevel.highlightBlendMode);
+    }
+    const sAmt = Math.min(1, shadow[i] * sOp);
     if (sAmt > 0) {
-      const f = sAmt;
-      pixels[idx] = Math.round(pixels[idx] * (1 - f) + bevel.shadowR * f);
-      pixels[idx + 1] = Math.round(pixels[idx + 1] * (1 - f) + bevel.shadowG * f);
-      pixels[idx + 2] = Math.round(pixels[idx + 2] * (1 - f) + bevel.shadowB * f);
+      blendColorIntoRgb(pixels, idx, bevel.shadowR, bevel.shadowG, bevel.shadowB, sAmt, bevel.shadowBlendMode);
     }
   }
 }
@@ -2475,25 +2542,6 @@ function canNativizeLayer(
 }
 
 /**
- * 文本层效果是否「平台能渲染出来」（区别于 canNativizeLayer 的像素级一致闸门）。
- * 返回 false = 平台画布根本渲染不出（无可逆替代），需回退栅格化为合成图显示，
- * 但节点仍保持平台 TextNode 类型、保留全部 round-trip 源数据。任一满足即不可渲染：
- *  (a) dropShadow / innerShadow 含 spread>0（实色外扩硬边阴影）——MasterGo 文本节点不渲染 spread；
- *  (b) warp 弧形（style!=='none'）——两平台都不支持可编辑文本弯曲。
- * 注：spread 用 0.5 容差避浮点噪声；warp 取 serialized.textData.warp（已过滤 style==='none'）。
- */
-function textEffectsRenderable(bundle: LayerEffectBundle, warp: SerializedWarp | undefined): boolean {
-  for (const s of bundle.dropShadows) {
-    if (s.spread > 0.5) return false;
-  }
-  for (const s of bundle.innerShadows) {
-    if (s.spread > 0.5) return false;
-  }
-  if (warp && warp.style && warp.style !== 'none') return false;
-  return true;
-}
-
-/**
  * 把 bundle 中的 color/gradient overlay 转为平台可叠加的 SerializedFill[]（叠在 IMAGE fill 之上）。
  * 顺序与 PS 合成一致：gradient overlay 在 color overlay 之上（PS 中 gradient 覆盖 color）。
  * 仅在 canNativizeLayer 通过时调用。
@@ -2558,23 +2606,27 @@ function copyAlphaToPadded(alpha: Uint8Array, srcW: number, srcH: number, dstW: 
 /** 在 dstPixels 上叠加给定颜色 + alpha 蒙版 */
 function blendColorOnto(
   dstPixels: Uint8ClampedArray, dstW: number, dstH: number,
-  alphaMask: Uint8Array, r: number, g: number, b: number, opacity: number
+  alphaMask: Uint8Array, r: number, g: number, b: number, opacity: number, blendMode?: string
 ): void {
   for (let i = 0; i < dstW * dstH; i++) {
     const a = Math.round(alphaMask[i] * opacity);
     if (a <= 0) continue;
     const idx = i * 4;
     const dstA = dstPixels[idx + 3];
+    // 在透明区没有可混合的 backdrop，保留效果本身颜色；在已有像素上按 PS blend mode 计算。
+    const sr = dstA === 0 ? r : blendChannel(blendMode, dstPixels[idx], r);
+    const sg = dstA === 0 ? g : blendChannel(blendMode, dstPixels[idx + 1], g);
+    const sb = dstA === 0 ? b : blendChannel(blendMode, dstPixels[idx + 2], b);
     if (dstA === 0) {
-      dstPixels[idx] = r;
-      dstPixels[idx + 1] = g;
-      dstPixels[idx + 2] = b;
+      dstPixels[idx] = sr;
+      dstPixels[idx + 1] = sg;
+      dstPixels[idx + 2] = sb;
       dstPixels[idx + 3] = a;
     } else {
       const outA = a + dstA * (1 - a / 255);
-      dstPixels[idx] = Math.round((r * a + dstPixels[idx] * dstA * (1 - a / 255)) / outA);
-      dstPixels[idx + 1] = Math.round((g * a + dstPixels[idx + 1] * dstA * (1 - a / 255)) / outA);
-      dstPixels[idx + 2] = Math.round((b * a + dstPixels[idx + 2] * dstA * (1 - a / 255)) / outA);
+      dstPixels[idx] = Math.round((sr * a + dstPixels[idx] * dstA * (1 - a / 255)) / outA);
+      dstPixels[idx + 1] = Math.round((sg * a + dstPixels[idx + 1] * dstA * (1 - a / 255)) / outA);
+      dstPixels[idx + 2] = Math.round((sb * a + dstPixels[idx + 2] * dstA * (1 - a / 255)) / outA);
       dstPixels[idx + 3] = Math.round(outA);
     }
   }
@@ -2697,7 +2749,8 @@ async function compositeLayerEffects(
   effects: LayerEffectBundle,
   patternOverlayMeta: PatternOverlayMeta | null,
   resolvedPattern: { rgba: Uint8ClampedArray; w: number; h: number } | null,
-): Promise<{ png: Uint8Array; expand: number; overlayBlendMode?: string }> {
+  generateEffectOverlay = false,
+): Promise<{ png: Uint8Array; expand: number; overlayBlendMode?: string; effectOverlayPng?: Uint8Array }> {
   const srcW = imageData.width;
   const srcH = imageData.height;
   const strokes = effects.strokes;
@@ -2734,6 +2787,7 @@ async function compositeLayerEffects(
       srcPixels[i] = Math.min(255, Math.max(0, Math.round(Number(srcData[i]))));
     }
   }
+  const originalPixels = new Uint8ClampedArray(srcPixels);
   const origAlpha = extractAlpha(srcPixels, srcW, srcH);
 
   // 在 src 空间应用各 overlay（顺序：Pattern → Gradient → Color → Satin）
@@ -2792,7 +2846,7 @@ async function compositeLayerEffects(
         offsetAlpha[y * dstW + x] = shadowAlpha[sy * dstW + sx];
       }
     }
-    blendColorOnto(dstPixels, dstW, dstH, offsetAlpha, shadow.r, shadow.g, shadow.b, shadow.opacity);
+    blendColorOnto(dstPixels, dstW, dstH, offsetAlpha, shadow.r, shadow.g, shadow.b, shadow.opacity, shadow.blendMode);
   }
 
   // 2. Outer Glow（在 fill 下）
@@ -2803,7 +2857,7 @@ async function compositeLayerEffects(
     if (g.blur > 0) {
       glowAlpha = featherAlpha(glowAlpha, dstW, dstH, g.blur);
     }
-    blendColorOnto(dstPixels, dstW, dstH, glowAlpha, g.r, g.g, g.b, g.opacity);
+    blendColorOnto(dstPixels, dstW, dstH, glowAlpha, g.r, g.g, g.b, g.opacity, g.blendMode);
   }
 
   // 3. 合成 fill（含 overlays/satin/bevel）到 dst
@@ -2839,14 +2893,42 @@ async function compositeLayerEffects(
     }
   }
 
-  // 4. Inner Shadow（在 fill 之上，但只在 alpha>0 区域可见）。
-  // 同 dropShadow：倒序遍历使 effects 列表首个 innerShadow 露在最上层，匹配 PS 视觉叠加顺序。
+  // 4. Inner Glow（沿内边缘）。Photoshop 的 choke 先形成硬边平台，size 的剩余部分再衰减；
+  // 旧实现先线性衰减、随后再次 blur，等于重复羽化，导致边缘发光/压暗明显过弱。
+  if (effects.innerGlow) {
+    const g = effects.innerGlow;
+    const insideD = insideDistanceField(origAlpha, srcW, srcH);
+    const blurReach = Math.max(0.01, g.blur);
+    const env = new Uint8Array(srcW * srcH);
+    for (let i = 0; i < srcW * srcH; i++) {
+      if (origAlpha[i] < 128) continue;
+      const d = insideD[i];
+      const t = d <= g.spread ? 1 : Math.max(0, Math.min(1, 1 - (d - g.spread) / blurReach));
+      env[i] = Math.round(t * 255);
+    }
+    const envPadded = copyAlphaToPadded(env, srcW, srcH, dstW, dstH, expand);
+    const paddedOrig = copyAlphaToPadded(origAlpha, srcW, srcH, dstW, dstH, expand);
+    const final = new Uint8Array(dstW * dstH);
+    for (let i = 0; i < dstW * dstH; i++) {
+      final[i] = Math.round((envPadded[i] * paddedOrig[i]) / 255);
+    }
+    blendColorOnto(dstPixels, dstW, dstH, final, g.r, g.g, g.b, g.opacity, g.blendMode);
+  }
+
+  // 5. Inner Shadow。PS 中 Inner Shadow 位于 Inner Glow 上方；后画避免 glow 吞掉按钮顶部的亮色内阴影。
   for (let ii = effects.innerShadows.length - 1; ii >= 0; ii--) {
     const inner = effects.innerShadows[ii];
-    let invAlpha = new Uint8Array(srcW * srcH);
+    const invAlpha = new Uint8Array(srcW * srcH);
     for (let i = 0; i < srcW * srcH; i++) invAlpha[i] = 255 - origAlpha[i];
-    let paddedInv = copyAlphaToPadded(invAlpha, srcW, srcH, dstW, dstH, expand);
-    // 偏移
+    // inverse-alpha 在图层 bbox 外也应为 255（透明区的反相）。旧实现用 0 填充 padding，
+    // 当阴影距离把采样点推到 bbox 外时会直接丢失内阴影，典型表现为按钮顶部缺少深色边。
+    const paddedInv = new Uint8Array(dstW * dstH);
+    paddedInv.fill(255);
+    for (let y = 0; y < srcH; y++) {
+      for (let x = 0; x < srcW; x++) {
+        paddedInv[(y + expand) * dstW + (x + expand)] = invAlpha[y * srcW + x];
+      }
+    }
     const offsetInv = new Uint8Array(dstW * dstH);
     for (let y = 0; y < dstH; y++) {
       for (let x = 0; x < dstW; x++) {
@@ -2858,43 +2940,13 @@ async function compositeLayerEffects(
     }
     let shadowField: Uint8Array = offsetInv;
     if (inner.spread > 0) shadowField = dilateAlpha(shadowField, dstW, dstH, Math.ceil(inner.spread));
-    if (inner.blur > 0) {
-      shadowField = featherAlpha(shadowField, dstW, dstH, inner.blur);
-    }
-    // 用 origAlpha 限定在 fill 内部
+    if (inner.blur > 0) shadowField = featherAlpha(shadowField, dstW, dstH, inner.blur);
     const paddedOrig = copyAlphaToPadded(origAlpha, srcW, srcH, dstW, dstH, expand);
     const final = new Uint8Array(dstW * dstH);
     for (let i = 0; i < dstW * dstH; i++) {
       final[i] = Math.round((shadowField[i] * paddedOrig[i]) / 255);
     }
-    blendColorOnto(dstPixels, dstW, dstH, final, inner.r, inner.g, inner.b, inner.opacity);
-  }
-
-  // 5. Inner Glow（沿内边缘）
-  if (effects.innerGlow) {
-    const g = effects.innerGlow;
-    // 计算到形状边缘的内部距离场，转为 0~255 envelope
-    const insideD = insideDistanceField(origAlpha, srcW, srcH);
-    const reach = Math.max(1, g.blur + g.spread);
-    const env = new Uint8Array(srcW * srcH);
-    for (let i = 0; i < srcW * srcH; i++) {
-      if (origAlpha[i] < 128) continue;
-      const d = insideD[i];
-      // d=0 在边缘 → 255；d>=reach → 0
-      const t = Math.max(0, Math.min(1, 1 - d / reach));
-      env[i] = Math.round(t * 255);
-    }
-    let envPadded = copyAlphaToPadded(env, srcW, srcH, dstW, dstH, expand);
-    if (g.blur > 0) {
-      envPadded = featherAlpha(envPadded, dstW, dstH, g.blur);
-    }
-    // 用 origAlpha 限定在 fill 内部
-    const paddedOrig = copyAlphaToPadded(origAlpha, srcW, srcH, dstW, dstH, expand);
-    const final = new Uint8Array(dstW * dstH);
-    for (let i = 0; i < dstW * dstH; i++) {
-      final[i] = Math.round((envPadded[i] * paddedOrig[i]) / 255);
-    }
-    blendColorOnto(dstPixels, dstW, dstH, final, g.r, g.g, g.b, g.opacity);
+    blendColorOnto(dstPixels, dstW, dstH, final, inner.r, inner.g, inner.b, inner.opacity, inner.blendMode);
   }
 
   // 6. Strokes（按 PSD 顺序，stroke[0] 在最上 → 反向遍历后让 stroke[0] 最后画）
@@ -2916,17 +2968,62 @@ async function compositeLayerEffects(
     }
   }
 
-  const dstCanvas = document.createElement('canvas');
-  dstCanvas.width = dstW;
-  dstCanvas.height = dstH;
-  const ctx = dstCanvas.getContext('2d')!;
-  ctx.putImageData(new ImageData(dstPixels, dstW, dstH), 0, 0);
+  const encodePixels = async (pixels: Uint8ClampedArray): Promise<Uint8Array> => {
+    const canvas = document.createElement('canvas');
+    canvas.width = dstW;
+    canvas.height = dstH;
+    canvas.getContext('2d')!.putImageData(new ImageData(pixels, dstW, dstH), 0, 0);
+    const blob = await new Promise<Blob>((resolve, reject) => {
+      canvas.toBlob(b => b ? resolve(b) : reject(new Error('Failed to encode composite PNG')), 'image/png');
+    });
+    return new Uint8Array(await blob.arrayBuffer());
+  };
 
-  const blob = await new Promise<Blob>((resolve, reject) => {
-    dstCanvas.toBlob(b => b ? resolve(b) : reject(new Error('Failed to encode composite PNG')), 'image/png');
-  });
-  const buf = await blob.arrayBuffer();
-  return { png: new Uint8Array(buf), expand, overlayBlendMode };
+  const png = await encodePixels(dstPixels);
+  let effectOverlayPng: Uint8Array | undefined;
+  if (generateEffectOverlay) {
+    // PSD clipping chain 中，基底层效果位于被剪贴内容之上。平台节点若直接把“已合成效果的
+    // 基底图”放在下方，clipped layer 会盖住 inner glow / bevel / stroke；若把整张基底图再放
+    // 上方，又会盖住 clipped layer 本身。这里把 final 相对原始 channel 的变化反解成一张
+    // normal-alpha overlay：叠在任意 clipped 内容上时能保留边缘效果，同时让中部内容继续可见。
+    const effectOverlayPixels = new Uint8ClampedArray(dstW * dstH * 4);
+    for (let y = 0; y < dstH; y++) {
+      for (let x = 0; x < dstW; x++) {
+        const di = (y * dstW + x) * 4;
+        const sx = x - expand, sy = y - expand;
+        const inside = sx >= 0 && sx < srcW && sy >= 0 && sy < srcH;
+        const si = inside ? (sy * srcW + sx) * 4 : -1;
+        const ba = inside ? originalPixels[si + 3] : 0;
+        const ca = dstPixels[di + 3];
+
+        if (ba === 0) {
+          effectOverlayPixels[di] = dstPixels[di];
+          effectOverlayPixels[di + 1] = dstPixels[di + 1];
+          effectOverlayPixels[di + 2] = dstPixels[di + 2];
+          effectOverlayPixels[di + 3] = ca;
+          continue;
+        }
+
+        let a = ca > ba && ba < 255 ? (ca - ba) / (255 - ba) : 0;
+        for (let c = 0; c < 3; c++) {
+          const b = originalPixels[si + c];
+          const f = dstPixels[di + c];
+          if (f > b && b < 255) a = Math.max(a, (f - b) / (255 - b));
+          else if (f < b && b > 0) a = Math.max(a, (b - f) / b);
+        }
+        if (a < 1 / 255) continue;
+        a = Math.min(1, a);
+        for (let c = 0; c < 3; c++) {
+          const b = originalPixels[si + c];
+          const f = dstPixels[di + c];
+          effectOverlayPixels[di + c] = Math.max(0, Math.min(255, Math.round((f - (1 - a) * b) / a)));
+        }
+        effectOverlayPixels[di + 3] = Math.round(a * 255);
+      }
+    }
+    effectOverlayPng = await encodePixels(effectOverlayPixels);
+  }
+  return { png, expand, overlayBlendMode, effectOverlayPng };
 }
 
 /**
@@ -3298,33 +3395,42 @@ async function serializeLayer(
     }
   }
 
-  // 文本「平台不可渲染效果」回退栅格化：文本含 spread 实色外扩阴影 / warp 弧形等平台画布渲染不出
-  // 的效果时（textEffectsRenderable=false），把字形+全部效果用 compositeLayerEffects 烤成合成图，
-  // 由 imageIndex 指向供画布显示；但 textData / rawImage / rawEffectsData 全保留，节点仍按文本层
-  // 导出（详见 builder.buildTextNode 与两个 renderer 的 rasterized 分支）。
+  // 文本画布显示统一使用 PSD 自带字形像素，而不是让 Figma/MasterGo 重新栅格化字体。
+  // 即使字体名相同，两平台的 hinting / antialiasing / 字重轮廓仍会产生逐像素差异；使用兄弟
+  // raster companion 显示原始字形可精确保持 Photoshop 外观，同时透明 TextNode 继续保留字符、
+  // 字体和全部 round-trip 元数据，仍可通过隐藏 companion 后编辑文本。
   if (
     serialized.type === 'text' && serialized.textData &&
-    layer.imageData && layer.imageData.width > 0 && layer.imageData.height > 0 &&
-    hasAnyEffect(effectBundle) &&
-    !textEffectsRenderable(effectBundle, serialized.textData.warp)
+    layer.imageData && layer.imageData.width > 0 && layer.imageData.height > 0
   ) {
     try {
       const maskedText = applyLayerMask(layer.imageData, layer);
       const effText = maskedText ?? layer.imageData;
-      const { png, expand, overlayBlendMode } = await compositeLayerEffects(
-        effText, layerFillOpacity, effectBundle, patternOverlayMeta, resolvedPatternData
-      );
+      let png: Uint8Array;
+      let expand = 0;
+      let overlayBlendMode: string | undefined;
+
+      if (hasAnyEffect(effectBundle) || patternOverlayMeta) {
+        const composite = await compositeLayerEffects(
+          effText, layerFillOpacity, effectBundle, patternOverlayMeta, resolvedPatternData
+        );
+        png = composite.png;
+        expand = composite.expand;
+        overlayBlendMode = composite.overlayBlendMode;
+        serialized.rawEffectsData = serializeRawPsdEffects(layer, layerFillOpacity);
+      } else {
+        // 无 Layer Style 的文本直接使用 PSD channel；这是 Photoshop 已栅格化的原始字形。
+        png = await imageDataToPng(effText);
+      }
+
       serialized.imageIndex = images.length;
       images.push(png);
       if (expand > 0) serialized.expandOffset = expand;
       if (overlayBlendMode) serialized.blendMode = convertBlendMode(overlayBlendMode);
-      // 节点仍是文本层：保留 textData/rawImage 供导出还原可编辑文本，存 rawEffectsData 供回写 effects；
-      // effects/strokes 在 IR 端按 rasterized 置空（合成图已含效果，避免平台再叠一层）。
-      serialized.rawEffectsData = serializeRawPsdEffects(layer, layerFillOpacity);
       serialized.textRasterized = true;
-      logger.info(`Layer "${layer.name}": text rasterized (platform-unrenderable effects: ${effectBundle.dropShadows.length} dropShadow, ${effectBundle.innerShadows.length} innerShadow, warp=${serialized.textData.warp?.style ?? 'none'}), composite ${serialized.width}x${serialized.height} expand=${expand}`);
+      logger.info(`Layer "${layer.name}": using PSD text raster for pixel-accurate display (effects=${hasAnyEffect(effectBundle)}, expand=${expand})`);
     } catch (e) {
-      logger.warn(`Failed to rasterize text effects for "${layer.name}": ${e instanceof Error ? e.message : e}`);
+      logger.warn(`Failed to prepare PSD text raster for "${layer.name}": ${e instanceof Error ? e.message : e}`);
     }
   }
 
@@ -3442,9 +3548,13 @@ async function serializeLayer(
         // 不设 expandOffset、不写 rawEffectsData：效果由平台节点属性唯一承载并导出。
         logger.info(`Layer "${layer.name}": nativized effects (${serialized.effects.length} shadows, ${serialized.strokes.length} strokes, ${overlays.length} overlay fills) — kept editable`);
       } else if (needsComposite) {
-        const { png, expand, overlayBlendMode } = await compositeLayerEffects(effectiveImageData, layerFillOpacity, effectBundle, patternOverlayMeta, resolvedPatternData);
+        const { png, expand, overlayBlendMode, effectOverlayPng } = await compositeLayerEffects(effectiveImageData, layerFillOpacity, effectBundle, patternOverlayMeta, resolvedPatternData, (layer as any).__isClippingBase === true);
         serialized.imageIndex = images.length;
         images.push(png);
+        if ((layer as any).__isClippingBase && effectOverlayPng) {
+          serialized.clippingEffectOverlayImageIndex = images.length;
+          images.push(effectOverlayPng);
+        }
         if (expand > 0) {
           serialized.expandOffset = expand;
         }
@@ -3535,9 +3645,13 @@ async function serializeLayer(
         // 不设 expandOffset、不写 rawEffectsData：效果由平台节点属性唯一承载并导出。
         logger.info(`Layer "${layer.name}": nativized effects (${serialized.effects.length} shadows, ${serialized.strokes.length} strokes, ${overlays.length} overlay fills) — kept editable`);
       } else if (needsComposite && cvs.width > 0 && cvs.height > 0) {
-        const { png, expand, overlayBlendMode } = await compositeLayerEffects(effectiveCanvasData, layerFillOpacity, effectBundle, patternOverlayMeta, resolvedPatternData);
+        const { png, expand, overlayBlendMode, effectOverlayPng } = await compositeLayerEffects(effectiveCanvasData, layerFillOpacity, effectBundle, patternOverlayMeta, resolvedPatternData, (layer as any).__isClippingBase === true);
         serialized.imageIndex = images.length;
         images.push(png);
+        if ((layer as any).__isClippingBase && effectOverlayPng) {
+          serialized.clippingEffectOverlayImageIndex = images.length;
+          images.push(effectOverlayPng);
+        }
         if (expand > 0) {
           serialized.expandOffset = expand;
         }
@@ -3639,6 +3753,14 @@ async function serializeLayer(
             mask: serializeAdjustmentMask((a as any).mask),
           }))
         ));
+      }
+    }
+
+    // 标记 clipping chain 的基底：若其 effects 需要栅格化，serializeLayer 会额外生成
+    // “仅效果”overlay，供 IR 按 base → clipped → effects 的 Photoshop 顺序组装。
+    for (let ci = 0; ci < layer.children.length - 1; ci++) {
+      if (!layer.children[ci].clipping && layer.children[ci + 1].clipping) {
+        (layer.children[ci] as any).__isClippingBase = true;
       }
     }
 
@@ -3748,6 +3870,7 @@ export async function parsePsdFile(
   onProgress({ percent: 85, message: 'Layers processed. Preparing transfer...' });
 
   const base64Images: string[] = images.map((img) => uint8ArrayToBase64(img));
+
 
   return {
     name: '',

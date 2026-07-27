@@ -4,7 +4,7 @@
 
 [使用说明](#使用说明) · [导出 PSD](#导出-psd) · [配合 9-Slice 插件](#配合-9-slice-插件) · [开发说明](#开发说明) · [更新历史](#更新历史)
 
-当前版本：`v1.6.2`
+当前版本：`v1.6.3`
 
 ## 功能特性
 
@@ -168,6 +168,13 @@ npm run watch      # 监听文件变化
 > 插件采用 IR（中间表示）架构：`parser → IR → platform renderer` 用于导入，`node-serializer → psd-builder` 用于导出。新增设计平台只需在 `src/platform/` 下实现 `PlatformRenderer` 接口。
 
 ## 更新历史
+
+### v1.6.3
+
+- 修复 PSD 剪贴蒙版：蒙版使用效果合成前的原始 channel alpha，避免 outer glow / outside stroke 撑大裁剪轮廓。
+- 剪贴蒙版基底层效果改为叠加图，还原 Photoshop 的 base content → clipped content → base effects 顺序；辅助节点导出时自动跳过。
+- 改进图层效果栅格化：支持阴影/发光/斜面的 blend mode，修正 bevel Depth、内外斜面定位、inner glow choke 与 inner shadow 边界填充等问题。
+- 文本层画布显示统一使用 PSD 原始字形像素，保留可编辑 TextNode 与 round-trip 元数据。
 
 ### v1.6.2
 

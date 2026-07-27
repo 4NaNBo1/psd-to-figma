@@ -901,10 +901,12 @@ async function serializeNode(
     onLog('warn', `Skipping "${node.name}": exceeded max nesting depth`);
     return null;
   }
-  // 栅格化文本的合成图兄弟 rectangle（renderer 创建，仅用于画布显示）：导出时跳过，
-  // 由同位置的透明占位 TextNode 导出为文本层（含 rawImage 字形 + rawEffects 还原 spread 阴影/warp）。
+  // 导入器创建的显示辅助节点不属于原始 PSD 结构，导出时跳过：
+  // - psd_raster_companion：栅格化文本的显示图；
+  // - psd_import_helper：clipping base 的效果叠加图等通用辅助节点。
   try {
-    if (typeof node.getPluginData === 'function' && node.getPluginData('psd_raster_companion')) {
+    if (typeof node.getPluginData === 'function' &&
+      (node.getPluginData('psd_raster_companion') || node.getPluginData('psd_import_helper'))) {
       return null;
     }
   } catch { /* ignore */ }
