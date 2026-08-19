@@ -4,7 +4,7 @@
 
 [使用说明](#使用说明) · [导出 PSD](#导出-psd) · [配合 9-Slice 插件](#配合-9-slice-插件) · [开发说明](#开发说明) · [更新历史](#更新历史)
 
-当前版本：`v1.6.3`
+当前版本：`v1.6.4`
 
 ## 功能特性
 
@@ -168,6 +168,12 @@ npm run watch      # 监听文件变化
 > 插件采用 IR（中间表示）架构：`parser → IR → platform renderer` 用于导入，`node-serializer → psd-builder` 用于导出。新增设计平台只需在 `src/platform/` 下实现 `PlatformRenderer` 接口。
 
 ## 更新历史
+
+### v1.6.4
+
+- 修复 PSD 导出时 pass-through 叠加层烘焙范围：文本、矢量、椭圆及带图片填充的独立内容层不再被误当作穿透叠加层合成进基底层。
+- 仅当 pass-through 叠加层紧挨基底层之上时才执行烘焙，避免中间夹有独立内容层时误合成。
+- 修复图层效果（阴影/发光等）中 `pass through` 混合模式写入 ag-psd 报错的问题，round-trip 残留值递归降级为 `normal`。
 
 ### v1.6.3
 

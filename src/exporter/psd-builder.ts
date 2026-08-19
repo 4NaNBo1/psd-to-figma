@@ -26,7 +26,25 @@ const BLEND_MODE_MAP: Record<string, BlendMode> = {
 };
 
 function toBlendMode(mode: string): BlendMode {
-  return BLEND_MODE_MAP[mode] ?? 'normal';
+  const mapped = BLEND_MODE_MAP[mode] ?? 'normal';
+  // ag-psd 图层样式 descriptor 的 BlnM 不含 pass through（仅 layer record 支持），写回会抛错。
+  return mapped === 'pass through' ? 'normal' : mapped;
+}
+
+/** 递归清理 rawEffects 中残留的 pass through（round-trip 从 PSD 直读的值）。 */
+function sanitizeEffectBlendModes(obj: unknown): void {
+  if (!obj || typeof obj !== 'object') return;
+  if (Array.isArray(obj)) {
+    for (const item of obj) sanitizeEffectBlendModes(item);
+    return;
+  }
+  for (const [key, val] of Object.entries(obj as Record<string, unknown>)) {
+    if (key === 'blendMode' && val === 'pass through') {
+      (obj as Record<string, unknown>)[key] = 'normal';
+    } else if (val && typeof val === 'object') {
+      sanitizeEffectBlendModes(val);
+    }
+  }
 }
 
 function toRGBA(c: SerializedColor): { r: number; g: number; b: number; a: number } {
@@ -388,6 +406,7 @@ function buildEffects(node: ExportNodeData, availablePatternIds?: Set<string>): 
     if (isContainerNode && result.bevel) delete result.bevel;
     // 容器/文本早退路径也必须过滤悬空 patternOverlay，否则 Patt 资源缺失时 PS 无法保存。
     filterPatternOverlay(result, node, availablePatternIds);
+    sanitizeEffectBlendModes(result);
     return Object.keys(result).length > 0 ? result : undefined;
   }
 
@@ -490,6 +509,7 @@ function buildEffects(node: ExportNodeData, availablePatternIds?: Set<string>): 
   }
 
   filterPatternOverlay(result, node, availablePatternIds);
+  sanitizeEffectBlendModes(result);
 
   return Object.keys(result).length > 0 ? result : undefined;
 }

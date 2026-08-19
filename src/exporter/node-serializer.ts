@@ -73,6 +73,11 @@ function isNativePassThroughOverlay(data: ExportNodeData): boolean {
   ) {
     return false;
   }
+  // MasterGo/Figma 帧内子层默认 PASS_THROUGH；带 IMAGE/文本/矢量的独立内容层须各自导出，
+  // 不可当作穿透叠加层烘焙进基底层。
+  if (data.type === 'text') return false;
+  if (data.type === 'vector' || data.type === 'ellipse') return false;
+  if (data.fills?.some(f => f.type === 'IMAGE' && f.visible)) return false;
   return true;
 }
 
@@ -126,6 +131,8 @@ async function bakePassThroughOverlays(
     if (isNativePassThroughOverlay(children[i])) ptIndices.push(i);
   }
   if (ptIndices.length === 0) return;
+  // 叠加层须紧挨基底层（index=0）之上；中间夹了独立内容层时不烘焙，避免误合成。
+  if (ptIndices[0] !== 1) return;
 
   const firstPt = ptIndices[0];
   const bakeTarget = children[firstPt - 1];
