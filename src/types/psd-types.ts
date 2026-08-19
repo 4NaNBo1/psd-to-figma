@@ -298,6 +298,10 @@ export interface ExportFillInfo {
 
 export interface ExportStrokeInfo {
   color: SerializedColor;
+  /** 默认 SOLID；渐变描边为 GRADIENT_* */
+  fillType?: 'SOLID' | 'GRADIENT_LINEAR' | 'GRADIENT_RADIAL' | 'GRADIENT_ANGULAR' | 'GRADIENT_DIAMOND';
+  gradientStops?: { position: number; color: SerializedColor }[];
+  gradientAngle?: number;
   weight: number;
   align: 'INSIDE' | 'OUTSIDE' | 'CENTER';
   opacity: number;

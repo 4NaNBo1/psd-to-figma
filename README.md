@@ -4,7 +4,7 @@
 
 [使用说明](#使用说明) · [导出 PSD](#导出-psd) · [配合 9-Slice 插件](#配合-9-slice-插件) · [开发说明](#开发说明) · [更新历史](#更新历史)
 
-当前版本：`v1.6.4`
+当前版本：`v1.6.5`
 
 ## 功能特性
 
@@ -168,6 +168,11 @@ npm run watch      # 监听文件变化
 > 插件采用 IR（中间表示）架构：`parser → IR → platform renderer` 用于导入，`node-serializer → psd-builder` 用于导出。新增设计平台只需在 `src/platform/` 下实现 `PlatformRenderer` 接口。
 
 ## 更新历史
+
+### v1.6.5
+
+- 导出 PSD 时支持渐变描边：Figma / MasterGo 中的线性、径向、角度、菱形渐变描边会写入 PSD 图层效果的渐变 stroke。
+- 序列化描边时保留 `fillType`、`gradientStops` 与渐变角度，与纯色描边共用同一 stroke 权重与对齐方式。
 
 ### v1.6.4
 

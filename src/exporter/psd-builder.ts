@@ -497,15 +497,61 @@ function buildEffects(node: ExportNodeData, availablePatternIds?: Set<string>): 
   const suppressInheritedStroke = !!node.inheritedGroupStrokes && !rawEffects;
   const visibleStrokes = suppressInheritedStroke ? [] : node.strokes.filter(s => s.visible);
   if (visibleStrokes.length > 0) {
-    result.stroke = visibleStrokes.map(s => ({
-      enabled: true,
-      size: { units: 'Pixels' as const, value: s.weight },
-      position: s.align.toLowerCase() as 'inside' | 'center' | 'outside',
-      fillType: 'color' as const,
-      color: toRGBA(s.color),
-      opacity: s.opacity,
-      blendMode: 'normal' as BlendMode,
-    }));
+    result.stroke = visibleStrokes.map(s => {
+      const base = {
+        enabled: true,
+        present: true,
+        showInDialog: true,
+        size: { units: 'Pixels' as const, value: s.weight },
+        position: s.align.toLowerCase() as 'inside' | 'center' | 'outside',
+        opacity: s.opacity,
+        blendMode: 'normal' as BlendMode,
+      };
+
+      if (s.fillType && s.fillType !== 'SOLID' && s.gradientStops && s.gradientStops.length > 0) {
+        const colorStops: ColorStop[] = s.gradientStops.map(st => ({
+          color: toRGBA(st.color),
+          location: Math.round(st.position * 4096),
+          midpoint: 50,
+        }));
+        const opacityStops: OpacityStop[] = s.gradientStops.map(st => ({
+          opacity: st.color.a,
+          location: Math.round(st.position * 4096),
+          midpoint: 50,
+        }));
+        let gradStyle: 'linear' | 'radial' | 'angle' | 'reflected' | 'diamond' = 'linear';
+        if (s.fillType === 'GRADIENT_RADIAL') gradStyle = 'radial';
+        else if (s.fillType === 'GRADIENT_ANGULAR') gradStyle = 'angle';
+        else if (s.fillType === 'GRADIENT_DIAMOND') gradStyle = 'diamond';
+
+        return {
+          ...base,
+          fillType: 'gradient' as const,
+          color: toRGBA(s.color),
+          gradient: {
+            name: 'Custom',
+            type: 'solid' as const,
+            style: gradStyle,
+            angle: s.gradientAngle ?? 90,
+            reverse: false,
+            scale: 1,
+            align: true,
+            dither: false,
+            interpolationMethod: 'classic' as const,
+            smoothness: 1,
+            colorStops,
+            opacityStops,
+            offset: { x: 0, y: 0 },
+          },
+        };
+      }
+
+      return {
+        ...base,
+        fillType: 'color' as const,
+        color: toRGBA(s.color),
+      };
+    });
   }
 
   filterPatternOverlay(result, node, availablePatternIds);

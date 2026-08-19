@@ -405,21 +405,57 @@ function extractStrokes(node: any): ExportStrokeInfo[] {
   const strokes = node.strokes;
   if (!strokes || isMixed(strokes) || !Array.isArray(strokes)) return [];
   const weight = isMixed(node.strokeWeight) ? 1 : (node.strokeWeight ?? 1);
+  const align = node.strokeAlign ?? 'INSIDE';
   const result: ExportStrokeInfo[] = [];
   for (const stroke of strokes) {
-    if (stroke.type !== 'SOLID' || stroke.visible === false) continue;
-    result.push({
-      color: {
-        r: stroke.color?.r ?? 0,
-        g: stroke.color?.g ?? 0,
-        b: stroke.color?.b ?? 0,
-        a: stroke.opacity ?? 1,
-      },
-      weight,
-      align: node.strokeAlign ?? 'INSIDE',
-      opacity: stroke.opacity ?? 1,
-      visible: true,
-    });
+    if (stroke.visible === false || stroke.isVisible === false) continue;
+
+    if (stroke.type === 'SOLID') {
+      result.push({
+        fillType: 'SOLID',
+        color: {
+          r: stroke.color?.r ?? 0,
+          g: stroke.color?.g ?? 0,
+          b: stroke.color?.b ?? 0,
+          a: stroke.opacity ?? stroke.alpha ?? 1,
+        },
+        weight,
+        align,
+        opacity: stroke.opacity ?? stroke.alpha ?? 1,
+        visible: true,
+      });
+      continue;
+    }
+
+    if (typeof stroke.type === 'string' && stroke.type.startsWith('GRADIENT_')) {
+      const stops = (stroke.gradientStops ?? []).map((s: any) => ({
+        position: s.position,
+        color: {
+          r: s.color?.r ?? 0,
+          g: s.color?.g ?? 0,
+          b: s.color?.b ?? 0,
+          a: s.color?.a ?? stroke.opacity ?? stroke.alpha ?? 1,
+        },
+      }));
+      if (stops.length === 0) continue;
+
+      let gradientAngle = 90;
+      if (stroke.gradientTransform) {
+        const [[a]] = stroke.gradientTransform as [[number, number, number], [number, number, number]];
+        gradientAngle = Math.atan2(a, 1) * (180 / Math.PI);
+      }
+
+      result.push({
+        fillType: stroke.type as ExportStrokeInfo['fillType'],
+        color: stops[0].color,
+        gradientStops: stops,
+        gradientAngle,
+        weight,
+        align,
+        opacity: stroke.opacity ?? stroke.alpha ?? 1,
+        visible: true,
+      });
+    }
   }
   return result;
 }
