@@ -205,6 +205,141 @@ function centerCropCanvas(source: HTMLCanvasElement, targetW: number, targetH: n
   return cropped;
 }
 
+/** 为「仅图层样式、无栅格像素」的矩形生成白色圆角形状蒙版，供 PS Color Overlay / Stroke 叠加。 */
+function createRoundedRectShapeCanvas(
+  width: number,
+  height: number,
+  radii?: { topLeft: number; topRight: number; bottomLeft: number; bottomRight: number },
+): HTMLCanvasElement {
+  const w = Math.max(1, Math.round(width));
+  const h = Math.max(1, Math.round(height));
+  const canvas = document.createElement('canvas');
+  canvas.width = w;
+  canvas.height = h;
+  const ctx = canvas.getContext('2d')!;
+  const tl = Math.min(radii?.topLeft ?? 0, w / 2, h / 2);
+  const tr = Math.min(radii?.topRight ?? 0, w / 2, h / 2);
+  const bl = Math.min(radii?.bottomLeft ?? 0, w / 2, h / 2);
+  const br = Math.min(radii?.bottomRight ?? 0, w / 2, h / 2);
+  ctx.beginPath();
+  ctx.moveTo(tl, 0);
+  ctx.lineTo(w - tr, 0);
+  ctx.arcTo(w, 0, w, tr, tr);
+  ctx.lineTo(w, h - br);
+  ctx.arcTo(w, h, w - br, h, br);
+  ctx.lineTo(bl, h);
+  ctx.arcTo(0, h, 0, h - bl, bl);
+  ctx.lineTo(0, tl);
+  ctx.arcTo(0, 0, tl, 0, tl);
+  ctx.closePath();
+  ctx.fillStyle = '#ffffff';
+  ctx.fill();
+  return canvas;
+}
+
+function pxUnits(value: number): { value: number; units: 'Pixels' } {
+  return { value, units: 'Pixels' };
+}
+
+/** PS 圆角矩形 vectorMask：8 knot 顺时针，控制点与 keyOriginRRectRadii 一致（对照真实 PSD shape 层推导）。 */
+function buildRoundedRectVectorMask(
+  left: number,
+  top: number,
+  right: number,
+  bottom: number,
+  radii: { topLeft: number; topRight: number; bottomLeft: number; bottomRight: number },
+) {
+  const maxW = (right - left) / 2;
+  const maxH = (bottom - top) / 2;
+  const tl = Math.min(radii.topLeft, maxW, maxH);
+  const tr = Math.min(radii.topRight, maxW, maxH);
+  const br = Math.min(radii.bottomRight, maxW, maxH);
+  const bl = Math.min(radii.bottomLeft, maxW, maxH);
+  const k = 0.5522847498;
+  const knot = (points: [number, number, number, number, number, number]) => ({ linked: true, points });
+
+  return {
+    paths: [{
+      open: false,
+      fillRule: 'even-odd' as const,
+      operation: 'combine' as const,
+      knots: [
+        knot([left + tl * (1 - k), top, left + tl, top, left + tl, top]),
+        knot([right - tr, top, right - tr, top, right - tr * (1 - k), top]),
+        knot([right, top + tr * (1 - k), right, top + tr, right, top + tr]),
+        knot([right, bottom - br, right, bottom - br, right, bottom - br * (1 - k)]),
+        knot([right - br * (1 - k), bottom, right - br, bottom, right - br, bottom]),
+        knot([left + bl, bottom, left + bl, bottom, left + bl * (1 - k), bottom]),
+        knot([left, bottom - bl * (1 - k), left, bottom - bl, left, bottom - bl]),
+        knot([left, top + tl, left, top + tl, left, top + tl * (1 - k)]),
+      ],
+    }],
+    invert: false,
+    notLink: false,
+    disable: false,
+    fillStartsWithAllPixels: false,
+  };
+}
+
+/** styleOnly 矩形且无 rawPsdVectorData 时，合成 PS 矢量 shape（Fill + 圆角 Appearance）。 */
+function shouldSynthesizeVectorShape(node: ExportNodeData): boolean {
+  if (!node.styleOnlyExport || node.rawPsdVectorData) return false;
+  if (node.type !== 'rectangle') return false;
+  return node.fills.some(f => f.type === 'SOLID' && f.visible && f.color);
+}
+
+function applySynthesizedVectorShape(
+  layer: Layer,
+  node: ExportNodeData,
+  left: number,
+  top: number,
+  right: number,
+  bottom: number,
+): void {
+  const solid = node.fills.find(f => f.type === 'SOLID' && f.visible && f.color);
+  if (!solid?.color) return;
+
+  const cr = node.cornerRadii ?? { topLeft: 0, topRight: 0, bottomLeft: 0, bottomRight: 0 };
+  const opacity = solid.opacity ?? solid.color.a ?? 1;
+  (layer as any).vectorFill = {
+    type: 'color',
+    color: {
+      r: Math.round(solid.color.r * 255),
+      g: Math.round(solid.color.g * 255),
+      b: Math.round(solid.color.b * 255),
+    },
+  };
+  (layer as any).vectorOrigination = {
+    keyDescriptorList: [{
+      keyOriginType: 2,
+      keyOriginResolution: 72,
+      keyOriginShapeBoundingBox: {
+        top: pxUnits(top),
+        left: pxUnits(left),
+        bottom: pxUnits(bottom),
+        right: pxUnits(right),
+      },
+      keyOriginRRectRadii: {
+        topLeft: pxUnits(cr.topLeft),
+        topRight: pxUnits(cr.topRight),
+        bottomLeft: pxUnits(cr.bottomLeft),
+        bottomRight: pxUnits(cr.bottomRight),
+      },
+      keyOriginBoxCorners: [
+        { x: left, y: top },
+        { x: right, y: top },
+        { x: right, y: bottom },
+        { x: left, y: bottom },
+      ],
+      transform: [1, 0, 0, 1, 0, 0],
+    }],
+  };
+  (layer as any).vectorMask = buildRoundedRectVectorMask(left, top, right, bottom, cr);
+  if (opacity < 1) {
+    layer.opacity = (layer.opacity ?? 1) * opacity;
+  }
+}
+
 /**
  * Trims transparent pixels from canvas edges and returns the cropped canvas.
  * Used for text layer bitmaps so ag-psd's internal trim doesn't shift our layer.top/left.
@@ -518,7 +653,9 @@ function buildEffects(node: ExportNodeData, availablePatternIds?: Set<string>): 
   );
   // 纯色填充：即使像素已烘焙进 imageBase64，仍写 solidFill 作 PS 兼容兜底（与 raster 同色同透明度时不重复显色）。
   // passThroughBaked 像素已含穿透叠加层合成，不可再写 solidFill。
-  if (solidFills.length > 0 && node.type !== 'text' && !hasChildren && !node.passThroughBaked) {
+  // 纯色填充：vectorFill 已承载时不再写 solidFill，避免与 Appearance 填充重复。
+  const useVectorFill = shouldSynthesizeVectorShape(node);
+  if (solidFills.length > 0 && !useVectorFill && node.type !== 'text' && !hasChildren && !node.passThroughBaked) {
     result.solidFill = solidFills.map(f => ({
       enabled: true,
       color: toRGBA(f.color!),
@@ -928,6 +1065,14 @@ async function buildLayer(node: ExportNodeData, parentClipRect?: { x: number; y:
         }
       }
     } catch { /* leave without image data */ }
+  }
+
+  // 样式专用导出：无 exportAsync 像素时，优先合成矢量 shape（Appearance 可编辑圆角/填充）；
+  // 仅当无法合成矢量（如纯渐变 fill）时回退白色圆角 raster 蒙版。
+  if (!(layer as any).vectorFill && shouldSynthesizeVectorShape(node)) {
+    applySynthesizedVectorShape(layer, node, layerLeft, layerTop, layerRight, layerBottom);
+  } else if (!layer.canvas && !usedRawTextImage && node.styleOnlyExport && node.width > 0 && node.height > 0) {
+    layer.canvas = createRoundedRectShapeCanvas(node.width, node.height, node.cornerRadii);
   }
 
   // 隐藏节点若 exportAsync 失败（没有 canvas），创建与原始尺寸一致的透明 placeholder

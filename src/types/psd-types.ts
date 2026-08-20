@@ -488,6 +488,8 @@ export interface ExportNodeData {
   passThroughBaked?: boolean;
   /** isMask 裁剪层：exportAsync 保留 MG 合成（含模糊/multiply），勿再 strip effects 或叠 hard mask。 */
   platformRenderBaked?: boolean;
+  /** 矩形仅由 MG 原生 fill + effects/strokes 表达，导出端生成形状蒙版 + 图层样式，不走 exportAsync。 */
+  styleOnlyExport?: boolean;
   /**
    * 9-Slice 九宫元数据 JSON（与 nineSliceSettings plugin data 同格式）。
    * 导出 PSD 时编码进图层名；导入时写回 setPluginData('nineSliceSettings')，供 9slice 插件还原。

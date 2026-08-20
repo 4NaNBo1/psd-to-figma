@@ -194,6 +194,18 @@ function hasRoundTripImagePluginData(node: any): boolean {
   );
 }
 
+/** PSD 往返可还原为可编辑图层样式（矢量 / 原始 channel / 合成前 channel + raw effects）。 */
+function hasEditablePsdRoundTripRestore(node: any): boolean {
+  if (typeof node.getPluginData !== 'function') return false;
+  if (node.getPluginData('psd_vector_data')) return true;
+  if (hasRoundTripImagePluginData(node)) return true;
+  // 导入端 effects 被合成进位图时，channel + rawEffects 可让 PS 还原可编辑样式。
+  return !!(
+    node.getPluginData('psd_channel_image') &&
+    node.getPluginData('psd_raw_effects')
+  );
+}
+
 function hasRoundTripLayerMask(node: any): boolean {
   if (typeof node.getPluginData !== 'function') return false;
   return !!node.getPluginData('psd_layer_mask');
@@ -1231,10 +1243,15 @@ async function serializeNode(
 
     const hasImageFill = data.fills.some(f => f.type === 'IMAGE' && f.visible);
     const hasRoundTripImage = hasRoundTripImagePluginData(node);
+    const canRestoreEditablePsd = hasEditablePsdRoundTripRestore(node);
     const hasVisiblePaintFill = data.fills.some(f =>
       f.visible && (f.type === 'SOLID' || (f.type && f.type.startsWith('GRADIENT_')))
     );
-    const willExportImage = hasImageFill || !effectiveVisible || (hasVisiblePaintFill && !hasRoundTripImage);
+    const hasPlatformStyles = data.effects.some(e => e.visible) || data.strokes.some(s => s.visible);
+    const isStyleOnlyEditableRectangle = !hasImageFill && hasVisiblePaintFill && hasPlatformStyles;
+    const willExportImage = !canRestoreEditablePsd && !isStyleOnlyEditableRectangle && (
+      hasImageFill || !effectiveVisible || (hasVisiblePaintFill && !hasRoundTripImage)
+    );
     if (willExportImage) {
       // isMask 裁剪层（如 sdw）：MG 已合成 multiply/羽化/模糊；strip 后 PSD 只剩硬边矩形。
       // 有 psd_layer_mask round-trip 时仍分离导出（保留可编辑羽化蒙版 + solidFill 等）。
@@ -1246,6 +1263,8 @@ async function serializeNode(
         node,
         bakePlatformRender ? undefined : { withoutStrokesAndEffects: true },
       );
+    } else if (isStyleOnlyEditableRectangle) {
+      data.styleOnlyExport = true;
     }
   } else {
     data.imageBase64 = await exportNodeImage(node);
