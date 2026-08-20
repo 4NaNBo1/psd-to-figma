@@ -407,6 +407,8 @@ export interface ExportNodeData {
   visible: boolean;
   clipsContent: boolean;
   isMask: boolean;
+  /** 导入时写入的原始 PSD layer.clipping；有值时导出优先于 isMask 推断。 */
+  psdClipping?: boolean;
   isInstance: boolean;
 
   imageBase64?: string;
@@ -484,6 +486,8 @@ export interface ExportNodeData {
   inheritedGroupStrokes?: boolean;
   /** 像素已含同组 PASS_THROUGH 穿透叠加层的合成结果，勿再写 solidFill/gradientOverlay 以免双重应用。 */
   passThroughBaked?: boolean;
+  /** isMask 裁剪层：exportAsync 保留 MG 合成（含模糊/multiply），勿再 strip effects 或叠 hard mask。 */
+  platformRenderBaked?: boolean;
   /**
    * 9-Slice 九宫元数据 JSON（与 nineSliceSettings plugin data 同格式）。
    * 导出 PSD 时编码进图层名；导入时写回 setPluginData('nineSliceSettings')，供 9slice 插件还原。

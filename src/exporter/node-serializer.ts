@@ -194,6 +194,18 @@ function hasRoundTripImagePluginData(node: any): boolean {
   );
 }
 
+function hasRoundTripLayerMask(node: any): boolean {
+  if (typeof node.getPluginData !== 'function') return false;
+  return !!node.getPluginData('psd_layer_mask');
+}
+
+/** 父组内存在 isMask 兄弟 → 本层在 MG 中被 alpha 裁剪（如 sdw 阴影）。 */
+function isClippedByIsMaskSibling(node: any): boolean {
+  const parent = node.parent;
+  if (!parent?.children || !Array.isArray(parent.children)) return false;
+  return parent.children.some((c: any) => c !== node && c.isMask === true);
+}
+
 function attachPsdPluginData(node: any, data: ExportNodeData): void {
   try {
     if (typeof node.getPluginData === 'function') {
@@ -280,6 +292,14 @@ function attachPsdPluginData(node: any, data: ExportNodeData): void {
       if (lm) data.rawPsdLayerMask = lm;
       const lmi = node.getPluginData('psd_layer_mask_image');
       if (lmi) data.rawPsdLayerMaskImage = lmi;
+    }
+  } catch { /* ignore */ }
+
+  try {
+    if (typeof node.getPluginData === 'function') {
+      const clipRaw = node.getPluginData('psd_clipping');
+      if (clipRaw === '1') data.psdClipping = true;
+      else if (clipRaw === '0') data.psdClipping = false;
     }
   } catch { /* ignore */ }
 
@@ -766,6 +786,17 @@ async function exportNodeImage(node: any, options?: { withoutStrokesAndEffects?:
     }
   } catch { /* ignore */ }
 
+  // MasterGo isMask 节点 isMaskVisible=false 时不显示填充，exportAsync 可能导出空/错误像素；
+  // 临时显示蒙版像素以获取正确 alpha 形状。
+  let savedIsMaskVisible: boolean | undefined;
+  if (node.isMask === true && node.isMaskVisible === false) {
+    try {
+      savedIsMaskVisible = false;
+      node.isMaskVisible = true;
+      await yieldThread();
+    } catch { /* ignore */ }
+  }
+
   try {
     const bytes: Uint8Array = await withTimeout(
       node.exportAsync({ format: 'PNG', constraint: { type: 'SCALE', value: scale } }),
@@ -790,6 +821,9 @@ async function exportNodeImage(node: any, options?: { withoutStrokesAndEffects?:
     }
     if (savedOpacity !== undefined) {
       try { node.opacity = savedOpacity; } catch { /* ignore */ }
+    }
+    if (savedIsMaskVisible === false) {
+      try { node.isMaskVisible = false; } catch { /* ignore */ }
     }
   }
 }
@@ -1202,10 +1236,16 @@ async function serializeNode(
     );
     const willExportImage = hasImageFill || !effectiveVisible || (hasVisiblePaintFill && !hasRoundTripImage);
     if (willExportImage) {
-      // 去除 node 的 effects/strokes 与叠加 overlay fill 再导出，使 PNG 只含原始像素：
-      // 整层原生化的位图层这些效果由 node 属性写回 PSD，不可重复烤进 PNG（难点 4）。
-      // 栅格化层的 effects/strokes 已在导入时清空、无 overlay fill，此操作对其为无副作用。
-      data.imageBase64 = await exportNodeImage(node, { withoutStrokesAndEffects: true });
+      // isMask 裁剪层（如 sdw）：MG 已合成 multiply/羽化/模糊；strip 后 PSD 只剩硬边矩形。
+      // 有 psd_layer_mask round-trip 时仍分离导出（保留可编辑羽化蒙版 + solidFill 等）。
+      const bakePlatformRender = isClippedByIsMaskSibling(node)
+        && !hasRoundTripLayerMask(node)
+        && !hasRoundTripImagePluginData(node);
+      data.platformRenderBaked = bakePlatformRender;
+      data.imageBase64 = await exportNodeImage(
+        node,
+        bakePlatformRender ? undefined : { withoutStrokesAndEffects: true },
+      );
     }
   } else {
     data.imageBase64 = await exportNodeImage(node);
@@ -1213,7 +1253,7 @@ async function serializeNode(
 
   attachPsdPluginData(node, data);
 
-  // 旋转位图层：exportAsync 返回 absoluteRenderBounds 尺寸的 PNG（旋转视觉已烘焙），
+  // 旋转位图层
   // node.width/height 却是未旋转框；若仍用未旋转尺寸作 PSD bbox，fitCanvasCoverCrop
   // 会把 ~525×523 压进 ~429×426，与 MasterGo 面板显示的旋转后尺寸不一致。
   try {

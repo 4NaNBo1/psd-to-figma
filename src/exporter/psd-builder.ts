@@ -247,6 +247,72 @@ function trimCanvasTransparent(srcCanvas: HTMLCanvasElement): { canvas: HTMLCanv
   return { canvas: out };
 }
 
+/** MG isMask：透明圆角范围；将其 alpha 写入 sibling 的 PSD layer.mask（不导出 mask 图层本身）。 */
+async function attachIsMaskAlphaAsLayerMask(
+  layer: Layer,
+  layerNode: ExportNodeData,
+  maskNode: ExportNodeData,
+): Promise<{ maskShapePixels: number; sdwOpaqueBefore: number; sdwOpaqueAfter: number } | null> {
+  const layerCanvas = layer.canvas as HTMLCanvasElement | undefined;
+  if (!layerCanvas || !maskNode.imageBase64) return null;
+  try {
+    const maskCanvas = await pngToCanvas(base64ToUint8Array(maskNode.imageBase64));
+    const lw = layerCanvas.width;
+    const lh = layerCanvas.height;
+    const layerLeft = layer.left ?? layerNode.x;
+    const layerTop = layer.top ?? layerNode.y;
+    const maskCtx = maskCanvas.getContext('2d')!;
+    const maskData = maskCtx.getImageData(0, 0, maskCanvas.width, maskCanvas.height);
+    const lctx = layerCanvas.getContext('2d')!;
+    const ldata = lctx.getImageData(0, 0, lw, lh);
+
+    const mcanvas = document.createElement('canvas');
+    mcanvas.width = lw;
+    mcanvas.height = lh;
+    const mimg = mcanvas.getContext('2d')!.createImageData(lw, lh);
+
+    let maskShapePixels = 0;
+    let sdwOpaqueBefore = 0;
+    let sdwOpaqueAfter = 0;
+    for (let py = 0; py < lh; py++) {
+      for (let px = 0; px < lw; px++) {
+        const li = (py * lw + px) * 4;
+        if (ldata.data[li + 3] > 10) sdwOpaqueBefore++;
+        const mx = Math.round(layerLeft + px - maskNode.x);
+        const my = Math.round(layerTop + py - maskNode.y);
+        let ma = 0;
+        if (mx >= 0 && mx < maskCanvas.width && my >= 0 && my < maskCanvas.height) {
+          const mi = (my * maskCanvas.width + mx) * 4;
+          ma = maskData.data[mi + 3];
+          if (ma === 0) {
+            ma = Math.max(maskData.data[mi], maskData.data[mi + 1], maskData.data[mi + 2]);
+          }
+        }
+        if (ma > 10) maskShapePixels++;
+        mimg.data[li] = ma;
+        mimg.data[li + 1] = ma;
+        mimg.data[li + 2] = ma;
+        mimg.data[li + 3] = 255;
+        ldata.data[li + 3] = Math.round(ldata.data[li + 3] * ma / 255);
+        if (ldata.data[li + 3] > 10) sdwOpaqueAfter++;
+      }
+    }
+    mcanvas.getContext('2d')!.putImageData(mimg, 0, 0);
+    lctx.putImageData(ldata, 0, 0);
+    (layer as any).mask = {
+      left: layerLeft,
+      top: layerTop,
+      right: layerLeft + lw,
+      bottom: layerTop + lh,
+      defaultColor: 0,
+      canvas: mcanvas,
+    };
+    return { maskShapePixels, sdwOpaqueBefore, sdwOpaqueAfter };
+  } catch {
+    return null;
+  }
+}
+
 /**
  * 还原 plugin data 中 base64 编码的 Uint8Array 字段。
  * 配合 `__binBase64` 写入端约定使用。
@@ -366,6 +432,10 @@ function buildEffects(node: ExportNodeData, availablePatternIds?: Set<string>): 
 
   const hasEffects = node.effects.length > 0 || node.fills.length > 0 || node.strokes.length > 0 || !!rawEffects;
   if (!hasEffects) return undefined;
+
+  if (node.platformRenderBaked) {
+    return undefined;
+  }
 
   // 以原始 effects 为底子（深拷贝避免 mutate），然后用 figma/mastergo 提取到的覆盖
   const result: NonNullable<ReturnType<typeof buildEffects>> = rawEffects ? JSON.parse(JSON.stringify(rawEffects, (_k, v) => {
@@ -660,7 +730,7 @@ async function buildLayer(node: ExportNodeData, parentClipRect?: { x: number; y:
     blendMode: toBlendMode(effectiveBlendMode),
     opacity: node.opacity,
     hidden: !node.visible,
-    clipping: node.isMask,
+    clipping: false,
   };
 
   const effects = buildEffects(node, availablePatternIds);
@@ -1313,12 +1383,30 @@ async function buildLayer(node: ExportNodeData, parentClipRect?: { x: number; y:
     if (layer.placedLayer) delete layer.placedLayer;
 
     layer.children = [];
-    for (const child of node.children) {
-      const result = await buildLayer(child, null, availablePatternIds);
-      if (Array.isArray(result)) {
-        layer.children.push(...result);
-      } else {
-        layer.children.push(result);
+    const maskBaseIdx = node.children.findIndex(c => c.isMask);
+    const maskNodeForClip = maskBaseIdx >= 0 && node.children[maskBaseIdx].psdClipping == null
+      ? node.children[maskBaseIdx]
+      : undefined;
+    const skipIsMaskExport = !!maskNodeForClip;
+    for (let ci = 0; ci < node.children.length; ci++) {
+      const childNode = node.children[ci];
+      // MG isMask 不单独导出；round-trip 用 rawPsdLayerMask；否则 platformRenderBaked + isMask layer.mask。
+      if (childNode.isMask && childNode.psdClipping == null) continue;
+      const result = await buildLayer(childNode, null, availablePatternIds);
+      const childLayers = Array.isArray(result) ? result : [result];
+      for (const cl of childLayers) {
+        if (childNode.psdClipping === true || childNode.psdClipping === false) {
+          cl.clipping = childNode.psdClipping;
+        } else if (!skipIsMaskExport && maskBaseIdx >= 0 && ci > maskBaseIdx) {
+          cl.clipping = true;
+        }
+        if (
+          skipIsMaskExport && maskNodeForClip && ci > maskBaseIdx && cl.canvas
+          && !childNode.rawPsdLayerMask
+        ) {
+          await attachIsMaskAlphaAsLayerMask(cl, childNode, maskNodeForClip);
+        }
+        layer.children.push(cl);
       }
     }
     layer.opened = true;

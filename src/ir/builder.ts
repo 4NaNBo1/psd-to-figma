@@ -408,6 +408,7 @@ function buildGroupNode(
     psdGroupMask: layer.groupMaskRect ? JSON.stringify(layer.groupMaskRect) : undefined,
     inheritedGroupEffects: layer.inheritedGroupEffects,
     inheritedGroupStrokes: layer.inheritedGroupStrokes,
+    psdClipping: layer.clipped,
   };
 }
 
@@ -444,6 +445,7 @@ function buildTextNode(
       psdExpandOffset: expand > 0 ? expand : undefined,
       inheritedGroupEffects: layer.inheritedGroupEffects,
       inheritedGroupStrokes: layer.inheritedGroupStrokes,
+      psdClipping: layer.clipped,
     };
   }
 
@@ -467,6 +469,7 @@ function buildTextNode(
     rawPsdEffects: layer.rawEffectsData,
     inheritedGroupEffects: layer.inheritedGroupEffects,
     inheritedGroupStrokes: layer.inheritedGroupStrokes,
+    psdClipping: layer.clipped,
   };
 }
 
@@ -517,6 +520,7 @@ function buildShapeNode(
     inheritedGroupEffects: layer.inheritedGroupEffects,
     inheritedGroupStrokes: layer.inheritedGroupStrokes,
     nineSliceSettings: layer.nineSliceSettings,
+    psdClipping: layer.clipped,
   };
 }
 

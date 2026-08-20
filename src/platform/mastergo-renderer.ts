@@ -749,6 +749,9 @@ async function renderNode(
             writeNineSlicePluginDataForImport(rect, irNode.nineSliceSettings);
           } catch { /* ignore */ }
         }
+        if (irNode.psdClipping != null) {
+          try { rect.setPluginData('psd_clipping', irNode.psdClipping ? '1' : '0'); } catch { /* ignore */ }
+        }
 
         onNodeCreated();
         onLog('info', `Created rect: "${irNode.name}" (${irNode.width}x${irNode.height})`);
