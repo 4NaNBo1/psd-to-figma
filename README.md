@@ -4,7 +4,7 @@
 
 [使用说明](#使用说明) · [导出 PSD](#导出-psd) · [配合 9-Slice 插件](#配合-9-slice-插件) · [开发说明](#开发说明) · [更新历史](#更新历史)
 
-当前版本：`v1.6.5`
+当前版本：`v1.6.6`
 
 ## 功能特性
 
@@ -168,6 +168,11 @@ npm run watch      # 监听文件变化
 > 插件采用 IR（中间表示）架构：`parser → IR → platform renderer` 用于导入，`node-serializer → psd-builder` 用于导出。新增设计平台只需在 `src/platform/` 下实现 `PlatformRenderer` 接口。
 
 ## 更新历史
+
+### v1.6.6
+
+- 修复旋转位图层导出 PSD 时尺寸与位置不正确的问题：`exportAsync` 返回的 PNG 已烘焙旋转视觉，现改用 `absoluteRenderBounds` 作为图层 bbox，与 MasterGo / Figma 面板显示的旋转后尺寸一致。
+- 旋转非文本位图层跳过 `fitCanvasCoverCrop`，直接按 baked PNG 尺寸定位，避免 ~525×523 被压进未旋转的 ~429×426 框。
 
 ### v1.6.5
 

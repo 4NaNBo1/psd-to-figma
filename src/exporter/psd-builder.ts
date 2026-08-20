@@ -834,6 +834,17 @@ async function buildLayer(node: ExportNodeData, parentClipRect?: { x: number; y:
         const cctx = cropped.getContext('2d')!;
         cctx.drawImage(rawCanvas, exp, exp, innerW, innerH, 0, 0, innerW, innerH);
         layer.canvas = cropped;
+      } else if (node.rotation != null && Math.abs(node.rotation) > 0.1 && !isTextLayer) {
+        // exportAsync PNG = absoluteRenderBounds 尺寸，旋转已烘焙；禁止 fitCanvasCoverCrop 压到未旋转框。
+        layer.canvas = rawCanvas;
+        layerLeft = Math.round(node.x);
+        layerTop = Math.round(node.y);
+        layerRight = layerLeft + rawCanvas.width;
+        layerBottom = layerTop + rawCanvas.height;
+        layer.left = layerLeft;
+        layer.top = layerTop;
+        layer.right = layerRight;
+        layer.bottom = layerBottom;
       } else {
         const targetW = Math.max(1, Math.round(layerRight - layerLeft));
         const targetH = Math.max(1, Math.round(layerBottom - layerTop));

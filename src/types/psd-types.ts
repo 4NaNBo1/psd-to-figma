@@ -400,6 +400,8 @@ export interface ExportNodeData {
   y: number;
   width: number;
   height: number;
+  /** MasterGo/Figma 节点旋转角（度）。非文本位图层 exportAsync PNG 基于 absoluteRenderBounds，需据此定位 bbox。 */
+  rotation?: number;
   opacity: number;
   blendMode: string;
   visible: boolean;

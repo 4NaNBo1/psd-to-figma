@@ -1213,6 +1213,23 @@ async function serializeNode(
 
   attachPsdPluginData(node, data);
 
+  // 旋转位图层：exportAsync 返回 absoluteRenderBounds 尺寸的 PNG（旋转视觉已烘焙），
+  // node.width/height 却是未旋转框；若仍用未旋转尺寸作 PSD bbox，fitCanvasCoverCrop
+  // 会把 ~525×523 压进 ~429×426，与 MasterGo 面板显示的旋转后尺寸不一致。
+  try {
+    const rot = typeof node.rotation === 'number' ? node.rotation : 0;
+    if (Math.abs(rot) > 0.1 && data.imageBase64 && nodeType !== 'text') {
+      const arb = node.absoluteRenderBounds;
+      if (arb && Number.isFinite(arb.x) && Number.isFinite(arb.y) && arb.width > 0 && arb.height > 0) {
+        data.x = arb.x - parentX;
+        data.y = arb.y - parentY;
+        data.width = arb.width;
+        data.height = arb.height;
+        data.rotation = rot;
+      }
+    }
+  } catch { /* ignore */ }
+
   return data;
 }
 
