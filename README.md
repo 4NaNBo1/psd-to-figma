@@ -4,7 +4,7 @@
 
 [使用说明](#使用说明) · [导出 PSD](#导出-psd) · [配合 9-Slice 插件](#配合-9-slice-插件) · [开发说明](#开发说明) · [更新历史](#更新历史)
 
-当前版本：`v1.6.6`
+当前版本：`v1.6.8`
 
 ## 功能特性
 
@@ -168,6 +168,17 @@ npm run watch      # 监听文件变化
 > 插件采用 IR（中间表示）架构：`parser → IR → platform renderer` 用于导入，`node-serializer → psd-builder` 用于导出。新增设计平台只需在 `src/platform/` 下实现 `PlatformRenderer` 接口。
 
 ## 更新历史
+
+### v1.6.8
+
+- 修复 PSD 矢量 shape 旋转 round-trip：解析 `keyOriginBoxCorners` 还原旋转，导出时同步旋转 vectorMask 与 shape 层点 bbox。
+- 改进 styleOnly 矩形导出定位，并清理写入 PSD 时非法的 layer effects。
+- 修复 isMask 节点无可见填充时图层蒙版 alpha 缺失：序列化阶段补充 exportAsync，写入 PSD 时无像素则回退 cornerRadii 几何合成蒙版形状。
+
+### v1.6.7
+
+- 纯 fill + effects/strokes 的矩形导出为可编辑 PSD 矢量 shape（vectorMask + vectorFill），不再栅格化。
+- 修复 MasterGo isMask 裁剪导出 PSD 时蒙版与合成保留问题。
 
 ### v1.6.6
 
