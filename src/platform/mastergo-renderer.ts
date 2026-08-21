@@ -714,6 +714,10 @@ async function renderNode(
         applyInheritedFxMarkers(rect, irNode);
         applyStrokes(rect, irNode.strokes, onLog, irNode.name);
         applyCornerRadii(rect, irNode.cornerRadii);
+        if (irNode.rotation != null && Math.abs(irNode.rotation) > 0.1) {
+          rect.rotation = irNode.rotation;
+          try { rect.setPluginData('psd_shape_rotation', String(irNode.rotation)); } catch { /* ignore */ }
+        }
         if (irNode.rawPsdEffects) {
           try { rect.setPluginData('psd_raw_effects', irNode.rawPsdEffects); } catch { /* ignore */ }
         }

@@ -253,6 +253,11 @@ function attachPsdPluginData(node: any, data: ExportNodeData): void {
     if (typeof node.getPluginData === 'function') {
       const vec = node.getPluginData('psd_vector_data');
       if (vec) data.rawPsdVectorData = vec;
+      const shapeRot = node.getPluginData('psd_shape_rotation');
+      if (shapeRot) {
+        const v = parseFloat(shapeRot);
+        if (Number.isFinite(v)) data.shapeRotation = v;
+      }
     }
   } catch { /* ignore */ }
 
@@ -972,6 +977,28 @@ async function serializeNineSliceCollapsed(
   return data;
 }
 
+/** 同组中与 node absoluteTransform 最近的 cube_cat* 底图层（frm 视觉对齐参照）。 */
+function findClosestCubeCatSibling(node: any): any | null {
+  const siblings = node.parent?.children;
+  if (!Array.isArray(siblings)) return null;
+  const nx = node.absoluteTransform?.[0]?.[2] ?? node.x ?? 0;
+  const ny = node.absoluteTransform?.[1]?.[2] ?? node.y ?? 0;
+  let best: any = null;
+  let bestDist = Infinity;
+  for (const s of siblings) {
+    const name = s?.name ?? '';
+    if (typeof name !== 'string' || !name.startsWith('cube_cat')) continue;
+    const sx = s.absoluteTransform?.[0]?.[2] ?? s.x ?? 0;
+    const sy = s.absoluteTransform?.[1]?.[2] ?? s.y ?? 0;
+    const dist = (sx - nx) ** 2 + (sy - ny) ** 2;
+    if (dist < bestDist) {
+      bestDist = dist;
+      best = s;
+    }
+  }
+  return best;
+}
+
 async function serializeNode(
   node: any,
   parentX: number,
@@ -1277,14 +1304,52 @@ async function serializeNode(
   // 会把 ~525×523 压进 ~429×426，与 MasterGo 面板显示的旋转后尺寸不一致。
   try {
     const rot = typeof node.rotation === 'number' ? node.rotation : 0;
-    if (Math.abs(rot) > 0.1 && data.imageBase64 && nodeType !== 'text') {
-      const arb = node.absoluteRenderBounds;
-      if (arb && Number.isFinite(arb.x) && Number.isFinite(arb.y) && arb.width > 0 && arb.height > 0) {
-        data.x = arb.x - parentX;
-        data.y = arb.y - parentY;
-        data.width = arb.width;
-        data.height = arb.height;
+    if (Math.abs(rot) > 0.1 && nodeType !== 'text') {
+      if (data.imageBase64) {
+        const arb = node.absoluteRenderBounds;
+        if (arb && Number.isFinite(arb.x) && Number.isFinite(arb.y) && arb.width > 0 && arb.height > 0) {
+          data.x = arb.x - parentX;
+          data.y = arb.y - parentY;
+          data.width = arb.width;
+          data.height = arb.height;
+          data.rotation = rot;
+        }
+      } else if (data.styleOnlyExport) {
         data.rotation = rot;
+        const w = node.width ?? 0;
+        const h = node.height ?? 0;
+        if (w > 0 && h > 0 && Math.abs(rot) > 0.1) {
+          // 与 cube 栅格旋转导出同路径：absoluteRenderBounds 定义视觉 AABB；
+          // voBox 锚点 = 视觉框 + (visualSize - 未旋转size)/2（PS shape 内部坐标）。
+          const cube = findClosestCubeCatSibling(node);
+          const arb = cube?.absoluteRenderBounds ?? node.absoluteRenderBounds;
+          if (arb && arb.width > 0 && arb.height > 0) {
+            const rad = Math.abs(rot) * (Math.PI / 180);
+            const geomVisualW = Math.abs(w * Math.cos(rad)) + Math.abs(h * Math.sin(rad));
+            const geomVisualH = Math.abs(w * Math.sin(rad)) + Math.abs(h * Math.cos(rad));
+            let targetW = arb.width;
+            let targetH = arb.height;
+            let targetAbsX = arb.x;
+            let targetAbsY = arb.y;
+            // frm 的 arb 含 stroke/shadow 会比 cube 大；cube 的 arb 已是紧致视觉框
+            if (!cube && (targetW > geomVisualW * 1.08 || targetH > geomVisualH * 1.08)) {
+              targetW = geomVisualW;
+              targetH = geomVisualH;
+              targetAbsX = arb.x + (arb.width - targetW) / 2;
+              targetAbsY = arb.y + (arb.height - targetH) / 2;
+            }
+            const targetLeft = targetAbsX - parentX;
+            const targetTop = targetAbsY - parentY;
+            data.x = targetLeft + (targetW - w) / 2;
+            data.y = targetTop + (targetH - h) / 2;
+            data.visualLayerBbox = {
+              left: targetLeft,
+              top: targetTop,
+              width: targetW,
+              height: targetH,
+            };
+          }
+        }
       }
     }
   } catch { /* ignore */ }

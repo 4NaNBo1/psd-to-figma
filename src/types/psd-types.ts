@@ -255,6 +255,8 @@ export interface SerializedLayer {
    * 9-Slice 九宫元数据 JSON。从 PSD 图层名 PUA 后缀解码；renderer 写入 nineSliceSettings plugin data。
    */
   nineSliceSettings?: string;
+  /** PSD 矢量 shape 层旋转角（度），由 keyOriginBoxCorners 相对 boundingBox 推算。 */
+  shapeRotation?: number;
 }
 
 /**
@@ -402,6 +404,8 @@ export interface ExportNodeData {
   height: number;
   /** MasterGo/Figma 节点旋转角（度）。非文本位图层 exportAsync PNG 基于 absoluteRenderBounds，需据此定位 bbox。 */
   rotation?: number;
+  /** 导入时 PSD 矢量 shape 原始旋转角（度），存于 psd_shape_rotation plugin data。 */
+  shapeRotation?: number;
   opacity: number;
   blendMode: string;
   visible: boolean;
@@ -490,6 +494,8 @@ export interface ExportNodeData {
   platformRenderBaked?: boolean;
   /** 矩形仅由 MG 原生 fill + effects/strokes 表达，导出端生成形状蒙版 + 图层样式，不走 exportAsync。 */
   styleOnlyExport?: boolean;
+  /** styleOnly 旋转层：与 cube 栅格导出一致的视觉 AABB，用于 PSD layer bbox。voBox 锚点另存于 x/y。 */
+  visualLayerBbox?: { left: number; top: number; width: number; height: number };
   /**
    * 9-Slice 九宫元数据 JSON（与 nineSliceSettings plugin data 同格式）。
    * 导出 PSD 时编码进图层名；导入时写回 setPluginData('nineSliceSettings')，供 9slice 插件还原。

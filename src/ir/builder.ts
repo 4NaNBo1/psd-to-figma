@@ -492,7 +492,7 @@ function buildShapeNode(
   })();
   const fills = buildImageFill(images, layer.imageIndex, layer.overlayFills, fillTarget);
 
-  return {
+  const node: IRNode = {
     type: 'rectangle',
     name: layer.name,
     x: layer.x - expand,
@@ -521,7 +521,10 @@ function buildShapeNode(
     inheritedGroupStrokes: layer.inheritedGroupStrokes,
     nineSliceSettings: layer.nineSliceSettings,
     psdClipping: layer.clipped,
+    rotation: layer.shapeRotation,
   };
+
+  return node;
 }
 
 function buildChildrenWithClipping(

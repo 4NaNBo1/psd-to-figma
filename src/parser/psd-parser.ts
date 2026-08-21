@@ -1293,6 +1293,36 @@ function getLayerBounds(layer: Layer): { left: number; top: number; right: numbe
   return { left, top, right, bottom };
 }
 
+function getVectorShapeBox(layer: Layer): { left: number; top: number; right: number; bottom: number } | null {
+  const box = (layer as any).vectorOrigination?.keyDescriptorList?.[0]?.keyOriginShapeBoundingBox;
+  if (!box) return null;
+  const left = box.left?.value;
+  const top = box.top?.value;
+  const right = box.right?.value;
+  const bottom = box.bottom?.value;
+  if (![left, top, right, bottom].every(v => typeof v === 'number' && Number.isFinite(v))) return null;
+  if (right <= left || bottom <= top) return null;
+  return { left, top, right, bottom };
+}
+
+/** 从 keyOriginBoxCorners 顶边相对 boundingBox 顶边的偏角推算 shape 旋转（度）。 */
+function rotationFromVectorOrigination(layer: Layer): number | undefined {
+  const desc = (layer as any).vectorOrigination?.keyDescriptorList?.[0];
+  const box = desc?.keyOriginShapeBoundingBox;
+  const corners = desc?.keyOriginBoxCorners as Array<{ x: number; y: number }> | undefined;
+  if (!box || !corners || corners.length < 2) return undefined;
+  const left = box.left?.value ?? 0;
+  const top = box.top?.value ?? 0;
+  const right = box.right?.value ?? 0;
+  const width = right - left;
+  if (width <= 0) return undefined;
+  const dx = corners[1].x - corners[0].x;
+  const dy = corners[1].y - corners[0].y;
+  if (Math.hypot(dx, dy) < width * 0.01) return undefined;
+  const deg = Math.atan2(dy, dx) * (180 / Math.PI);
+  return Math.abs(deg) > 0.1 ? deg : undefined;
+}
+
 function collectLeafBounds(
   layer: Layer,
   out: { minL: number; minT: number; maxR: number; maxB: number }
@@ -3206,6 +3236,16 @@ async function serializeLayer(
     absY = bounds.top;
     width = bounds.right - bounds.left;
     height = bounds.bottom - bounds.top;
+    // PS 矢量 shape 层 bbox 常为点（0×0），真实尺寸在 vectorOrigination.keyOriginShapeBoundingBox。
+    if (type === 'shape') {
+      const shapeBox = getVectorShapeBox(layer);
+      if (shapeBox && (width <= 0 || height <= 0)) {
+        absX = shapeBox.left;
+        absY = shapeBox.top;
+        width = shapeBox.right - shapeBox.left;
+        height = shapeBox.bottom - shapeBox.top;
+      }
+    }
   }
 
   // 带矩形蒙版的组退出 subGroup，成为真实尺寸的裁剪 frame；其余组判定逻辑不变。
@@ -3278,6 +3318,20 @@ async function serializeLayer(
   const vectorRaw = serializeRawVectorData(layer);
   if (vectorRaw) {
     serialized.rawVectorData = vectorRaw;
+    // 矢量 shape 无栅格像素，仍需保留原始 layer.effects 供 round-trip 精确还原。
+    if (!serialized.rawEffectsData && layer.effects) {
+      const rawFx = serializeRawPsdEffects(layer, (layer as any).fillOpacity ?? 1);
+      if (rawFx) serialized.rawEffectsData = rawFx;
+    }
+    const shapeRot = rotationFromVectorOrigination(layer);
+    if (shapeRot != null) serialized.shapeRotation = shapeRot;
+    const vf = (layer as any).vectorFill;
+    if (vf?.type === 'color' && vf.color) {
+      serialized.overlayFills = [{
+        type: 'SOLID',
+        color: toColor(vf.color),
+      }];
+    }
   }
 
 

@@ -93,8 +93,6 @@ api.ui.onmessage = async (rawMsg: any) => {
       const irTree = buildIRTree(psd);
       sendLog('info', `${prefix}IR tree built: type=${irTree.type}, children=${irTree.children?.length}`);
 
-
-
       api.ui.postMessage({
         type: 'progress-update',
         percent: 92,

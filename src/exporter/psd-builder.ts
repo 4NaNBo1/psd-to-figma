@@ -241,6 +241,40 @@ function pxUnits(value: number): { value: number; units: 'Pixels' } {
   return { value, units: 'Pixels' };
 }
 
+/** MasterGo 矩形 rotation 与 PSD 屏幕坐标系同向（实测）；文本因存 psd_transform_rotation 另行处理。 */
+function masterGoRotationToPsdDeg(mgRotation: number): number {
+  return mgRotation;
+}
+
+function rotatePointAround(
+  x: number, y: number, cx: number, cy: number, deg: number,
+): [number, number] {
+  const rad = (deg * Math.PI) / 180;
+  const cos = Math.cos(rad);
+  const sin = Math.sin(rad);
+  const dx = x - cx;
+  const dy = y - cy;
+  return [cx + dx * cos - dy * sin, cy + dx * sin + dy * cos];
+}
+
+function rotateVectorMaskInPlace(
+  mask: ReturnType<typeof buildRoundedRectVectorMask>,
+  cx: number,
+  cy: number,
+  deg: number,
+): void {
+  if (Math.abs(deg) <= 0.1) return;
+  for (const path of mask.paths) {
+    for (const knot of path.knots) {
+      for (let i = 0; i < knot.points.length; i += 2) {
+        const [rx, ry] = rotatePointAround(knot.points[i], knot.points[i + 1], cx, cy, deg);
+        knot.points[i] = rx;
+        knot.points[i + 1] = ry;
+      }
+    }
+  }
+}
+
 /** PS 圆角矩形 vectorMask：8 knot 顺时针，控制点与 keyOriginRRectRadii 一致（对照真实 PSD shape 层推导）。 */
 function buildRoundedRectVectorMask(
   left: number,
@@ -309,6 +343,17 @@ function applySynthesizedVectorShape(
       b: Math.round(solid.color.b * 255),
     },
   };
+  const psRotDeg = node.rotation != null && Math.abs(node.rotation) > 0.1
+    ? masterGoRotationToPsdDeg(node.rotation)
+    : 0;
+  const cx = (left + right) / 2;
+  const cy = (top + bottom) / 2;
+  const boxCorners = [
+    { x: left, y: top },
+    { x: right, y: top },
+    { x: right, y: bottom },
+    { x: left, y: bottom },
+  ];
   (layer as any).vectorOrigination = {
     keyDescriptorList: [{
       keyOriginType: 2,
@@ -325,19 +370,32 @@ function applySynthesizedVectorShape(
         bottomLeft: pxUnits(cr.bottomLeft),
         bottomRight: pxUnits(cr.bottomRight),
       },
-      keyOriginBoxCorners: [
-        { x: left, y: top },
-        { x: right, y: top },
-        { x: right, y: bottom },
-        { x: left, y: bottom },
-      ],
+      keyOriginBoxCorners: boxCorners,
       transform: [1, 0, 0, 1, 0, 0],
     }],
   };
-  (layer as any).vectorMask = buildRoundedRectVectorMask(left, top, right, bottom, cr);
+  const vectorMask = buildRoundedRectVectorMask(left, top, right, bottom, cr);
+  rotateVectorMaskInPlace(vectorMask, cx, cy, psRotDeg);
+  (layer as any).vectorMask = vectorMask;
   if (opacity < 1) {
     layer.opacity = (layer.opacity ?? 1) * opacity;
   }
+}
+
+/** PS 矢量 shape 层锚点 = keyOrigin 未旋转矩形左上角；layer bbox 为点（left=right, top=bottom）。 */
+function applyShapeLayerPointBBox(layer: Layer, anchorLeft: number, anchorTop: number): void {
+  const left = Math.round(anchorLeft);
+  const top = Math.round(anchorTop);
+  layer.left = left;
+  layer.top = top;
+  layer.right = left;
+  layer.bottom = top;
+}
+
+function applyShapePointBBoxFromVectorOrigination(layer: Layer): void {
+  const box = (layer as any).vectorOrigination?.keyDescriptorList?.[0]?.keyOriginShapeBoundingBox;
+  if (!box) return;
+  applyShapeLayerPointBBox(layer, box.left?.value ?? 0, box.top?.value ?? 0);
 }
 
 /**
@@ -548,6 +606,14 @@ function filterPatternOverlay(result: any, node: ExportNodeData, availablePatter
   }
 }
 
+function sanitizePsdLayerEffects(result: any): void {
+  if (!result || typeof result !== 'object') return;
+  // ag-psd 偶发将 scale 读成裸数字；写入 PS 会触发 shape 层「智能形状元数据错误」
+  if ('scale' in result && (typeof result.scale !== 'object' || result.scale == null)) {
+    delete result.scale;
+  }
+}
+
 function buildEffects(node: ExportNodeData, availablePatternIds?: Set<string>): {
   dropShadow?: LayerEffectShadow[];
   innerShadow?: LayerEffectShadow[];
@@ -562,7 +628,9 @@ function buildEffects(node: ExportNodeData, availablePatternIds?: Set<string>): 
 } | undefined {
   // 优先使用 PSD 解析时保留的原始 effects 数据作为底子，
   // figma/mastergo 上提取到的字段（如用户编辑过的 stroke/fill/shadow）覆盖在上面（override-fallback 策略）。
-  const rawDecoded = node.rawPsdEffects ? decodeRawPsdEffects(node.rawPsdEffects) : null;
+  // MG 原生 styleOnly 合成矢量不走 import 残留 rawEffects（常含非法 scale 等字段）。
+  const useRawEffectsBase = !!node.rawPsdEffects && !(node.styleOnlyExport && !node.rawPsdVectorData);
+  const rawDecoded = useRawEffectsBase ? decodeRawPsdEffects(node.rawPsdEffects!) : null;
   const rawEffects = rawDecoded?.effects ?? null;
 
   const hasEffects = node.effects.length > 0 || node.fills.length > 0 || node.strokes.length > 0 || !!rawEffects;
@@ -612,6 +680,7 @@ function buildEffects(node: ExportNodeData, availablePatternIds?: Set<string>): 
     // 容器/文本早退路径也必须过滤悬空 patternOverlay，否则 Patt 资源缺失时 PS 无法保存。
     filterPatternOverlay(result, node, availablePatternIds);
     sanitizeEffectBlendModes(result);
+    sanitizePsdLayerEffects(result);
     return Object.keys(result).length > 0 ? result : undefined;
   }
 
@@ -763,6 +832,7 @@ function buildEffects(node: ExportNodeData, availablePatternIds?: Set<string>): 
 
   filterPatternOverlay(result, node, availablePatternIds);
   sanitizeEffectBlendModes(result);
+  sanitizePsdLayerEffects(result);
 
   return Object.keys(result).length > 0 ? result : undefined;
 }
@@ -892,6 +962,24 @@ async function buildLayer(node: ExportNodeData, parentClipRect?: { x: number; y:
       if (vectorData.vectorFill) (layer as any).vectorFill = vectorData.vectorFill;
       if (vectorData.vectorOrigination) (layer as any).vectorOrigination = vectorData.vectorOrigination;
       if (vectorData.vectorStroke) (layer as any).vectorStroke = vectorData.vectorStroke;
+      applyShapePointBBoxFromVectorOrigination(layer);
+
+      const baseRot = node.shapeRotation ?? 0;
+      const currentRot = node.rotation ?? 0;
+      const box = (layer as any).vectorOrigination?.keyDescriptorList?.[0]?.keyOriginShapeBoundingBox;
+      if (box && Math.abs(currentRot - baseRot) > 0.5) {
+        // 用户在 MG 中改了旋转：基于原始 voBox 重新合成 vectorMask，避免对 raw mask 做 delta 旋转累积误差。
+        const l = box.left?.value ?? layerLeft;
+        const t = box.top?.value ?? layerTop;
+        const r = box.right?.value ?? layerRight;
+        const b = box.bottom?.value ?? layerBottom;
+        delete (layer as any).vectorFill;
+        delete (layer as any).vectorMask;
+        delete (layer as any).vectorOrigination;
+        delete (layer as any).vectorStroke;
+        applySynthesizedVectorShape(layer, node, l, t, r, b);
+        applyShapeLayerPointBBox(layer, l, t);
+      }
     }
   }
 
@@ -1070,7 +1158,13 @@ async function buildLayer(node: ExportNodeData, parentClipRect?: { x: number; y:
   // 样式专用导出：无 exportAsync 像素时，优先合成矢量 shape（Appearance 可编辑圆角/填充）；
   // 仅当无法合成矢量（如纯渐变 fill）时回退白色圆角 raster 蒙版。
   if (!(layer as any).vectorFill && shouldSynthesizeVectorShape(node)) {
-    applySynthesizedVectorShape(layer, node, layerLeft, layerTop, layerRight, layerBottom);
+    const shapeLeft = node.x;
+    const shapeTop = node.y;
+    const shapeRight = node.x + node.width;
+    const shapeBottom = node.y + node.height;
+    applySynthesizedVectorShape(layer, node, shapeLeft, shapeTop, shapeRight, shapeBottom);
+    // PS shape 层：layer bbox 必须为 voBox 锚点（点 bbox），与 keyOriginShapeBoundingBox 左上角一致
+    applyShapeLayerPointBBox(layer, shapeLeft, shapeTop);
   } else if (!layer.canvas && !usedRawTextImage && node.styleOnlyExport && node.width > 0 && node.height > 0) {
     layer.canvas = createRoundedRectShapeCanvas(node.width, node.height, node.cornerRadii);
   }

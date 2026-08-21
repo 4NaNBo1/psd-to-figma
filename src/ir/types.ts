@@ -138,6 +138,8 @@ export interface IRNode {
   blendMode: string;
   visible: boolean;
   clipsContent: boolean;
+  /** PSD 矢量 shape / 旋转位图层的旋转角（度，PS 屏幕坐标系）。 */
+  rotation?: number;
   /** PSD 剪贴蒙版基底层标记。渲染器把该节点设为 isMask，用其 alpha 形状裁剪
    *  clip group 内排在其后的兄弟节点（对应 PS 剪贴蒙版）。 */
   isMask?: boolean;
