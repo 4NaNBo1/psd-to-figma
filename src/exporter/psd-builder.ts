@@ -445,11 +445,19 @@ async function attachIsMaskAlphaAsLayerMask(
   layer: Layer,
   layerNode: ExportNodeData,
   maskNode: ExportNodeData,
-): Promise<{ maskShapePixels: number; sdwOpaqueBefore: number; sdwOpaqueAfter: number } | null> {
+): Promise<void> {
   const layerCanvas = layer.canvas as HTMLCanvasElement | undefined;
-  if (!layerCanvas || !maskNode.imageBase64) return null;
+  if (!layerCanvas) return;
   try {
-    const maskCanvas = await pngToCanvas(base64ToUint8Array(maskNode.imageBase64));
+    // ponytail: isMask 常为透明填充，exportAsync 无像素；回退用 cornerRadii 几何合成 alpha
+    let maskCanvas: HTMLCanvasElement;
+    if (maskNode.imageBase64) {
+      maskCanvas = await pngToCanvas(base64ToUint8Array(maskNode.imageBase64));
+    } else if (maskNode.width > 0 && maskNode.height > 0) {
+      maskCanvas = createRoundedRectShapeCanvas(maskNode.width, maskNode.height, maskNode.cornerRadii);
+    } else {
+      return;
+    }
     const lw = layerCanvas.width;
     const lh = layerCanvas.height;
     const layerLeft = layer.left ?? layerNode.x;
@@ -464,13 +472,9 @@ async function attachIsMaskAlphaAsLayerMask(
     mcanvas.height = lh;
     const mimg = mcanvas.getContext('2d')!.createImageData(lw, lh);
 
-    let maskShapePixels = 0;
-    let sdwOpaqueBefore = 0;
-    let sdwOpaqueAfter = 0;
     for (let py = 0; py < lh; py++) {
       for (let px = 0; px < lw; px++) {
         const li = (py * lw + px) * 4;
-        if (ldata.data[li + 3] > 10) sdwOpaqueBefore++;
         const mx = Math.round(layerLeft + px - maskNode.x);
         const my = Math.round(layerTop + py - maskNode.y);
         let ma = 0;
@@ -481,13 +485,11 @@ async function attachIsMaskAlphaAsLayerMask(
             ma = Math.max(maskData.data[mi], maskData.data[mi + 1], maskData.data[mi + 2]);
           }
         }
-        if (ma > 10) maskShapePixels++;
         mimg.data[li] = ma;
         mimg.data[li + 1] = ma;
         mimg.data[li + 2] = ma;
         mimg.data[li + 3] = 255;
         ldata.data[li + 3] = Math.round(ldata.data[li + 3] * ma / 255);
-        if (ldata.data[li + 3] > 10) sdwOpaqueAfter++;
       }
     }
     mcanvas.getContext('2d')!.putImageData(mimg, 0, 0);
@@ -500,10 +502,7 @@ async function attachIsMaskAlphaAsLayerMask(
       defaultColor: 0,
       canvas: mcanvas,
     };
-    return { maskShapePixels, sdwOpaqueBefore, sdwOpaqueAfter };
-  } catch {
-    return null;
-  }
+  } catch { /* ignore */ }
 }
 
 /**

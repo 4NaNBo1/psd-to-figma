@@ -1293,6 +1293,10 @@ async function serializeNode(
     } else if (isStyleOnlyEditableRectangle) {
       data.styleOnlyExport = true;
     }
+    // isMask 节点常无可见填充，矩形分支可能跳过 exportAsync；仍尝试导出 alpha 形状供 PSD layer.mask 使用
+    if (data.isMask && !data.imageBase64) {
+      data.imageBase64 = await exportNodeImage(node);
+    }
   } else {
     data.imageBase64 = await exportNodeImage(node);
   }
