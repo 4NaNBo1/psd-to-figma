@@ -140,6 +140,10 @@ export interface IRNode {
   clipsContent: boolean;
   /** PSD 矢量 shape / 旋转位图层的旋转角（度，PS 屏幕坐标系）。 */
   rotation?: number;
+  /** 该节点的旋转已烘焙进栅格像素（PSD channel 像素本身即旋转后的结果），
+   * 渲染期不得再对节点做一次旋转，否则视觉上双重旋转。旋转角仍保留在
+   * rotation / textProps.rotation 中，供导出端写回 PSD transform / 矢量元数据。 */
+  rotationBaked?: boolean;
   /** PSD 剪贴蒙版基底层标记。渲染器把该节点设为 isMask，用其 alpha 形状裁剪
    *  clip group 内排在其后的兄弟节点（对应 PS 剪贴蒙版）。 */
   isMask?: boolean;

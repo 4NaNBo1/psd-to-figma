@@ -3417,12 +3417,20 @@ async function serializeLayer(
     }
     const shapeRot = rotationFromVectorOrigination(layer);
     if (shapeRot != null) serialized.shapeRotation = shapeRot;
-    const vf = (layer as any).vectorFill;
-    if (vf?.type === 'color' && vf.color) {
-      serialized.overlayFills = [{
-        type: 'SOLID',
-        color: toColor(vf.color),
-      }];
+    // vectorFill 仅在「该层没有任何栅格像素」时用来兜底显示纯色矢量 shape。
+    // 带栅格像素的 shape 层（PS 已把形状+效果合成进 channel 像素）不能叠加不透明的
+    // SOLID overlay——它会被渲染器画在 IMAGE fill 之上，整层被纯色覆盖
+    // （如大量卡片/圆角矩形/图标按钮，画面被洗成淡色块）。
+    // round-trip 不受影响：导出端用 rawPsdVectorData 还原 vectorFill。
+    const hasRasterPixels = !!layer.imageData && layer.imageData.width > 0 && layer.imageData.height > 0;
+    if (!hasRasterPixels) {
+      const vf = (layer as any).vectorFill;
+      if (vf?.type === 'color' && vf.color) {
+        serialized.overlayFills = [{
+          type: 'SOLID',
+          color: toColor(vf.color),
+        }];
+      }
     }
   }
 

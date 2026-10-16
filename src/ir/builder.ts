@@ -426,6 +426,7 @@ function buildTextNode(
     const expand = layer.expandOffset ?? 0;
     const w = Math.max(1, layer.width + expand * 2);
     const h = Math.max(1, layer.height + expand * 2);
+    const rasterFills = buildImageFill(images, layer.imageIndex);
     return {
       type: 'text',
       name: layer.name,
@@ -437,10 +438,13 @@ function buildTextNode(
       blendMode: normalizeBlendMode(layer.blendMode),
       visible: layer.visible,
       clipsContent: false,
-      fills: buildImageFill(images, layer.imageIndex),
+      fills: rasterFills,
       effects: [],
       strokes: [],
       textProps,
+      // PSD channel 栅格本身已是旋转后的像素，渲染期不得再转一次（否则双重旋转）。
+      // 旋转角仍留在 textProps.rotation，导出端据此还原 PSD transform。
+      rotationBaked: textProps?.rotation != null && rasterFills.some((f) => f.type === 'IMAGE'),
       rawPsdEffects: layer.rawEffectsData,
       psdExpandOffset: expand > 0 ? expand : undefined,
       inheritedGroupEffects: layer.inheritedGroupEffects,
@@ -522,6 +526,9 @@ function buildShapeNode(
     nineSliceSettings: layer.nineSliceSettings,
     psdClipping: layer.clipped,
     rotation: layer.shapeRotation,
+    // 带栅格像素的 shape 层：PS 已把旋转烘焙进 channel 像素，渲染期不再转一次。
+    // 无栅格像素时（纯矢量合成路径）才需要渲染器按 rotation 旋转节点。
+    rotationBaked: layer.shapeRotation != null && fills.some((f) => f.type === 'IMAGE'),
   };
 
   return node;

@@ -356,9 +356,12 @@ async function createStyledTextNode(
     try { text.locked = true; } catch { /* ignore */ }
     applyInheritedFxMarkers(text, irNode);
     if (tp.rotation) {
-      // MasterGo: 正值=顺时针；Figma/PSD: 正值=逆时针 → 取反
-      text.rotation = -tp.rotation;
       try { text.setPluginData('psd_transform_rotation', String(tp.rotation)); } catch { /* ignore */ }
+      // 栅格像素已含旋转（rotationBaked）时不再转一次，否则双重旋转；角度已存 plugin data 供导出还原。
+      if (!irNode.rotationBaked) {
+        // MasterGo: 正值=顺时针；Figma/PSD: 正值=逆时针 → 取反
+        text.rotation = -tp.rotation;
+      }
     }
     try { text.setPluginData('psd_text_rasterized', '1'); } catch { /* ignore */ }
     // 栅格化为对齐 companion 把 textAutoResize 强制设为 NONE，会污染导出端 isPointText 判定
@@ -388,8 +391,9 @@ async function createStyledTextNode(
         companion.isVisible = irNode.visible;
         if (irNode.opacity !== 1) companion.opacity = irNode.opacity;
         companion.blendMode = irNode.blendMode;
-        // MasterGo: 正值=顺时针；Figma/PSD: 正值=逆时针 → 取反（与文本节点一致）
-        if (tp.rotation) companion.rotation = -tp.rotation;
+        // MasterGo: 正值=顺时针；Figma/PSD: 正值=逆时针 → 取反（与文本节点一致）；
+        // 栅格像素已含旋转（rotationBaked）时不再转一次。
+        if (tp.rotation && !irNode.rotationBaked) companion.rotation = -tp.rotation;
         try { companion.setPluginData('psd_raster_companion', '1'); } catch { /* ignore */ }
       }
     }
@@ -714,7 +718,10 @@ async function renderNode(
         applyInheritedFxMarkers(rect, irNode);
         applyStrokes(rect, irNode.strokes, onLog, irNode.name);
         applyCornerRadii(rect, irNode.cornerRadii);
-        if (irNode.rotation != null && Math.abs(irNode.rotation) > 0.1) {
+        // rotationBaked（栅格像素已含旋转）时不转节点，也不写 psd_shape_rotation：
+        // 导出端用该 plugin data 作「导入时基准旋转」做 delta 判定，基准必须与平台实际
+        // rotation（此处为 0）一致，否则会误判成用户改过旋转而丢弃原始矢量数据。
+        if (irNode.rotation != null && Math.abs(irNode.rotation) > 0.1 && !irNode.rotationBaked) {
           rect.rotation = irNode.rotation;
           try { rect.setPluginData('psd_shape_rotation', String(irNode.rotation)); } catch { /* ignore */ }
         }
