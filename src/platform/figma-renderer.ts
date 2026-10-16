@@ -1,4 +1,4 @@
-import type { IRNode, IRFill, IRShadow, IRStroke, IRCornerRadii, IRTextProps, IRTextRange, IRGradientFill, IRSolidFill } from '../ir/types';
+import type { IRNode, IRFill, IRImageFill, IRShadow, IRStroke, IRCornerRadii, IRTextProps, IRTextRange, IRGradientFill, IRSolidFill } from '../ir/types';
 import type { PlatformRenderer, LogFn, ProgressFn, RenderOptions } from './types';
 import { writeNineSlicePluginDataForImport } from '../exporter/nine-slice-collapse';
 import { countIRNodes } from '../ir/builder';
@@ -159,12 +159,29 @@ function applySolidFills(node: MinimalFillsMixin, fills: IRSolidFill[]): void {
   }));
 }
 
+// Figma 的 ImagePaint.scaleMode 只接受 'FILL' | 'FIT' | 'CROP' | 'TILE'（见 @figma/plugin-typings）。
+// IR 里的 'STRETCH'（PNG 尺寸与图层 bbox 相等时由 builder 标记，见 ir/builder.ts）是 MasterGo 的能力，
+// Figma 不支持：直接透传会被平台拒绝，整层图片填充失效，画布上只剩灰色空块。
+// 该值触发条件本就是「图片与目标等比同尺寸」，'FILL' 在此条件下与 1:1 像素映射等价，
+// 也与文本层 raster companion 走同一路径。此处仅做 Figma 平台的降级映射，不动 IR / builder / MasterGo。
+const FIGMA_IMAGE_SCALE_MODES = ['FILL', 'FIT', 'CROP', 'TILE'] as const;
+type FigmaImageScaleMode = (typeof FIGMA_IMAGE_SCALE_MODES)[number];
+
+/** 把 IR 的 scaleMode 映射为 Figma 支持的枚举。非法值降级为 FILL 并给出告警。 */
+function toFigmaScaleMode(scaleMode: IRImageFill['scaleMode'], onLog: LogFn, name: string): FigmaImageScaleMode {
+  if ((FIGMA_IMAGE_SCALE_MODES as readonly string[]).includes(scaleMode)) {
+    return scaleMode as FigmaImageScaleMode;
+  }
+  onLog('warn', `Unsupported image scaleMode "${scaleMode}" on "${name}"; using "FILL" (Figma limitation)`);
+  return 'FILL';
+}
+
 /** 把单个 IRFill 转成 Figma Paint。IMAGE 需异步 createImage，返回 null 表示失败由调用方处理。 */
 function irFillToPaint(fill: IRFill, onLog: LogFn, name: string): Paint | null {
   if (fill.type === 'IMAGE') {
     try {
       const image = figma.createImage(fill.imageBytes);
-      return { type: 'IMAGE', imageHash: image.hash, scaleMode: fill.scaleMode };
+      return { type: 'IMAGE', imageHash: image.hash, scaleMode: toFigmaScaleMode(fill.scaleMode, onLog, name) };
     } catch (e) {
       onLog('warn', `Failed to apply image on "${name}": ${e instanceof Error ? e.message : e}`);
       return null;
