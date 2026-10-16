@@ -235,35 +235,47 @@ function serializeAdjustmentMask(mask: any): {
   left: number; top: number; width: number; height: number; defaultColor: number; dataB64: string; empty?: boolean;
 } | null {
   if (!mask || mask.disabled) return null;
-  let pixels: Uint8ClampedArray | Uint8Array | Uint16Array | Float32Array | null = null;
-  let mW = 0, mH = 0;
-  if (mask.imageData && mask.imageData.width > 0 && mask.imageData.height > 0) {
-    pixels = mask.imageData.data;
-    mW = mask.imageData.width;
-    mH = mask.imageData.height;
-  } else if (mask.canvas && mask.canvas.width > 0) {
-    const cvs = mask.canvas as HTMLCanvasElement;
-    pixels = cvs.getContext('2d')!.getImageData(0, 0, cvs.width, cvs.height).data;
-    mW = cvs.width;
-    mH = cvs.height;
-  }
+  const gray = extractMaskGray(mask);
   // 存在 mask 但无像素数据(全白/全黑空蒙版，defaultColor)：保留为「空蒙版」标记，
   // 让导出端创建对应的空蒙版，使 PS 图层面板结构与原始一致(调整层旁的蒙版缩略图)。
-  if (!pixels || mW === 0 || mH === 0) {
+  if (!gray) {
     return { left: mask.left ?? 0, top: mask.top ?? 0, width: 0, height: 0, defaultColor: mask.defaultColor ?? 255, dataB64: '', empty: true };
   }
-  const stride = pixels.length === mW * mH ? 1 : 4;
-  // 抽取单通道 alpha
-  const single = new Uint8Array(mW * mH);
-  for (let i = 0; i < mW * mH; i++) single[i] = Math.max(0, Math.min(255, Math.round(Number(pixels[i * stride]))));
   return {
     left: mask.left ?? 0,
     top: mask.top ?? 0,
-    width: mW,
-    height: mH,
+    width: gray.width,
+    height: gray.height,
     defaultColor: mask.defaultColor ?? 255,
-    dataB64: uint8ArrayToBase64(single),
+    dataB64: uint8ArrayToBase64(gray.data),
   };
+}
+
+/**
+ * 抽出 PSD 蒙版的灰度单通道像素（PS 蒙版为灰度图，取 R 通道即可）。
+ * 支持 ag-psd 的 imageData 与 canvas 两种来源；无像素来源返回 null。
+ */
+function extractMaskGray(mask: any): { data: Uint8Array; width: number; height: number } | null {
+  let pixels: Uint8ClampedArray | Uint8Array | Uint16Array | Float32Array | null = null;
+  let width = 0, height = 0;
+  if (mask.imageData && mask.imageData.width > 0 && mask.imageData.height > 0) {
+    pixels = mask.imageData.data;
+    width = mask.imageData.width;
+    height = mask.imageData.height;
+  } else if (mask.canvas && mask.canvas.width > 0 && mask.canvas.height > 0) {
+    const cvs = mask.canvas as HTMLCanvasElement;
+    pixels = cvs.getContext('2d')!.getImageData(0, 0, cvs.width, cvs.height).data;
+    width = cvs.width;
+    height = cvs.height;
+  }
+  if (!pixels || width === 0 || height === 0) return null;
+  // 单通道蒙版长度为 w*h，RGBA 为 w*h*4；两者都取首通道。
+  const stride = pixels.length === width * height ? 1 : 4;
+  const single = new Uint8Array(width * height);
+  for (let i = 0; i < single.length; i++) {
+    single[i] = Math.max(0, Math.min(255, Math.round(Number(pixels[i * stride]))));
+  }
+  return { data: single, width, height };
 }
 
 function applyAdjustmentLayers(baseLayer: Layer, clippedLayers: Layer[]): void {
@@ -1375,13 +1387,13 @@ function computeGroupBounds(layer: Layer): { left: number; top: number; right: n
 /**
  * 提取「组上的矩形图层蒙版」的画布绝对坐标框。
  * PSD 中组的 layer mask（带像素、未禁用）常用于裁剪溢出内容（如滚动视口）。
- * Figma/MasterGo 用 frame 的 clipsContent + 蒙版框尺寸表达这种矩形裁剪。
- * 用户场景中该蒙版为规则矩形，故直接取蒙版 bbox，不校验像素是否实心。
+ * 框几何决定 frame 的位置与尺寸；灰度像素（可能带圆角等不规则轮廓）在
+ * serializeLayer 中作为 alpha 蒙版烘焙进组内子层，显示因此不受「实心矩形」假设影响。
  * 返回 null：无蒙版 / 蒙版禁用 / 无像素来源 / 面积为 0。
  */
 function getGroupMaskRect(
   layer: Layer
-): { left: number; top: number; right: number; bottom: number; defaultColor: number } | null {
+): GroupMaskInfo | null {
   const mask = layer.mask;
   if (!mask || mask.disabled) return null;
 
@@ -1396,7 +1408,85 @@ function getGroupMaskRect(
   const bottom = mask.bottom ?? top;
   if (right - left <= 0 || bottom - top <= 0) return null;
 
-  return { left, top, right, bottom, defaultColor: mask.defaultColor ?? 255 };
+  const gray = extractMaskGray(mask);
+  // 无像素来源（canvas 兜底失败等）时退化为「框内全可见」的空蒙版：几何仍可用于裁剪。
+  if (!gray) {
+    return { left, top, right, bottom, defaultColor: mask.defaultColor ?? 255, width: 0, height: 0 };
+  }
+
+  return {
+    left,
+    top,
+    right,
+    bottom,
+    defaultColor: mask.defaultColor ?? 255,
+    width: gray.width,
+    height: gray.height,
+    gray: gray.data,
+  };
+}
+
+/** 组图层蒙版的解析结果：框几何 + 可选逐像素灰度。 */
+interface GroupMaskInfo {
+  left: number;
+  top: number;
+  right: number;
+  bottom: number;
+  defaultColor: number;
+  /** 灰度像素尺寸；为 0 表示无像素来源。 */
+  width: number;
+  height: number;
+  /** 灰度单通道像素（length = width * height）。 */
+  gray?: Uint8Array;
+}
+
+/**
+ * 把组图层蒙版作为 alpha 乘进组内可见子层的栅格像素，返回被改写的子层数量。
+ *
+ * PS 的组蒙版语义：像素 alpha ×= mask 灰度，蒙版框外按 defaultColor。这里只在有栅格
+ * 像素的子层上就地相乘（frame 几何与层级结构完全不变），因此纯矢量子层不受影响，
+ * 文本/智能对象等其它路径在下游各自读到的也已是带蒙版的像素。
+ */
+function applyGroupMaskToChildren(group: Layer, groupMask: GroupMaskInfo): number {
+  const gray = groupMask.gray!;
+  const maskW = groupMask.width;
+  const maskH = groupMask.height;
+  const defaultAlpha = Math.max(0, Math.min(255, groupMask.defaultColor));
+
+  let maskedCount = 0;
+  const walk = (layer: Layer): void => {
+    // 隐藏子层不贡献像素；组蒙版与子层自身的图层蒙版相互独立，这里只乘组蒙版。
+    if (layer.hidden) return;
+    const imageData = layer.imageData;
+    if (imageData && imageData.width > 0 && imageData.height > 0) {
+      const data = imageData.data;
+      if (data instanceof Uint8ClampedArray || data instanceof Uint8Array) {
+        const imgW = imageData.width;
+        const imgH = imageData.height;
+        const layerLeft = layer.left ?? 0;
+        const layerTop = layer.top ?? 0;
+        for (let y = 0; y < imgH; y++) {
+          const docY = layerTop + y;
+          const maskY = docY - groupMask.top;
+          for (let x = 0; x < imgW; x++) {
+            const docX = layerLeft + x;
+            const maskX = docX - groupMask.left;
+            const maskAlpha = (maskX >= 0 && maskX < maskW && maskY >= 0 && maskY < maskH)
+              ? gray[maskY * maskW + maskX]
+              : defaultAlpha;
+            if (maskAlpha === 255) continue;
+            const pIdx = (y * imgW + x) * 4;
+            data[pIdx + 3] = Math.round((data[pIdx + 3] * maskAlpha) / 255);
+          }
+        }
+        maskedCount++;
+      }
+    }
+    for (const child of layer.children ?? []) walk(child);
+  };
+
+  for (const child of group.children ?? []) walk(child);
+  return maskedCount;
 }
 
 function getArtboardBounds(layer: Layer): { left: number; top: number; right: number; bottom: number } | null {
@@ -3288,7 +3378,7 @@ async function serializeLayer(
     logger.info(`Layer "${displayName}": restored 9-slice metadata from PSD layer name`);
   }
 
-  // 组矩形蒙版：frame 已落在蒙版框原点，蒙版相对 frame 是满框矩形（left/top 恒 0）。
+  // 组蒙版：frame 已落在蒙版框原点，蒙版相对 frame 是满框矩形（left/top 恒 0）。
   if (groupMask) {
     serialized.groupMaskRect = {
       left: 0,
@@ -3296,6 +3386,8 @@ async function serializeLayer(
       width: Math.max(0, width),
       height: Math.max(0, height),
       defaultColor: groupMask.defaultColor,
+      // 逐像素灰度随字段透传，导出端据此重建与原始一致的 group layer mask。
+      dataB64: groupMask.gray ? uint8ArrayToBase64(groupMask.gray) : undefined,
     };
   }
 
@@ -3815,6 +3907,18 @@ async function serializeLayer(
     for (let ci = 0; ci < layer.children.length - 1; ci++) {
       if (!layer.children[ci].clipping && layer.children[ci + 1].clipping) {
         (layer.children[ci] as any).__isClippingBase = true;
+      }
+    }
+
+    // 组图层蒙版烘焙：PS 对组蒙版的语义是「组内容 alpha × 蒙版灰度 alpha」（框外按
+    // defaultColor），而不是只把内容裁到蒙版框。蒙版灰度常有圆角等不规则轮廓
+    // （例如上下带弧形的圆角轮廓），若只按蒙版框矩形裁剪，内容会整块留在框外、
+    // 细节被拉宽。这里在子层序列化前把蒙版乘进子层原始像素，
+    // 之后栅格 / 效果合成 / round-trip 全部天然带上蒙版。
+    if (groupMask?.gray && groupMask.width > 0 && groupMask.height > 0) {
+      const maskedCount = applyGroupMaskToChildren(layer, groupMask);
+      if (maskedCount > 0) {
+        logger.info(`Group "${serialized.name}": baked layer mask alpha (${groupMask.width}x${groupMask.height}) into ${maskedCount} child layer(s)`);
       }
     }
 

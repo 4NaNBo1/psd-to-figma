@@ -1655,28 +1655,32 @@ async function buildLayer(node: ExportNodeData, parentClipRect?: { x: number; y:
     layer.right = 0;
     layer.bottom = 0;
 
-    // 还原组的矩形图层蒙版（滚动视口裁剪）：白色实心矩形 = 可见区域，框外按
-    // defaultColor（通常 0=透明）裁掉。node.x/node.y 是组的绝对画布坐标，
-    // groupMaskRect 的 left/top 相对组 frame（导入时恒为 0）。mask 独立于 layer
+    // 还原组的图层蒙版（滚动视口裁剪）。有逐像素灰度（dataB64）时原样写回，否则退化为
+    // 白色实心矩形 = 框内全可见，框外按 defaultColor 裁掉。node.x/node.y 是组的绝对画布
+    // 坐标，groupMaskRect 的 left/top 相对组 frame（导入时恒为 0）。mask 独立于 layer
     // bbox，上面把 bbox 清零不影响它。
     if (node.rawPsdGroupMask) {
       try {
         const gm = JSON.parse(node.rawPsdGroupMask) as {
-          left: number; top: number; width: number; height: number; defaultColor: number;
+          left: number; top: number; width: number; height: number; defaultColor: number; dataB64?: string;
         };
         const mw = Math.round(gm.width), mh = Math.round(gm.height);
         if (mw > 0 && mh > 0) {
           const absLeft = Math.round(node.x + gm.left);
           const absTop = Math.round(node.y + gm.top);
+          const gray = gm.dataB64 ? base64ToUint8Array(gm.dataB64) : null;
           const mcanvas = document.createElement('canvas');
           mcanvas.width = mw;
           mcanvas.height = mh;
           const mctx = mcanvas.getContext('2d')!;
           const mimg = mctx.createImageData(mw, mh);
+          const useGray = !!gray && gray.length === mw * mh;
           for (let i = 0; i < mw * mh; i++) {
-            mimg.data[i * 4] = 255;
-            mimg.data[i * 4 + 1] = 255;
-            mimg.data[i * 4 + 2] = 255;
+            // PSD 蒙版为灰度：写入 RGB=alpha 值、A=255，ag-psd 据此回写单通道蒙版。
+            const v = useGray ? gray![i] : 255;
+            mimg.data[i * 4] = v;
+            mimg.data[i * 4 + 1] = v;
+            mimg.data[i * 4 + 2] = v;
             mimg.data[i * 4 + 3] = 255;
           }
           mctx.putImageData(mimg, 0, 0);

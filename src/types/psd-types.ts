@@ -206,12 +206,20 @@ export interface SerializedLayer {
    */
   rawPsdAdjustments?: string;
   /**
-   * 组的矩形图层蒙版（layer mask）信息，坐标相对组 frame 原点。
-   * PSD 中组上的矩形蒙版用于裁剪溢出内容（滚动视口）。Figma/MasterGo 用
-   * frame 的 clipsContent + 蒙版框尺寸表达；此字段透传给 renderer 写入
-   * pluginData，round-trip 导出时重建组的矩形 layer mask。
+   * 组的图层蒙版信息：蒙版框坐标（相对组 frame 原点）+ 逐像素灰度。
+   * 组蒙版不一定是实心矩形（常带圆角等不规则轮廓），因此导入时把灰度蒙版作为 alpha
+   * 烘焙进组内子层像素（见 serializeLayer 的 applyGroupMaskToChildren），
+   * 显示只依赖 frame 的 clipsContent；dataB64 供 round-trip 导出重建逐像素 layer mask。
    */
-  groupMaskRect?: { left: number; top: number; width: number; height: number; defaultColor: number };
+  groupMaskRect?: {
+    left: number;
+    top: number;
+    width: number;
+    height: number;
+    defaultColor: number;
+    /** 蒙版灰度单通道 base64（长宽 = width/height）。矩形实心蒙版省略。 */
+    dataB64?: string;
+  };
   /**
    * 基底层「烘焙调整前的原始像素」的 base64 PNG。
    * 仅当该层带调整图层（rawPsdAdjustments）时存在。
