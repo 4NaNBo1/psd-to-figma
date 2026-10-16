@@ -525,6 +525,7 @@ function buildShapeNode(
     inheritedGroupStrokes: layer.inheritedGroupStrokes,
     nineSliceSettings: layer.nineSliceSettings,
     psdClipping: layer.clipped,
+    isImportHelper: layer.isImportHelper,
     rotation: layer.shapeRotation,
     // 带栅格像素的 shape 层：PS 已把旋转烘焙进 channel 像素，渲染期不再转一次。
     // 无栅格像素时（纯矢量合成路径）才需要渲染器按 rotation 旋转节点。

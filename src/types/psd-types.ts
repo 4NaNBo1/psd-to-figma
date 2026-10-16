@@ -151,6 +151,11 @@ export interface SerializedLayer {
   clipped: boolean;
   isArtboard?: boolean;
   isSubGroup?: boolean;
+  /**
+   * 仅用于导入画布显示的辅助节点（如多子层组效果并集 overlay）。
+   * renderer 写入 psd_import_helper plugin data，导出 PSD 时跳过。
+   */
+  isImportHelper?: boolean;
   children?: SerializedLayer[];
   textData?: SerializedTextData;
   imageIndex?: number;

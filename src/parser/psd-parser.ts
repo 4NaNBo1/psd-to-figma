@@ -3274,6 +3274,107 @@ async function compositeGroupEffectsIntoOnlyChild(
   return true;
 }
 
+/**
+ * 多子层 pass-through 组的 layer effects：PS 中组效果作用于「组内所有内容的合并 alpha 轮廓」。
+ * 旧逻辑把组效果逐子层下放成原生 effect，平台按每个子层自己的几何 bbox（而非图片 alpha）绘制
+ * 投影，于是大尺寸的透明卡片会被投出一整块不透明色带横贯画面。这里改为：把组内子层像素
+ * 按实际位置合成一张联合轮廓图，
+ * 交给 compositeLayerEffects 求出「仅效果」的可见增量 overlay，作为组内最上层辅助节点插入，
+ * 从而等价 PS 的「组效果作用于合并轮廓」。辅助节点带 isImportHelper，导出 PSD 时跳过。
+ */
+async function compositeGroupEffectsIntoUnionOverlay(
+  group: SerializedLayer,
+  images: Uint8Array[],
+  effectBundle: LayerEffectBundle,
+  patternOverlayMeta: PatternOverlayMeta | null
+): Promise<boolean> {
+  if (!hasAnyEffect(effectBundle)) return false;
+  // Color/Gradient/Pattern Overlay 作用于组内像素本身，增量反解不可靠；这类组退回旧的逐子层近似。
+  if (effectBundle.solidFill || effectBundle.gradientOverlay || effectBundle.patternOverlay || patternOverlayMeta) {
+    return false;
+  }
+
+  // 组内子层坐标：isSubGroup 的 x/y 恒为 0，子层坐标与组同级（相对上层 frame），故直接累加。
+  const draws: Array<{ x: number; y: number; w: number; h: number; imageIndex: number; opacity: number }> = [];
+  const collect = (n: SerializedLayer, ox: number, oy: number): void => {
+    const ax = ox + n.x;
+    const ay = oy + n.y;
+    if (n.visible !== false && !n.isImportHelper && n.imageIndex != null && images[n.imageIndex]) {
+      const e = n.expandOffset ?? 0;
+      draws.push({ x: ax - e, y: ay - e, w: n.width + e * 2, h: n.height + e * 2, imageIndex: n.imageIndex, opacity: n.opacity });
+    }
+    for (const c of n.children ?? []) collect(c, ax, ay);
+  };
+  for (const c of group.children ?? []) collect(c, 0, 0);
+  if (draws.length === 0) return false;
+
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (const d of draws) {
+    minX = Math.min(minX, d.x);
+    minY = Math.min(minY, d.y);
+    maxX = Math.max(maxX, d.x + d.w);
+    maxY = Math.max(maxY, d.y + d.h);
+  }
+  const unionW = Math.max(1, Math.round(maxX - minX));
+  const unionH = Math.max(1, Math.round(maxY - minY));
+  // 联合轮廓图超过平台单图上限时放弃，退回旧的逐子层近似。
+  if (unionW > FIGMA_MAX_IMAGE_DIMENSION || unionH > FIGMA_MAX_IMAGE_DIMENSION) return false;
+
+  const canvas = document.createElement('canvas');
+  canvas.width = unionW;
+  canvas.height = unionH;
+  const ctx = canvas.getContext('2d')!;
+  for (const d of draws) {
+    const bitmap = await createImageBitmap(new Blob([images[d.imageIndex]], { type: 'image/png' }));
+    // 组投影按「合并内容的 alpha」计算：子层自身的图层不透明度要参与，否则低透明度装饰层会投出过重的影子。
+    const prevAlpha = ctx.globalAlpha;
+    ctx.globalAlpha = Math.max(0, Math.min(1, d.opacity));
+    ctx.drawImage(bitmap as unknown as CanvasImageSource, d.x - minX, d.y - minY, d.w, d.h);
+    ctx.globalAlpha = prevAlpha;
+    if (typeof (bitmap as ImageBitmap).close === 'function') (bitmap as ImageBitmap).close();
+  }
+  const unionImageData = ctx.getImageData(0, 0, unionW, unionH);
+
+  const { expand, effectOverlayPng } = await compositeLayerEffects(
+    unionImageData,
+    effectBundle.fillOpacity,
+    effectBundle,
+    null,
+    null,
+    true
+  );
+  if (!effectOverlayPng || expand <= 0) return false;
+
+  // 增量 overlay 必须真的包含可见像素，否则说明该组效果在合并轮廓上无视觉贡献。
+  const overlayData = (await pngToImageData(effectOverlayPng)).data;
+  let visiblePixels = 0;
+  for (let i = 3; i < overlayData.length; i += 4) {
+    if (overlayData[i] > 0) visiblePixels++;
+  }
+  if (visiblePixels === 0) return false;
+
+  const overlayIndex = images.length;
+  images.push(effectOverlayPng);
+  group.children!.push({
+    id: `layer-${overlayIndex}-effects-union`,
+    name: `${group.name} (effects overlay)`,
+    type: 'image',
+    imageIndex: overlayIndex,
+    x: minX - expand,
+    y: minY - expand,
+    width: unionW + expand * 2,
+    height: unionH + expand * 2,
+    opacity: 1,
+    blendMode: 'NORMAL',
+    visible: true,
+    clipped: false,
+    effects: [],
+    strokes: [],
+    isImportHelper: true,
+  });
+  return true;
+}
+
 async function serializeLayer(
   layer: Layer,
   images: Uint8Array[],
@@ -3968,7 +4069,27 @@ async function serializeLayer(
         if (compositedIntoOnlyChild) {
           serialized.strokes = [];
           serialized.effects = [];
-        } else {
+        } else if (serialized.children.length > 1) {
+          // 多子层组：按「组内子层联合 alpha 轮廓」生成一张仅效果的 overlay 辅助节点，
+          // 等价 PS 的「组效果作用于合并轮廓」，避免逐子层几何投影产生的错误色带。
+          let compositedIntoUnionOverlay = false;
+          try {
+            compositedIntoUnionOverlay = await compositeGroupEffectsIntoUnionOverlay(
+              serialized,
+              images,
+              effectBundle,
+              patternOverlayMeta
+            );
+          } catch (e) {
+            logger.warn(`Failed to composite group effects into union overlay for "${serialized.name}": ${e instanceof Error ? e.message : e}`);
+          }
+          if (compositedIntoUnionOverlay) {
+            serialized.strokes = [];
+            serialized.effects = [];
+          }
+        }
+
+        if (serialized.strokes.length > 0 || serialized.effects.length > 0) {
           for (const child of serialized.children) {
             if (groupStrokes.length > 0) {
               child.strokes = [...child.strokes, ...groupStrokes];
