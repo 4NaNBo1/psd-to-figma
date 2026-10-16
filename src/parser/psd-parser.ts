@@ -671,7 +671,8 @@ async function pngToImageData(bytes: Uint8Array): Promise<ImageData> {
   const ctx = canvas.getContext('2d')!;
   ctx.drawImage(bitmap, 0, 0);
   const imageData = ctx.getImageData(0, 0, bitmap.width, bitmap.height);
-  bitmap.close();
+  // 平台实现可能有差异（Figma 的 ImageBitmap 有 close()，某些宿主返回的位图没有）。
+  if (typeof bitmap.close === 'function') bitmap.close();
   return imageData;
 }
 
