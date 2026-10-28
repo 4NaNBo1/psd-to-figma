@@ -235,35 +235,47 @@ function serializeAdjustmentMask(mask: any): {
   left: number; top: number; width: number; height: number; defaultColor: number; dataB64: string; empty?: boolean;
 } | null {
   if (!mask || mask.disabled) return null;
-  let pixels: Uint8ClampedArray | Uint8Array | Uint16Array | Float32Array | null = null;
-  let mW = 0, mH = 0;
-  if (mask.imageData && mask.imageData.width > 0 && mask.imageData.height > 0) {
-    pixels = mask.imageData.data;
-    mW = mask.imageData.width;
-    mH = mask.imageData.height;
-  } else if (mask.canvas && mask.canvas.width > 0) {
-    const cvs = mask.canvas as HTMLCanvasElement;
-    pixels = cvs.getContext('2d')!.getImageData(0, 0, cvs.width, cvs.height).data;
-    mW = cvs.width;
-    mH = cvs.height;
-  }
+  const gray = extractMaskGray(mask);
   // 存在 mask 但无像素数据(全白/全黑空蒙版，defaultColor)：保留为「空蒙版」标记，
   // 让导出端创建对应的空蒙版，使 PS 图层面板结构与原始一致(调整层旁的蒙版缩略图)。
-  if (!pixels || mW === 0 || mH === 0) {
+  if (!gray) {
     return { left: mask.left ?? 0, top: mask.top ?? 0, width: 0, height: 0, defaultColor: mask.defaultColor ?? 255, dataB64: '', empty: true };
   }
-  const stride = pixels.length === mW * mH ? 1 : 4;
-  // 抽取单通道 alpha
-  const single = new Uint8Array(mW * mH);
-  for (let i = 0; i < mW * mH; i++) single[i] = Math.max(0, Math.min(255, Math.round(Number(pixels[i * stride]))));
   return {
     left: mask.left ?? 0,
     top: mask.top ?? 0,
-    width: mW,
-    height: mH,
+    width: gray.width,
+    height: gray.height,
     defaultColor: mask.defaultColor ?? 255,
-    dataB64: uint8ArrayToBase64(single),
+    dataB64: uint8ArrayToBase64(gray.data),
   };
+}
+
+/**
+ * 抽出 PSD 蒙版的灰度单通道像素（PS 蒙版为灰度图，取 R 通道即可）。
+ * 支持 ag-psd 的 imageData 与 canvas 两种来源；无像素来源返回 null。
+ */
+function extractMaskGray(mask: any): { data: Uint8Array; width: number; height: number } | null {
+  let pixels: Uint8ClampedArray | Uint8Array | Uint16Array | Float32Array | null = null;
+  let width = 0, height = 0;
+  if (mask.imageData && mask.imageData.width > 0 && mask.imageData.height > 0) {
+    pixels = mask.imageData.data;
+    width = mask.imageData.width;
+    height = mask.imageData.height;
+  } else if (mask.canvas && mask.canvas.width > 0 && mask.canvas.height > 0) {
+    const cvs = mask.canvas as HTMLCanvasElement;
+    pixels = cvs.getContext('2d')!.getImageData(0, 0, cvs.width, cvs.height).data;
+    width = cvs.width;
+    height = cvs.height;
+  }
+  if (!pixels || width === 0 || height === 0) return null;
+  // 单通道蒙版长度为 w*h，RGBA 为 w*h*4；两者都取首通道。
+  const stride = pixels.length === width * height ? 1 : 4;
+  const single = new Uint8Array(width * height);
+  for (let i = 0; i < single.length; i++) {
+    single[i] = Math.max(0, Math.min(255, Math.round(Number(pixels[i * stride]))));
+  }
+  return { data: single, width, height };
 }
 
 function applyAdjustmentLayers(baseLayer: Layer, clippedLayers: Layer[]): void {
@@ -659,7 +671,8 @@ async function pngToImageData(bytes: Uint8Array): Promise<ImageData> {
   const ctx = canvas.getContext('2d')!;
   ctx.drawImage(bitmap, 0, 0);
   const imageData = ctx.getImageData(0, 0, bitmap.width, bitmap.height);
-  bitmap.close();
+  // 平台实现可能有差异（Figma 的 ImageBitmap 有 close()，某些宿主返回的位图没有）。
+  if (typeof bitmap.close === 'function') bitmap.close();
   return imageData;
 }
 
@@ -1375,13 +1388,13 @@ function computeGroupBounds(layer: Layer): { left: number; top: number; right: n
 /**
  * 提取「组上的矩形图层蒙版」的画布绝对坐标框。
  * PSD 中组的 layer mask（带像素、未禁用）常用于裁剪溢出内容（如滚动视口）。
- * Figma/MasterGo 用 frame 的 clipsContent + 蒙版框尺寸表达这种矩形裁剪。
- * 用户场景中该蒙版为规则矩形，故直接取蒙版 bbox，不校验像素是否实心。
+ * 框几何决定 frame 的位置与尺寸；灰度像素（可能带圆角等不规则轮廓）在
+ * serializeLayer 中作为 alpha 蒙版烘焙进组内子层，显示因此不受「实心矩形」假设影响。
  * 返回 null：无蒙版 / 蒙版禁用 / 无像素来源 / 面积为 0。
  */
 function getGroupMaskRect(
   layer: Layer
-): { left: number; top: number; right: number; bottom: number; defaultColor: number } | null {
+): GroupMaskInfo | null {
   const mask = layer.mask;
   if (!mask || mask.disabled) return null;
 
@@ -1396,7 +1409,85 @@ function getGroupMaskRect(
   const bottom = mask.bottom ?? top;
   if (right - left <= 0 || bottom - top <= 0) return null;
 
-  return { left, top, right, bottom, defaultColor: mask.defaultColor ?? 255 };
+  const gray = extractMaskGray(mask);
+  // 无像素来源（canvas 兜底失败等）时退化为「框内全可见」的空蒙版：几何仍可用于裁剪。
+  if (!gray) {
+    return { left, top, right, bottom, defaultColor: mask.defaultColor ?? 255, width: 0, height: 0 };
+  }
+
+  return {
+    left,
+    top,
+    right,
+    bottom,
+    defaultColor: mask.defaultColor ?? 255,
+    width: gray.width,
+    height: gray.height,
+    gray: gray.data,
+  };
+}
+
+/** 组图层蒙版的解析结果：框几何 + 可选逐像素灰度。 */
+interface GroupMaskInfo {
+  left: number;
+  top: number;
+  right: number;
+  bottom: number;
+  defaultColor: number;
+  /** 灰度像素尺寸；为 0 表示无像素来源。 */
+  width: number;
+  height: number;
+  /** 灰度单通道像素（length = width * height）。 */
+  gray?: Uint8Array;
+}
+
+/**
+ * 把组图层蒙版作为 alpha 乘进组内可见子层的栅格像素，返回被改写的子层数量。
+ *
+ * PS 的组蒙版语义：像素 alpha ×= mask 灰度，蒙版框外按 defaultColor。这里只在有栅格
+ * 像素的子层上就地相乘（frame 几何与层级结构完全不变），因此纯矢量子层不受影响，
+ * 文本/智能对象等其它路径在下游各自读到的也已是带蒙版的像素。
+ */
+function applyGroupMaskToChildren(group: Layer, groupMask: GroupMaskInfo): number {
+  const gray = groupMask.gray!;
+  const maskW = groupMask.width;
+  const maskH = groupMask.height;
+  const defaultAlpha = Math.max(0, Math.min(255, groupMask.defaultColor));
+
+  let maskedCount = 0;
+  const walk = (layer: Layer): void => {
+    // 隐藏子层不贡献像素；组蒙版与子层自身的图层蒙版相互独立，这里只乘组蒙版。
+    if (layer.hidden) return;
+    const imageData = layer.imageData;
+    if (imageData && imageData.width > 0 && imageData.height > 0) {
+      const data = imageData.data;
+      if (data instanceof Uint8ClampedArray || data instanceof Uint8Array) {
+        const imgW = imageData.width;
+        const imgH = imageData.height;
+        const layerLeft = layer.left ?? 0;
+        const layerTop = layer.top ?? 0;
+        for (let y = 0; y < imgH; y++) {
+          const docY = layerTop + y;
+          const maskY = docY - groupMask.top;
+          for (let x = 0; x < imgW; x++) {
+            const docX = layerLeft + x;
+            const maskX = docX - groupMask.left;
+            const maskAlpha = (maskX >= 0 && maskX < maskW && maskY >= 0 && maskY < maskH)
+              ? gray[maskY * maskW + maskX]
+              : defaultAlpha;
+            if (maskAlpha === 255) continue;
+            const pIdx = (y * imgW + x) * 4;
+            data[pIdx + 3] = Math.round((data[pIdx + 3] * maskAlpha) / 255);
+          }
+        }
+        maskedCount++;
+      }
+    }
+    for (const child of layer.children ?? []) walk(child);
+  };
+
+  for (const child of group.children ?? []) walk(child);
+  return maskedCount;
 }
 
 function getArtboardBounds(layer: Layer): { left: number; top: number; right: number; bottom: number } | null {
@@ -3184,6 +3275,107 @@ async function compositeGroupEffectsIntoOnlyChild(
   return true;
 }
 
+/**
+ * 多子层 pass-through 组的 layer effects：PS 中组效果作用于「组内所有内容的合并 alpha 轮廓」。
+ * 旧逻辑把组效果逐子层下放成原生 effect，平台按每个子层自己的几何 bbox（而非图片 alpha）绘制
+ * 投影，于是大尺寸的透明卡片会被投出一整块不透明色带横贯画面。这里改为：把组内子层像素
+ * 按实际位置合成一张联合轮廓图，
+ * 交给 compositeLayerEffects 求出「仅效果」的可见增量 overlay，作为组内最上层辅助节点插入，
+ * 从而等价 PS 的「组效果作用于合并轮廓」。辅助节点带 isImportHelper，导出 PSD 时跳过。
+ */
+async function compositeGroupEffectsIntoUnionOverlay(
+  group: SerializedLayer,
+  images: Uint8Array[],
+  effectBundle: LayerEffectBundle,
+  patternOverlayMeta: PatternOverlayMeta | null
+): Promise<boolean> {
+  if (!hasAnyEffect(effectBundle)) return false;
+  // Color/Gradient/Pattern Overlay 作用于组内像素本身，增量反解不可靠；这类组退回旧的逐子层近似。
+  if (effectBundle.solidFill || effectBundle.gradientOverlay || effectBundle.patternOverlay || patternOverlayMeta) {
+    return false;
+  }
+
+  // 组内子层坐标：isSubGroup 的 x/y 恒为 0，子层坐标与组同级（相对上层 frame），故直接累加。
+  const draws: Array<{ x: number; y: number; w: number; h: number; imageIndex: number; opacity: number }> = [];
+  const collect = (n: SerializedLayer, ox: number, oy: number): void => {
+    const ax = ox + n.x;
+    const ay = oy + n.y;
+    if (n.visible !== false && !n.isImportHelper && n.imageIndex != null && images[n.imageIndex]) {
+      const e = n.expandOffset ?? 0;
+      draws.push({ x: ax - e, y: ay - e, w: n.width + e * 2, h: n.height + e * 2, imageIndex: n.imageIndex, opacity: n.opacity });
+    }
+    for (const c of n.children ?? []) collect(c, ax, ay);
+  };
+  for (const c of group.children ?? []) collect(c, 0, 0);
+  if (draws.length === 0) return false;
+
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (const d of draws) {
+    minX = Math.min(minX, d.x);
+    minY = Math.min(minY, d.y);
+    maxX = Math.max(maxX, d.x + d.w);
+    maxY = Math.max(maxY, d.y + d.h);
+  }
+  const unionW = Math.max(1, Math.round(maxX - minX));
+  const unionH = Math.max(1, Math.round(maxY - minY));
+  // 联合轮廓图超过平台单图上限时放弃，退回旧的逐子层近似。
+  if (unionW > FIGMA_MAX_IMAGE_DIMENSION || unionH > FIGMA_MAX_IMAGE_DIMENSION) return false;
+
+  const canvas = document.createElement('canvas');
+  canvas.width = unionW;
+  canvas.height = unionH;
+  const ctx = canvas.getContext('2d')!;
+  for (const d of draws) {
+    const bitmap = await createImageBitmap(new Blob([images[d.imageIndex]], { type: 'image/png' }));
+    // 组投影按「合并内容的 alpha」计算：子层自身的图层不透明度要参与，否则低透明度装饰层会投出过重的影子。
+    const prevAlpha = ctx.globalAlpha;
+    ctx.globalAlpha = Math.max(0, Math.min(1, d.opacity));
+    ctx.drawImage(bitmap as unknown as CanvasImageSource, d.x - minX, d.y - minY, d.w, d.h);
+    ctx.globalAlpha = prevAlpha;
+    if (typeof (bitmap as ImageBitmap).close === 'function') (bitmap as ImageBitmap).close();
+  }
+  const unionImageData = ctx.getImageData(0, 0, unionW, unionH);
+
+  const { expand, effectOverlayPng } = await compositeLayerEffects(
+    unionImageData,
+    effectBundle.fillOpacity,
+    effectBundle,
+    null,
+    null,
+    true
+  );
+  if (!effectOverlayPng || expand <= 0) return false;
+
+  // 增量 overlay 必须真的包含可见像素，否则说明该组效果在合并轮廓上无视觉贡献。
+  const overlayData = (await pngToImageData(effectOverlayPng)).data;
+  let visiblePixels = 0;
+  for (let i = 3; i < overlayData.length; i += 4) {
+    if (overlayData[i] > 0) visiblePixels++;
+  }
+  if (visiblePixels === 0) return false;
+
+  const overlayIndex = images.length;
+  images.push(effectOverlayPng);
+  group.children!.push({
+    id: `layer-${overlayIndex}-effects-union`,
+    name: `${group.name} (effects overlay)`,
+    type: 'image',
+    imageIndex: overlayIndex,
+    x: minX - expand,
+    y: minY - expand,
+    width: unionW + expand * 2,
+    height: unionH + expand * 2,
+    opacity: 1,
+    blendMode: 'NORMAL',
+    visible: true,
+    clipped: false,
+    effects: [],
+    strokes: [],
+    isImportHelper: true,
+  });
+  return true;
+}
+
 async function serializeLayer(
   layer: Layer,
   images: Uint8Array[],
@@ -3288,7 +3480,7 @@ async function serializeLayer(
     logger.info(`Layer "${displayName}": restored 9-slice metadata from PSD layer name`);
   }
 
-  // 组矩形蒙版：frame 已落在蒙版框原点，蒙版相对 frame 是满框矩形（left/top 恒 0）。
+  // 组蒙版：frame 已落在蒙版框原点，蒙版相对 frame 是满框矩形（left/top 恒 0）。
   if (groupMask) {
     serialized.groupMaskRect = {
       left: 0,
@@ -3296,6 +3488,8 @@ async function serializeLayer(
       width: Math.max(0, width),
       height: Math.max(0, height),
       defaultColor: groupMask.defaultColor,
+      // 逐像素灰度随字段透传，导出端据此重建与原始一致的 group layer mask。
+      dataB64: groupMask.gray ? uint8ArrayToBase64(groupMask.gray) : undefined,
     };
   }
 
@@ -3325,12 +3519,20 @@ async function serializeLayer(
     }
     const shapeRot = rotationFromVectorOrigination(layer);
     if (shapeRot != null) serialized.shapeRotation = shapeRot;
-    const vf = (layer as any).vectorFill;
-    if (vf?.type === 'color' && vf.color) {
-      serialized.overlayFills = [{
-        type: 'SOLID',
-        color: toColor(vf.color),
-      }];
+    // vectorFill 仅在「该层没有任何栅格像素」时用来兜底显示纯色矢量 shape。
+    // 带栅格像素的 shape 层（PS 已把形状+效果合成进 channel 像素）不能叠加不透明的
+    // SOLID overlay——它会被渲染器画在 IMAGE fill 之上，整层被纯色覆盖
+    // （如大量卡片/圆角矩形/图标按钮，画面被洗成淡色块）。
+    // round-trip 不受影响：导出端用 rawPsdVectorData 还原 vectorFill。
+    const hasRasterPixels = !!layer.imageData && layer.imageData.width > 0 && layer.imageData.height > 0;
+    if (!hasRasterPixels) {
+      const vf = (layer as any).vectorFill;
+      if (vf?.type === 'color' && vf.color) {
+        serialized.overlayFills = [{
+          type: 'SOLID',
+          color: toColor(vf.color),
+        }];
+      }
     }
   }
 
@@ -3818,6 +4020,18 @@ async function serializeLayer(
       }
     }
 
+    // 组图层蒙版烘焙：PS 对组蒙版的语义是「组内容 alpha × 蒙版灰度 alpha」（框外按
+    // defaultColor），而不是只把内容裁到蒙版框。蒙版灰度常有圆角等不规则轮廓
+    // （例如上下带弧形的圆角轮廓），若只按蒙版框矩形裁剪，内容会整块留在框外、
+    // 细节被拉宽。这里在子层序列化前把蒙版乘进子层原始像素，
+    // 之后栅格 / 效果合成 / round-trip 全部天然带上蒙版。
+    if (groupMask?.gray && groupMask.width > 0 && groupMask.height > 0) {
+      const maskedCount = applyGroupMaskToChildren(layer, groupMask);
+      if (maskedCount > 0) {
+        logger.info(`Group "${serialized.name}": baked layer mask alpha (${groupMask.width}x${groupMask.height}) into ${maskedCount} child layer(s)`);
+      }
+    }
+
     for (const child of layer.children) {
       const childSerialized = await serializeLayer(child, images, onProgress, depth + 1, childParentLeft, childParentTop, effectiveRootLeft, effectiveRootTop);
       if (childSerialized) {
@@ -3856,7 +4070,27 @@ async function serializeLayer(
         if (compositedIntoOnlyChild) {
           serialized.strokes = [];
           serialized.effects = [];
-        } else {
+        } else if (serialized.children.length > 1) {
+          // 多子层组：按「组内子层联合 alpha 轮廓」生成一张仅效果的 overlay 辅助节点，
+          // 等价 PS 的「组效果作用于合并轮廓」，避免逐子层几何投影产生的错误色带。
+          let compositedIntoUnionOverlay = false;
+          try {
+            compositedIntoUnionOverlay = await compositeGroupEffectsIntoUnionOverlay(
+              serialized,
+              images,
+              effectBundle,
+              patternOverlayMeta
+            );
+          } catch (e) {
+            logger.warn(`Failed to composite group effects into union overlay for "${serialized.name}": ${e instanceof Error ? e.message : e}`);
+          }
+          if (compositedIntoUnionOverlay) {
+            serialized.strokes = [];
+            serialized.effects = [];
+          }
+        }
+
+        if (serialized.strokes.length > 0 || serialized.effects.length > 0) {
           for (const child of serialized.children) {
             if (groupStrokes.length > 0) {
               child.strokes = [...child.strokes, ...groupStrokes];

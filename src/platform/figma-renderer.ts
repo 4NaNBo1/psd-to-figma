@@ -1,4 +1,4 @@
-import type { IRNode, IRFill, IRShadow, IRStroke, IRCornerRadii, IRTextProps, IRTextRange, IRGradientFill, IRSolidFill } from '../ir/types';
+import type { IRNode, IRFill, IRImageFill, IRShadow, IRStroke, IRCornerRadii, IRTextProps, IRTextRange, IRGradientFill, IRSolidFill } from '../ir/types';
 import type { PlatformRenderer, LogFn, ProgressFn, RenderOptions } from './types';
 import { writeNineSlicePluginDataForImport } from '../exporter/nine-slice-collapse';
 import { countIRNodes } from '../ir/builder';
@@ -159,12 +159,29 @@ function applySolidFills(node: MinimalFillsMixin, fills: IRSolidFill[]): void {
   }));
 }
 
+// Figma 的 ImagePaint.scaleMode 只接受 'FILL' | 'FIT' | 'CROP' | 'TILE'（见 @figma/plugin-typings）。
+// IR 里的 'STRETCH'（PNG 尺寸与图层 bbox 相等时由 builder 标记，见 ir/builder.ts）是 MasterGo 的能力，
+// Figma 不支持：直接透传会被平台拒绝，整层图片填充失效，画布上只剩灰色空块。
+// 该值触发条件本就是「图片与目标等比同尺寸」，'FILL' 在此条件下与 1:1 像素映射等价，
+// 也与文本层 raster companion 走同一路径。此处仅做 Figma 平台的降级映射，不动 IR / builder / MasterGo。
+const FIGMA_IMAGE_SCALE_MODES = ['FILL', 'FIT', 'CROP', 'TILE'] as const;
+type FigmaImageScaleMode = (typeof FIGMA_IMAGE_SCALE_MODES)[number];
+
+/** 把 IR 的 scaleMode 映射为 Figma 支持的枚举。非法值降级为 FILL 并给出告警。 */
+function toFigmaScaleMode(scaleMode: IRImageFill['scaleMode'], onLog: LogFn, name: string): FigmaImageScaleMode {
+  if ((FIGMA_IMAGE_SCALE_MODES as readonly string[]).includes(scaleMode)) {
+    return scaleMode as FigmaImageScaleMode;
+  }
+  onLog('warn', `Unsupported image scaleMode "${scaleMode}" on "${name}"; using "FILL" (Figma limitation)`);
+  return 'FILL';
+}
+
 /** 把单个 IRFill 转成 Figma Paint。IMAGE 需异步 createImage，返回 null 表示失败由调用方处理。 */
 function irFillToPaint(fill: IRFill, onLog: LogFn, name: string): Paint | null {
   if (fill.type === 'IMAGE') {
     try {
       const image = figma.createImage(fill.imageBytes);
-      return { type: 'IMAGE', imageHash: image.hash, scaleMode: fill.scaleMode };
+      return { type: 'IMAGE', imageHash: image.hash, scaleMode: toFigmaScaleMode(fill.scaleMode, onLog, name) };
     } catch (e) {
       onLog('warn', `Failed to apply image on "${name}": ${e instanceof Error ? e.message : e}`);
       return null;
@@ -317,8 +334,12 @@ async function createStyledTextNode(
     text.resize(Math.max(1, irNode.width), Math.max(1, irNode.height));
     try { text.locked = true; } catch { /* ignore */ }
     applyInheritedFxMarkers(text, irNode);
+    // 栅格像素已含旋转（rotationBaked）时不再转一次，否则双重旋转；角度仍存 plugin data 供导出还原。
     if (tp.rotation) {
-      text.rotation = tp.rotation;
+      try { text.setPluginData('psd_transform_rotation', String(tp.rotation)); } catch { /* ignore */ }
+      if (!irNode.rotationBaked) {
+        text.rotation = tp.rotation;
+      }
     }
     try { text.setPluginData('psd_text_rasterized', '1'); } catch { /* ignore */ }
     // 栅格化为对齐 companion 把 textAutoResize 强制设为 NONE，会污染导出端 isPointText 判定
@@ -348,7 +369,7 @@ async function createStyledTextNode(
         companion.visible = irNode.visible;
         if (irNode.opacity !== 1) companion.opacity = irNode.opacity;
         companion.blendMode = irNode.blendMode as BlendMode;
-        if (tp.rotation) companion.rotation = tp.rotation;
+        if (tp.rotation && !irNode.rotationBaked) companion.rotation = tp.rotation;
         try { companion.setPluginData('psd_raster_companion', '1'); } catch { /* ignore */ }
       }
     }
@@ -374,6 +395,9 @@ async function createStyledTextNode(
     alignTextPosition(text, irNode, onLog);
     if (tp.rotation) {
       text.rotation = tp.rotation;
+      // 与 mastergo 端保持对等：保存原始 PSD 旋转角（度，PS 约定：正=逆时针），
+      // 供导出端还原旋转 transform 与旋转后的 layer bbox，避免旋转文本被 PS 裁剪。
+      try { text.setPluginData('psd_transform_rotation', String(tp.rotation)); } catch { /* ignore */ }
     }
   }
 
@@ -625,7 +649,10 @@ async function renderNode(
         applyInheritedFxMarkers(rect, irNode);
         applyStrokes(rect, irNode.strokes, onLog, irNode.name);
         applyCornerRadii(rect, irNode.cornerRadii);
-        if (irNode.rotation != null && Math.abs(irNode.rotation) > 0.1) {
+        // rotationBaked（栅格像素已含旋转）时不转节点，也不写 psd_shape_rotation：
+        // 导出端用该 plugin data 作「导入时基准旋转」做 delta 判定，基准必须与平台实际
+        // rotation（此处为 0）一致，否则会误判成用户改过旋转而丢弃原始矢量数据。
+        if (irNode.rotation != null && Math.abs(irNode.rotation) > 0.1 && !irNode.rotationBaked) {
           rect.rotation = irNode.rotation;
           try { rect.setPluginData('psd_shape_rotation', String(irNode.rotation)); } catch { /* ignore */ }
         }
