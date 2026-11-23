@@ -12,6 +12,7 @@ import type {
 } from '../types/psd-types';
 import {
   findNineSliceHiddenSource,
+  readPngDimensions,
   isNineSliceComponent,
   NINE_SLICE_METADATA_KEY,
   prescanNineSliceHiddenSources,
@@ -43,8 +44,8 @@ type ProgressFn = (percent: number, message: string) => void;
 function getNodeChildrenForExport(node: any): { kids: any[]; exportOrderReversed: boolean } {
   const raw = node?.children;
   if (!Array.isArray(raw) || raw.length === 0) return { kids: [], exportOrderReversed: false };
-  const autoLayout = isMasterGo && node.flexMode && node.flexMode !== 'NONE';
-  const exportOrderReversed = !!(autoLayout && node.itemReverseZIndex === true);
+  const autoLayout = isMasterGo ? node.flexMode && node.flexMode !== 'NONE' : node.layoutMode && node.layoutMode !== 'NONE';
+  const exportOrderReversed = !!(autoLayout && node.itemReverseZIndex === true && (isMasterGo || !raw.some((child: any) => child.isMask)));
   return {
     kids: exportOrderReversed ? [...raw].reverse() : raw,
     exportOrderReversed,
@@ -745,6 +746,8 @@ async function exportNodeImage(node: any, options?: {
   withoutStrokesAndEffects?: boolean;
   imageFillOnly?: boolean;
   onRenderBounds?: (bounds: { x: number; y: number; width: number; height: number }) => void;
+  onRasterExport?: (bytes: Uint8Array, scale: number) => void;
+  absoluteBounds?: boolean;
 }): Promise<string | undefined> {
   if (typeof node.exportAsync !== 'function') return undefined;
 
@@ -830,10 +833,14 @@ async function exportNodeImage(node: any, options?: {
     const bounds = node.absoluteRenderBounds;
     if (bounds) options?.onRenderBounds?.(bounds);
     const bytes: Uint8Array = await withTimeout(
-      node.exportAsync({ format: 'PNG', constraint: { type: 'SCALE', value: scale } }),
+      node.exportAsync({
+        format: 'PNG', constraint: { type: 'SCALE', value: scale },
+        ...(!isMasterGo && options?.absoluteBounds ? { useAbsoluteBounds: true } : {}),
+      }),
       EXPORT_TIMEOUT_MS,
     );
     if (!bytes || bytes.length === 0) return undefined;
+    options?.onRasterExport?.(bytes, scale);
     return uint8ArrayToBase64(bytes);
   } catch {
     return undefined;
@@ -856,6 +863,83 @@ async function exportNodeImage(node: any, options?: {
     if (savedIsMaskVisible === false) {
       try { node.isMaskVisible = false; } catch { /* ignore */ }
     }
+  }
+}
+
+/** Give the PSD writer the raster's actual origin; never stretch it to the Figma node box. */
+async function exportFigmaRaster(
+  node: RectangleNode | VectorNode | EllipseNode | BooleanOperationNode, data: ExportNodeData, originX: number, originY: number, exportScale: number,
+): Promise<string | undefined> {
+  return exportNodeImage(node, {
+    exportScale,
+    onRasterExport: (bytes, scale) => {
+      const size = readPngDimensions(bytes);
+      const geometry = node.absoluteBoundingBox;
+      const visible = node.absoluteRenderBounds;
+      const matches = (bounds: NonNullable<typeof geometry>) => !!size &&
+        Math.abs(size.width - bounds.width * scale) <= 2 &&
+        Math.abs(size.height - bounds.height * scale) <= 2;
+      const bounds = visible && matches(visible) ? visible : geometry;
+      if (bounds) data.rasterOrigin = { x: bounds.x - originX, y: bounds.y - originY };
+    },
+  });
+}
+
+/** Export an isolated mask. Figma normally returns a transparent 1×1 PNG for mask nodes. */
+async function exportFigmaMask(node: SceneNode & BlendMixin, exportScale: number): Promise<string | undefined> {
+  const bounds = node.absoluteBoundingBox;
+  if (!bounds) return undefined;
+  let copy: (SceneNode & BlendMixin) | undefined;
+  try {
+    if (node.type === 'RECTANGLE') {
+      const rect: RectangleNode = api.createRectangle();
+      copy = rect;
+      rect.resize(node.width, node.height);
+      rect.fills = node.maskType === 'VECTOR' ? [{ type: 'SOLID', color: { r: 1, g: 1, b: 1 } }] : node.fills;
+      rect.topLeftRadius = node.topLeftRadius;
+      rect.topRightRadius = node.topRightRadius;
+      rect.bottomLeftRadius = node.bottomLeftRadius;
+      rect.bottomRightRadius = node.bottomRightRadius;
+      rect.cornerSmoothing = node.cornerSmoothing;
+      if (node.maskType !== 'VECTOR') {
+        rect.strokes = node.strokes;
+        rect.strokeWeight = node.strokeWeight;
+        rect.strokeAlign = node.strokeAlign;
+        rect.effects = node.effects;
+      }
+    } else if (node.type === 'VECTOR' && node.maskType === 'VECTOR') {
+      const vector: VectorNode = api.createVector();
+      copy = vector;
+      const network = node.vectorNetwork;
+      const white: SolidPaint = { type: 'SOLID', color: { r: 1, g: 1, b: 1 } };
+      // SVG-like vectorPaths omit Figma's per-vertex corner radii.
+      await vector.setVectorNetworkAsync({
+        vertices: network.vertices,
+        segments: network.segments,
+        regions: network.regions?.map(region => ({
+          windingRule: region.windingRule, loops: region.loops, fills: [white],
+        })),
+      });
+      vector.cornerSmoothing = node.cornerSmoothing;
+      vector.fills = [white];
+    } else if ('clone' in node) {
+      copy = node.clone() as SceneNode & BlendMixin;
+      api.currentPage.appendChild(copy);
+      copy.isMask = false;
+    }
+    if (!copy) return undefined;
+    const transform = node.absoluteTransform;
+    copy.relativeTransform = [
+      [transform[0][0], transform[0][1], transform[0][2] - bounds.x],
+      [transform[1][0], transform[1][1], transform[1][2] - bounds.y],
+    ];
+    copy.opacity = 1;
+    return await exportNodeImage(copy, { exportScale, absoluteBounds: true });
+  } catch {
+    // Some instance descendants cannot be cloned. A rectangle's geometry is still available.
+    return undefined;
+  } finally {
+    copy?.remove();
   }
 }
 
@@ -1041,26 +1125,76 @@ function containsText(node: any): boolean {
   return node.type === 'TEXT' || !!node.children?.some(containsText);
 }
 
-function mayUseBackdrop(node: any): boolean {
-  if (!getNodeVisible(node)) return false;
-  const usesBlend = (mode?: string) => !!mode && mode !== 'NORMAL' && mode !== 'PASS_THROUGH';
-  return usesBlend(node.blendMode) ||
-    (Array.isArray(node.fills) && node.fills.some((fill: any) => fill.visible !== false && usesBlend(fill.blendMode))) ||
-    (Array.isArray(node.effects) && node.effects.some((effect: any) => effect.visible !== false && effect.type === 'BACKGROUND_BLUR')) ||
-    !!node.children?.some(mayUseBackdrop);
+function hasMaskInSubtree(node: any): boolean {
+  return getNodeVisible(node) && (node.isMask === true || !!node.children?.some(hasMaskInSubtree));
+}
+
+function usesBackdropBlend(mode?: string): boolean {
+  return !!mode && mode !== 'NORMAL' && mode !== 'PASS_THROUGH';
+}
+
+// A visible, opaque copy of a vector mask underneath supplies the blend's entire
+// backdrop. Compare the network geometry as well as placement, including rounded vertices.
+function isOpaqueVectorMaskBase(base: any, mask: any): boolean {
+  if (base.type !== 'VECTOR' || mask.type !== 'VECTOR' || mask.maskType !== 'VECTOR' ||
+      base.isMask || base.opacity !== 1 || usesBackdropBlend(base.blendMode) || !getNodeVisible(base)) return false;
+  const geometry = (node: VectorNode) => {
+    const { vertices, segments, regions } = node.vectorNetwork;
+    return [vertices, segments, regions?.map(({ windingRule, loops }) => ({ windingRule, loops }))];
+  };
+  const opaquePaint = (paint: any) => paint.visible !== false && (paint.opacity ?? 1) === 1 &&
+    !usesBackdropBlend(paint.blendMode) &&
+    (paint.type === 'SOLID' ||
+      (paint.type.startsWith('GRADIENT_') && paint.gradientStops?.length &&
+        paint.gradientStops.every((stop: any) => stop.color.a === 1)));
+  if (!Array.isArray(base.fills) || !base.fills.some(opaquePaint) ||
+      base.vectorNetwork.regions?.some((region: VectorRegion) => region.fills?.length && !region.fills.some(opaquePaint)) ||
+      base.effects?.some((effect: any) => effect.visible !== false &&
+        ['LAYER_BLUR', 'BACKGROUND_BLUR'].includes(effect.type))) return false;
+  return base.cornerSmoothing === mask.cornerSmoothing &&
+    JSON.stringify(base.absoluteTransform) === JSON.stringify(mask.absoluteTransform) &&
+    JSON.stringify(geometry(base)) === JSON.stringify(geometry(mask));
+}
+
+function mayUseBackdrop(node: any, coveredByInternalBase = false): boolean {
+  if (!getNodeVisible(node) || node.opacity === 0 || node.isMask) return false;
+  if (node.effects?.some((effect: any) => effect.visible !== false && effect.type === 'BACKGROUND_BLUR')) {
+    return true;
+  }
+  if (!coveredByInternalBase && (usesBackdropBlend(node.blendMode) ||
+      (Array.isArray(node.fills) && node.fills.some((fill: any) => fill.visible !== false &&
+        usesBackdropBlend(fill.blendMode))))) return true;
+
+  let coveredByMaskBase = false;
+  let previous: any;
+  for (const child of node.children ?? []) {
+    if (!getNodeVisible(child) || child.opacity === 0) continue;
+    if (child.isMask) {
+      coveredByMaskBase = !!previous && isOpaqueVectorMaskBase(previous, child);
+    } else if (mayUseBackdrop(child, coveredByInternalBase || coveredByMaskBase)) {
+      return true;
+    }
+    previous = child;
+  }
+  return false;
 }
 
 async function rasterizeDecorativeGroup(
   node: any, data: ExportNodeData, parentX: number, parentY: number,
-  exportScale: number, onLog: LogFn,
+  exportScale: number, onLog: LogFn, ignoreHiddenLayers: boolean,
 ): Promise<ExportNodeData | undefined> {
-  if (!RASTER_GROUP_PREFIX.test(data.name)) return undefined;
+  const marked = RASTER_GROUP_PREFIX.test(data.name);
+  const automatic = data.figmaNative && ignoreHiddenLayers && node.children?.length > 0 &&
+    data.opacity > 0 && (data.clipsContent || node.children.some(hasMaskInSubtree));
+  if (!marked && !automatic) return undefined;
   if (isMasterGo || !['frame', 'group', 'instance', 'component'].includes(data.type) ||
       !data.visible || data.isMask || isClippedByIsMaskSibling(node) ||
       containsText(node) || containsImportedPsdData(node)) {
-    onLog('warn', `保留「${data.name}」的图层结构：转图只适用于 Figma 可见、无文字的独立装饰组。`);
+    if (marked) onLog('warn', `保留「${data.name}」的图层结构：转图只适用于 Figma 可见、无文字的独立装饰组。`);
     return undefined;
   }
+  const usesBackdrop = mayUseBackdrop(node);
+  if (!marked && usesBackdrop) return undefined;
   const bounds = node.absoluteRenderBounds;
   if (!bounds || bounds.width <= 0 || bounds.height <= 0) {
     onLog('warn', `无法转图「${data.name}」：没有可渲染区域，已保留分层。`);
@@ -1073,7 +1207,7 @@ async function rasterizeDecorativeGroup(
     onLog('warn', `无法按 ${exportScale}× 转图「${data.name}」：尺寸过大，已保留分层。`);
     return undefined;
   }
-  if (mayUseBackdrop(node)) {
+  if (usesBackdrop) {
     onLog('warn', `「${data.name}」含混合模式或背景模糊。如果依赖组外底图，请将实际参与混合的底图放进同一个转图组。`);
   }
   try {
@@ -1099,6 +1233,7 @@ async function rasterizeDecorativeGroup(
       clipsContent: false,
       imageBase64: uint8ArrayToBase64(bytes),
       rasterizedGroup: true,
+      platformRenderBaked: true,
     };
   } catch {
     onLog('warn', `无法转图「${data.name}」，已保留分层。`);
@@ -1185,8 +1320,10 @@ async function serializeNode(
   const selfVisible = getNodeVisible(node);
   const effectiveVisible = selfVisible && parentVisible;
 
+  const figmaNative = !isMasterGo && !node.getPluginDataKeys?.()?.some((key: string) => key.startsWith('psd_'));
   const data: ExportNodeData = {
     id: node.id,
+    figmaNative,
     name: node.name ?? 'Unnamed',
     type: nodeType,
     x: relX,
@@ -1203,13 +1340,29 @@ async function serializeNode(
     strokes: [],
     effects: [],
   };
-  const rasterized = await rasterizeDecorativeGroup(node, data, parentX, parentY, exportScale, onLog);
+  const rasterized = await rasterizeDecorativeGroup(node, data, parentX, parentY, exportScale, onLog, ignoreHiddenLayers);
   if (rasterized) {
     for (const child of node.children ?? []) processed.count += countNodes(child, ignoreHiddenLayers);
     return rasterized;
   }
-  if (nodeType === 'text') {
+  if (figmaNative && data.isMask) {
+    data.cornerRadii = extractCornerRadii(node);
+    const bounds = node.absoluteBoundingBox;
+    if (bounds) {
+      data.x = bounds.x - parentX;
+      data.y = bounds.y - parentY;
+      data.width = bounds.width;
+      data.height = bounds.height;
+    }
+    data.maskType = node.maskType;
+    data.imageBase64 = await exportFigmaMask(node, exportScale);
+    if (!data.imageBase64) onLog('warn', `未能读取蒙版「${data.name}」的像素。`);
+  } else if (nodeType === 'text') {
     data.textInfo = extractTextInfo(node);
+    if (data.textInfo && figmaNative) {
+      data.textInfo.rotation = node.rotation;
+      data.textInfo.verticalAlignment = node.textAlignVertical;
+    }
     if (data.textInfo) {
       try {
         const getData = (key: string): string => typeof node.getPluginData === 'function' ? node.getPluginData(key) : '';
@@ -1332,7 +1485,9 @@ async function serializeNode(
     data.strokes = extractStrokes(node);
     data.effects = extractEffects(node);
     data.cornerRadii = extractCornerRadii(node);
-    data.imageBase64 = await exportNodeImage(node, { exportScale });
+    if (!node.children?.length || !figmaNative) {
+      data.imageBase64 = await exportNodeImage(node, { exportScale });
+    }
     onLog('info', `Instance "${node.name}": exported as smart object`);
 
     if ('children' in node && node.children && Array.isArray(node.children)) {
@@ -1345,7 +1500,9 @@ async function serializeNode(
         const childData = await serializeNode(child, parentX, parentY, onLog, onProgress, processed, total, depth + 1, effectiveVisible, skippedNodeIds, exportScale, ignoreHiddenLayers);
         if (childData) data.children.push(childData);
       }
-      await bakePassThroughOverlays(node, data.children, onLog, parentX, parentY, exportOrderReversed, exportScale);
+      if (!figmaNative) {
+        await bakePassThroughOverlays(node, data.children, onLog, parentX, parentY, exportOrderReversed, exportScale);
+      }
     }
   } else if (nodeType === 'frame' || nodeType === 'group' || nodeType === 'component') {
     if (exportScale === 1 && nodeType === 'component' && isNineSliceComponent(node)) {
@@ -1365,7 +1522,9 @@ async function serializeNode(
         const childData = await serializeNode(child, parentX, parentY, onLog, onProgress, processed, total, depth + 1, effectiveVisible, skippedNodeIds, exportScale, ignoreHiddenLayers);
         if (childData) data.children.push(childData);
       }
-      await bakePassThroughOverlays(node, data.children, onLog, parentX, parentY, exportOrderReversed, exportScale);
+      if (!figmaNative) {
+        await bakePassThroughOverlays(node, data.children, onLog, parentX, parentY, exportOrderReversed, exportScale);
+      }
     }
 
     if (!isMasterGo && nodeType === 'frame' && data.children?.length &&
@@ -1377,6 +1536,11 @@ async function serializeNode(
       }
     } else if (data.fills.some(f => f.type === 'IMAGE' && f.visible)) {
       data.imageBase64 = await exportNodeImage(node, { exportScale });
+    }
+  } else if (figmaNative && ['rectangle', 'vector', 'ellipse'].includes(nodeType)) {
+    data.imageBase64 = await exportFigmaRaster(node, data, parentX, parentY, exportScale);
+    if (data.imageBase64) {
+      data.platformRenderBaked = true;
     }
   } else if (nodeType === 'vector' || nodeType === 'ellipse') {
     data.fills = extractFills(node);
@@ -1428,7 +1592,7 @@ async function serializeNode(
 
   attachPsdPluginData(node, data);
 
-  if (data.imageBase64 && (data.width <= 0 || data.height <= 0)) {
+  if (!data.rasterOrigin && data.imageBase64 && (data.width <= 0 || data.height <= 0)) {
     const bounds = node.absoluteRenderBounds;
     if (bounds) {
       data.x = bounds.x - parentX;
@@ -1444,7 +1608,7 @@ async function serializeNode(
   // 会把 ~525×523 压进 ~429×426，与 MasterGo 面板显示的旋转后尺寸不一致。
   try {
     const rot = typeof node.rotation === 'number' ? node.rotation : 0;
-    if (Math.abs(rot) > 0.1 && nodeType !== 'text') {
+    if (!data.rasterOrigin && Math.abs(rot) > 0.1 && nodeType !== 'text') {
       if (data.imageBase64) {
         const arb = node.absoluteRenderBounds;
         if (arb && Number.isFinite(arb.x) && Number.isFinite(arb.y) && arb.width > 0 && arb.height > 0) {
@@ -1637,6 +1801,10 @@ function scaleLayer(node: ExportNodeData, scale: number): void {
   node.y *= scale;
   node.width *= scale;
   node.height *= scale;
+  if (node.rasterOrigin) {
+    node.rasterOrigin.x *= scale;
+    node.rasterOrigin.y *= scale;
+  }
   if (node.cornerRadii) {
     node.cornerRadii.topLeft *= scale;
     node.cornerRadii.topRight *= scale;
@@ -1817,9 +1985,9 @@ export async function serializeSelection(
   if (exportScale !== 1) for (const node of nodes) scaleLayer(node, exportScale);
 
   const root = selection.length === 1 ? selection[0] : undefined;
-  const compositeBase64 = !isMasterGo && root?.type === 'FRAME' && root.visible &&
-    root.clipsContent && root.opacity === 1 && !root.rotation && !psdCanvasWidth
-    ? await exportNodeImage(root, { exportScale })
+  const compositeBase64 = !isMasterGo && root && ['FRAME', 'INSTANCE', 'COMPONENT'].includes(root.type) &&
+    root.visible && root.opacity === 1 && !root.rotation && !psdCanvasWidth
+    ? await exportNodeImage(root, { exportScale, absoluteBounds: true })
     : undefined;
 
   return {

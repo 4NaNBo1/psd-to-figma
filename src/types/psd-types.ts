@@ -341,6 +341,8 @@ export interface ExportTextInfo {
   alignment: 'LEFT' | 'CENTER' | 'RIGHT' | 'JUSTIFIED';
   styles: ExportTextStyleRange[];
   textAutoResize?: 'NONE' | 'HEIGHT' | 'WIDTH_AND_HEIGHT';
+  verticalAlignment?: 'TOP' | 'CENTER' | 'BOTTOM';
+  rotation?: number;
   /** 原始 PSD 文本 shapeType（point/box）。栅格化文本把 textAutoResize 强制设为 NONE 对齐 companion，
    * 会污染 isPointText 判定；导出时优先用此字段决定走 point/box 分支，保留缩放/旋转 transform。 */
   shapeType?: 'point' | 'box';
@@ -424,11 +426,16 @@ export interface ExportNodeData {
   visible: boolean;
   clipsContent: boolean;
   isMask: boolean;
+  maskType?: 'ALPHA' | 'VECTOR' | 'LUMINANCE';
   /** 导入时写入的原始 PSD layer.clipping；有值时导出优先于 isMask 推断。 */
   psdClipping?: boolean;
   isInstance: boolean;
 
   imageBase64?: string;
+  /** PNG already in document orientation, with its own origin rather than the node origin. */
+  rasterOrigin?: { x: number; y: number };
+  /** Native Figma nodes use Figma's stacking and mask rules. */
+  figmaNative?: boolean;
   frameFillBase64?: string;
   rasterizedGroup?: boolean;
   fills: ExportFillInfo[];
