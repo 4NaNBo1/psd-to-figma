@@ -141,6 +141,8 @@ api.ui.onmessage = async (rawMsg: any) => {
             message,
           } as PluginMessage);
         },
+        msg.scale,
+        msg.ignoreHiddenLayers,
       );
 
       sendLog('info', `Serialized ${result.nodes.length} nodes, canvas ${result.width}x${result.height}`);
@@ -152,6 +154,7 @@ api.ui.onmessage = async (rawMsg: any) => {
         height: result.height,
         engineData: result.engineData,
         patterns: result.patterns,
+        compositeBase64: result.compositeBase64,
       } as PluginMessage);
     } catch (err) {
       const message = err instanceof Error ? err.message : '导出失败';

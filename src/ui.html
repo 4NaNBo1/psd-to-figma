@@ -277,7 +277,8 @@
       white-space: nowrap;
     }
 
-    .filename-row input {
+    .filename-row input,
+    .filename-row select {
       flex: 1;
       padding: 6px 10px;
       border: 1px solid #444;
@@ -289,13 +290,28 @@
       transition: border-color 0.2s;
     }
 
-    .filename-row input:focus {
+    .filename-row input:focus,
+    .filename-row select:focus {
       border-color: #7b61ff;
     }
 
     .filename-row .ext {
       font-size: 12px;
       color: #888;
+    }
+
+    .export-checkbox {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      margin-top: 12px;
+      font-size: 12px;
+      color: #aaa;
+    }
+
+    .export-checkbox input {
+      margin: 0;
+      accent-color: #7b61ff;
     }
 
     .export-btn {
@@ -363,6 +379,20 @@
           <span class="ext">.psd</span>
         </div>
 
+        <div class="filename-row">
+          <label for="exportScale">PSD 导出倍率</label>
+          <select id="exportScale">
+            <option value="1">1×</option>
+            <option value="2">2×</option>
+            <option value="3" selected>3×</option>
+            <option value="4">4×</option>
+            <option value="5">5×</option>
+          </select>
+        </div>
+        <label class="export-checkbox">
+          <input type="checkbox" id="ignoreHiddenLayers" checked>
+          忽略隐藏图层
+        </label>
         <button class="export-btn" id="exportBtn" disabled>导出 PSD</button>
       </div>
 

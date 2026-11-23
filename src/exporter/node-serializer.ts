@@ -82,17 +82,18 @@ function isNativePassThroughOverlay(data: ExportNodeData): boolean {
 }
 
 function canBakePassThroughInto(target: ExportNodeData): boolean {
-  return !(target.children && target.children.length > 0);
+  return !target.rasterizedGroup && !target.styleOnlyExport && !(target.children && target.children.length > 0);
 }
 
 async function exportParentCompositeUpToChildIndex(
   parentNode: any,
   lastChildIndex: number,
   exportOrderReversed: boolean,
+  exportScale: number,
 ): Promise<string | undefined> {
   const kids = parentNode?.children;
   if (!Array.isArray(kids) || kids.length === 0) {
-    return exportNodeImage(parentNode);
+    return exportNodeImage(parentNode, { exportScale });
   }
 
   const savedVisible: boolean[] = [];
@@ -107,7 +108,7 @@ async function exportParentCompositeUpToChildIndex(
   await yieldThread();
 
   try {
-    return await exportNodeImage(parentNode);
+    return await exportNodeImage(parentNode, { exportScale });
   } finally {
     for (let i = 0; i < kids.length; i++) {
       setNodeVisible(kids[i], savedVisible[i]);
@@ -122,6 +123,7 @@ async function bakePassThroughOverlays(
   parentX: number,
   parentY: number,
   exportOrderReversed: boolean,
+  exportScale: number,
 ): Promise<void> {
   if (!children.length || !parentNode) return;
 
@@ -145,7 +147,11 @@ async function bakePassThroughOverlays(
   }
 
   const lastPt = ptIndices[ptIndices.length - 1];
-  const baked = await exportParentCompositeUpToChildIndex(parentNode, lastPt, exportOrderReversed);
+  const nativeChildren = parentNode.children;
+  const nativeIndex = nativeChildren.findIndex((child: any) => child.id === children[lastPt].id);
+  if (nativeIndex < 0) return;
+  const lastExportIndex = nativeChildIndexFromExportIndex(nativeIndex, nativeChildren.length, exportOrderReversed);
+  const baked = await exportParentCompositeUpToChildIndex(parentNode, lastExportIndex, exportOrderReversed, exportScale);
   if (!baked) return;
 
   bakeTarget.imageBase64 = baked;
@@ -716,6 +722,8 @@ function extractTextInfo(node: any): ExportTextInfo | undefined {
 }
 
 const MAX_IMAGE_DIMENSION = 4096;
+const MAX_SCALED_DIMENSION = 8192;
+const MAX_SCALED_PIXELS = 32 * 1024 * 1024;
 const EXPORT_TIMEOUT_MS = 15_000;
 
 function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
@@ -732,17 +740,21 @@ function yieldThread(): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, 0));
 }
 
-async function exportNodeImage(node: any, options?: { withoutStrokesAndEffects?: boolean }): Promise<string | undefined> {
+async function exportNodeImage(node: any, options?: {
+  exportScale?: number;
+  withoutStrokesAndEffects?: boolean;
+  imageFillOnly?: boolean;
+  onRenderBounds?: (bounds: { x: number; y: number; width: number; height: number }) => void;
+}): Promise<string | undefined> {
   if (typeof node.exportAsync !== 'function') return undefined;
 
-  const w = node.width ?? 0;
-  const h = node.height ?? 0;
+  const w = node.width || node.absoluteRenderBounds?.width || 0;
+  const h = node.height || node.absoluteRenderBounds?.height || 0;
   if (w <= 0 || h <= 0) return undefined;
 
-  let scale = 1;
-  if (w > MAX_IMAGE_DIMENSION || h > MAX_IMAGE_DIMENSION) {
-    scale = MAX_IMAGE_DIMENSION / Math.max(w, h);
-  }
+  const exportScale = options?.exportScale ?? 1;
+  const limit = exportScale === 1 ? MAX_IMAGE_DIMENSION : MAX_SCALED_DIMENSION;
+  const scale = Math.min(exportScale, limit / Math.max(w, h));
 
   // MasterGo/Figma 对不可见节点 exportAsync 可能返回空数据，
   // 临时设为可见再导出，导出后恢复原始可见性。
@@ -775,7 +787,7 @@ async function exportNodeImage(node: any, options?: { withoutStrokesAndEffects?:
       // 仅当同时存在 IMAGE fill 时才去掉叠加的 SOLID/GRADIENT overlay fill；
       // 纯 SOLID/GRADIENT 形状层需保留 fill 才能导出可见像素。
       const hasImageFill = Array.isArray(node.fills) && node.fills.some((f: any) => f && f.type === 'IMAGE');
-      if (hasImageFill && Array.isArray(node.fills) && node.fills.some((f: any) => f && f.type !== 'IMAGE')) {
+      if (options.imageFillOnly && hasImageFill && Array.isArray(node.fills) && node.fills.some((f: any) => f && f.type !== 'IMAGE')) {
         const imageOnly = node.fills.filter((f: any) => f && f.type === 'IMAGE');
         if (imageOnly.length !== node.fills.length) {
           savedFills = node.fills;
@@ -815,6 +827,8 @@ async function exportNodeImage(node: any, options?: { withoutStrokesAndEffects?:
   }
 
   try {
+    const bounds = node.absoluteRenderBounds;
+    if (bounds) options?.onRenderBounds?.(bounds);
     const bytes: Uint8Array = await withTimeout(
       node.exportAsync({ format: 'PNG', constraint: { type: 'SCALE', value: scale } }),
       EXPORT_TIMEOUT_MS,
@@ -845,11 +859,26 @@ async function exportNodeImage(node: any, options?: { withoutStrokesAndEffects?:
   }
 }
 
-function countNodes(node: any): number {
+async function exportFrameFill(node: FrameNode, exportScale: number): Promise<string | undefined> {
+  const copy = node.clone();
+  try {
+    api.currentPage.appendChild(copy);
+    copy.layoutMode = 'NONE';
+    for (const child of [...copy.children]) child.remove();
+    copy.rotation = 0;
+    copy.resizeWithoutConstraints(node.width, node.height);
+    return await exportNodeImage(copy, { withoutStrokesAndEffects: true, exportScale });
+  } finally {
+    copy.remove();
+  }
+}
+
+function countNodes(node: any, ignoreHiddenLayers = false): number {
+  if (ignoreHiddenLayers && !getNodeVisible(node)) return 0;
   let count = 1;
   if ('children' in node && node.children) {
     for (const child of node.children) {
-      count += countNodes(child);
+      count += countNodes(child, ignoreHiddenLayers);
     }
   }
   return count;
@@ -862,6 +891,13 @@ const MAX_DEPTH = 50;
 function getNodeVisible(node: any): boolean {
   if (typeof node.isVisible === 'boolean') return node.isVisible;
   if (typeof node.visible === 'boolean') return node.visible;
+  return true;
+}
+
+function isVisibleInCanvas(node: any): boolean {
+  for (let current = node; current; current = current.parent) {
+    if (!getNodeVisible(current)) return false;
+  }
   return true;
 }
 
@@ -999,6 +1035,77 @@ function findClosestCubeCatSibling(node: any): any | null {
   return best;
 }
 
+const RASTER_GROUP_PREFIX = /^\[(?:转图|raster)\]\s*/i;
+
+function containsText(node: any): boolean {
+  return node.type === 'TEXT' || !!node.children?.some(containsText);
+}
+
+function mayUseBackdrop(node: any): boolean {
+  if (!getNodeVisible(node)) return false;
+  const usesBlend = (mode?: string) => !!mode && mode !== 'NORMAL' && mode !== 'PASS_THROUGH';
+  return usesBlend(node.blendMode) ||
+    (Array.isArray(node.fills) && node.fills.some((fill: any) => fill.visible !== false && usesBlend(fill.blendMode))) ||
+    (Array.isArray(node.effects) && node.effects.some((effect: any) => effect.visible !== false && effect.type === 'BACKGROUND_BLUR')) ||
+    !!node.children?.some(mayUseBackdrop);
+}
+
+async function rasterizeDecorativeGroup(
+  node: any, data: ExportNodeData, parentX: number, parentY: number,
+  exportScale: number, onLog: LogFn,
+): Promise<ExportNodeData | undefined> {
+  if (!RASTER_GROUP_PREFIX.test(data.name)) return undefined;
+  if (isMasterGo || !['frame', 'group', 'instance', 'component'].includes(data.type) ||
+      !data.visible || data.isMask || isClippedByIsMaskSibling(node) ||
+      containsText(node) || containsImportedPsdData(node)) {
+    onLog('warn', `保留「${data.name}」的图层结构：转图只适用于 Figma 可见、无文字的独立装饰组。`);
+    return undefined;
+  }
+  const bounds = node.absoluteRenderBounds;
+  if (!bounds || bounds.width <= 0 || bounds.height <= 0) {
+    onLog('warn', `无法转图「${data.name}」：没有可渲染区域，已保留分层。`);
+    return undefined;
+  }
+  const limit = exportScale === 1 ? MAX_IMAGE_DIMENSION : MAX_SCALED_DIMENSION;
+  const width = Math.ceil(bounds.width * exportScale);
+  const height = Math.ceil(bounds.height * exportScale);
+  if (Math.max(width, height) > limit || width * height > MAX_SCALED_PIXELS) {
+    onLog('warn', `无法按 ${exportScale}× 转图「${data.name}」：尺寸过大，已保留分层。`);
+    return undefined;
+  }
+  if (mayUseBackdrop(node)) {
+    onLog('warn', `「${data.name}」含混合模式或背景模糊。如果依赖组外底图，请将实际参与混合的底图放进同一个转图组。`);
+  }
+  try {
+    const bytes: Uint8Array = await withTimeout(node.exportAsync({
+      format: 'PNG',
+      contentsOnly: true,
+      constraint: { type: 'SCALE', value: exportScale },
+    }), EXPORT_TIMEOUT_MS);
+    if (!bytes.length) throw new Error('Empty PNG');
+    const imageName = data.name.replace(RASTER_GROUP_PREFIX, '').trim() || '装饰图';
+    onLog('info', `已按 ${exportScale}× 转图「${imageName}」。`);
+    return {
+      ...data,
+      name: imageName,
+      type: 'rectangle',
+      x: bounds.x - parentX,
+      y: bounds.y - parentY,
+      width: bounds.width,
+      height: bounds.height,
+      opacity: 1,
+      blendMode: 'NORMAL',
+      isInstance: false,
+      clipsContent: false,
+      imageBase64: uint8ArrayToBase64(bytes),
+      rasterizedGroup: true,
+    };
+  } catch {
+    onLog('warn', `无法转图「${data.name}」，已保留分层。`);
+    return undefined;
+  }
+}
+
 async function serializeNode(
   node: any,
   parentX: number,
@@ -1010,8 +1117,11 @@ async function serializeNode(
   depth: number = 0,
   parentVisible: boolean = true,
   skippedNodeIds: Set<string> = new Set(),
+  exportScale = 1,
+  ignoreHiddenLayers = true,
 ): Promise<ExportNodeData | null> {
   if (!node || typeof node !== 'object') return null;
+  if (ignoreHiddenLayers && (!parentVisible || !getNodeVisible(node))) return null;
   if (skippedNodeIds.has(node.id)) return null;
   if (depth > MAX_DEPTH) {
     onLog('warn', `Skipping "${node.name}": exceeded max nesting depth`);
@@ -1093,6 +1203,11 @@ async function serializeNode(
     strokes: [],
     effects: [],
   };
+  const rasterized = await rasterizeDecorativeGroup(node, data, parentX, parentY, exportScale, onLog);
+  if (rasterized) {
+    for (const child of node.children ?? []) processed.count += countNodes(child, ignoreHiddenLayers);
+    return rasterized;
+  }
   if (nodeType === 'text') {
     data.textInfo = extractTextInfo(node);
     if (data.textInfo) {
@@ -1195,28 +1310,29 @@ async function serializeNode(
     data.fills = extractFills(node);
     data.strokes = extractStrokes(node);
     data.effects = extractEffects(node);
-    data.imageBase64 = await exportNodeImage(node, { withoutStrokesAndEffects: true });
-    try {
-      const abb = node.absoluteBoundingBox;
-      const arb = node.absoluteRenderBounds;
-      if (abb && arb && data.textInfo) {
+    const textBounds = node.absoluteBoundingBox;
+    data.imageBase64 = await exportNodeImage(node, {
+      withoutStrokesAndEffects: true,
+      exportScale,
+      onRenderBounds: (bounds) => {
+        if (!textBounds || !data.textInfo) return;
         data.textInfo.renderBoundsOffset = {
-          dx: arb.x - abb.x,
-          dy: arb.y - abb.y,
-          w: arb.width,
-          h: arb.height,
-          nodeW: abb.width,
-          nodeH: abb.height,
+          dx: bounds.x - textBounds.x,
+          dy: bounds.y - textBounds.y,
+          w: bounds.width,
+          h: bounds.height,
+          nodeW: textBounds.width,
+          nodeH: textBounds.height,
         };
-      }
-    } catch { /* ignore */ }
+      },
+    });
     onLog('info', `Text "${node.name}": ${data.textInfo?.characters.length ?? 0} chars`);
   } else if (nodeType === 'instance') {
     data.fills = extractFills(node);
     data.strokes = extractStrokes(node);
     data.effects = extractEffects(node);
     data.cornerRadii = extractCornerRadii(node);
-    data.imageBase64 = await exportNodeImage(node);
+    data.imageBase64 = await exportNodeImage(node, { exportScale });
     onLog('info', `Instance "${node.name}": exported as smart object`);
 
     if ('children' in node && node.children && Array.isArray(node.children)) {
@@ -1226,13 +1342,13 @@ async function serializeNode(
       for (const child of exportKids) {
         // 传画布原点（parentX/Y）保持不变，让所有节点的 data.x/y 都是相对画布原点的绝对偏移。
         // PSD layer.left/top 要求绝对坐标，group bbox=[0,0,0,0] 不影响子节点位置。
-        const childData = await serializeNode(child, parentX, parentY, onLog, onProgress, processed, total, depth + 1, effectiveVisible, skippedNodeIds);
+        const childData = await serializeNode(child, parentX, parentY, onLog, onProgress, processed, total, depth + 1, effectiveVisible, skippedNodeIds, exportScale, ignoreHiddenLayers);
         if (childData) data.children.push(childData);
       }
-      await bakePassThroughOverlays(node, data.children, onLog, parentX, parentY, exportOrderReversed);
+      await bakePassThroughOverlays(node, data.children, onLog, parentX, parentY, exportOrderReversed, exportScale);
     }
   } else if (nodeType === 'frame' || nodeType === 'group' || nodeType === 'component') {
-    if (nodeType === 'component' && isNineSliceComponent(node)) {
+    if (exportScale === 1 && nodeType === 'component' && isNineSliceComponent(node)) {
       return serializeNineSliceCollapsed(node, parentX, parentY, onLog, effectiveVisible, skippedNodeIds);
     }
 
@@ -1246,21 +1362,30 @@ async function serializeNode(
       prescanNineSliceHiddenSources(exportKids, skippedNodeIds, getNodeVisible);
       data.children = [];
       for (const child of exportKids) {
-        const childData = await serializeNode(child, parentX, parentY, onLog, onProgress, processed, total, depth + 1, effectiveVisible, skippedNodeIds);
+        const childData = await serializeNode(child, parentX, parentY, onLog, onProgress, processed, total, depth + 1, effectiveVisible, skippedNodeIds, exportScale, ignoreHiddenLayers);
         if (childData) data.children.push(childData);
       }
-      await bakePassThroughOverlays(node, data.children, onLog, parentX, parentY, exportOrderReversed);
+      await bakePassThroughOverlays(node, data.children, onLog, parentX, parentY, exportOrderReversed, exportScale);
     }
 
-    if (data.fills.some(f => f.type === 'IMAGE' && f.visible)) {
-      data.imageBase64 = await exportNodeImage(node);
+    if (!isMasterGo && nodeType === 'frame' && data.children?.length &&
+        data.fills.some(f => f.visible) && !hasEditablePsdRoundTripRestore(node)) {
+      try {
+        data.frameFillBase64 = await exportFrameFill(node, exportScale);
+      } catch {
+        onLog('warn', `Could not export the fill of frame "${node.name}" separately`);
+      }
+    } else if (data.fills.some(f => f.type === 'IMAGE' && f.visible)) {
+      data.imageBase64 = await exportNodeImage(node, { exportScale });
     }
   } else if (nodeType === 'vector' || nodeType === 'ellipse') {
     data.fills = extractFills(node);
-    data.strokes = extractStrokes(node);
     data.effects = extractEffects(node);
     data.cornerRadii = extractCornerRadii(node);
-    data.imageBase64 = await exportNodeImage(node);
+    data.imageBase64 = await exportNodeImage(node, { exportScale });
+    if (!data.imageBase64 || containsImportedPsdData(node)) {
+      data.strokes = extractStrokes(node);
+    }
     onLog('info', `Vector "${node.name}": exported as raster`);
   } else if (nodeType === 'rectangle') {
     data.fills = extractFills(node);
@@ -1288,20 +1413,31 @@ async function serializeNode(
       data.platformRenderBaked = bakePlatformRender;
       data.imageBase64 = await exportNodeImage(
         node,
-        bakePlatformRender ? undefined : { withoutStrokesAndEffects: true },
+        { exportScale, withoutStrokesAndEffects: !bakePlatformRender, imageFillOnly: hasRoundTripImage },
       );
     } else if (isStyleOnlyEditableRectangle) {
       data.styleOnlyExport = true;
     }
     // isMask 节点常无可见填充，矩形分支可能跳过 exportAsync；仍尝试导出 alpha 形状供 PSD layer.mask 使用
     if (data.isMask && !data.imageBase64) {
-      data.imageBase64 = await exportNodeImage(node);
+      data.imageBase64 = await exportNodeImage(node, { exportScale });
     }
   } else {
-    data.imageBase64 = await exportNodeImage(node);
+    data.imageBase64 = await exportNodeImage(node, { exportScale });
   }
 
   attachPsdPluginData(node, data);
+
+  if (data.imageBase64 && (data.width <= 0 || data.height <= 0)) {
+    const bounds = node.absoluteRenderBounds;
+    if (bounds) {
+      data.x = bounds.x - parentX;
+      data.y = bounds.y - parentY;
+      data.width = bounds.width;
+      data.height = bounds.height;
+      data.platformRenderBaked = true;
+    }
+  }
 
   // 旋转位图层
   // node.width/height 却是未旋转框；若仍用未旋转尺寸作 PSD bbox，fitCanvasCoverCrop
@@ -1424,8 +1560,8 @@ function collectMultiStrokeGroups(
   }
 }
 
-function findPsdEngineData(node: any): string | undefined {
-  if (!node || typeof node !== 'object') return undefined;
+function findPsdEngineData(node: any, ignoreHiddenLayers: boolean): string | undefined {
+  if (!node || typeof node !== 'object' || (ignoreHiddenLayers && !getNodeVisible(node))) return undefined;
   try {
     if (typeof node.getPluginData === 'function') {
       const v = node.getPluginData('psd_engine_data');
@@ -1434,7 +1570,7 @@ function findPsdEngineData(node: any): string | undefined {
   } catch { /* ignore */ }
   if ('children' in node && Array.isArray(node.children)) {
     for (const child of node.children) {
-      const r = findPsdEngineData(child);
+      const r = findPsdEngineData(child, ignoreHiddenLayers);
       if (r) return r;
     }
   }
@@ -1442,8 +1578,8 @@ function findPsdEngineData(node: any): string | undefined {
 }
 
 // 递归查找根 Section 上的 psd_patterns plugin data（PSD 全局 pattern 资源表 JSON）。
-function findPsdPatterns(node: any): string | undefined {
-  if (!node || typeof node !== 'object') return undefined;
+function findPsdPatterns(node: any, ignoreHiddenLayers: boolean): string | undefined {
+  if (!node || typeof node !== 'object' || (ignoreHiddenLayers && !getNodeVisible(node))) return undefined;
   try {
     if (typeof node.getPluginData === 'function') {
       const v = node.getPluginData('psd_patterns');
@@ -1452,7 +1588,7 @@ function findPsdPatterns(node: any): string | undefined {
   } catch { /* ignore */ }
   if ('children' in node && Array.isArray(node.children)) {
     for (const child of node.children) {
-      const r = findPsdPatterns(child);
+      const r = findPsdPatterns(child, ignoreHiddenLayers);
       if (r) return r;
     }
   }
@@ -1490,22 +1626,80 @@ function expandImportWrappers(selection: any[]): any[] {
   return out;
 }
 
+function containsImportedPsdData(node: any, ignoreHiddenLayers = false): boolean {
+  if (ignoreHiddenLayers && !getNodeVisible(node)) return false;
+  return !!node.getPluginDataKeys?.()?.some((key: string) => key.startsWith('psd_')) ||
+    !!node.children?.some((child: any) => containsImportedPsdData(child, ignoreHiddenLayers));
+}
+
+function scaleLayer(node: ExportNodeData, scale: number): void {
+  node.x *= scale;
+  node.y *= scale;
+  node.width *= scale;
+  node.height *= scale;
+  if (node.cornerRadii) {
+    node.cornerRadii.topLeft *= scale;
+    node.cornerRadii.topRight *= scale;
+    node.cornerRadii.bottomLeft *= scale;
+    node.cornerRadii.bottomRight *= scale;
+  }
+  if (node.visualLayerBbox) {
+    node.visualLayerBbox.left *= scale;
+    node.visualLayerBbox.top *= scale;
+    node.visualLayerBbox.width *= scale;
+    node.visualLayerBbox.height *= scale;
+  }
+  for (const stroke of node.strokes) stroke.weight *= scale;
+  for (const effect of node.effects) {
+    effect.offsetX *= scale;
+    effect.offsetY *= scale;
+    effect.blur *= scale;
+    effect.spread *= scale;
+  }
+  if (node.textInfo) {
+    for (const style of node.textInfo.styles) {
+      style.fontSize *= scale;
+      style.letterSpacing *= scale;
+      if (style.lineHeight !== null) style.lineHeight *= scale;
+    }
+    const bounds = node.textInfo.renderBoundsOffset;
+    if (bounds) {
+      bounds.dx *= scale;
+      bounds.dy *= scale;
+      bounds.w *= scale;
+      bounds.h *= scale;
+      bounds.nodeW *= scale;
+      bounds.nodeH *= scale;
+    }
+  }
+  for (const child of node.children ?? []) scaleLayer(child, scale);
+}
+
 export async function serializeSelection(
   onLog: LogFn,
   onProgress: ProgressFn,
-): Promise<{ nodes: ExportNodeData[]; width: number; height: number; engineData?: string; patterns?: string }> {
+  exportScale = 1,
+  ignoreHiddenLayers = true,
+): Promise<{ nodes: ExportNodeData[]; width: number; height: number; engineData?: string; patterns?: string; compositeBase64?: string }> {
   const page = isMasterGo ? mg.document.currentPage : api.currentPage;
-  const rawSelection = page.selection;
-
-  if (!rawSelection || rawSelection.length === 0) {
+  const selectedNodes: any[] = [...(page.selection ?? [])];
+  if (!selectedNodes.length) {
     throw new Error('没有选中任何节点');
+  }
+  const rawSelection = ignoreHiddenLayers ? selectedNodes.filter(isVisibleInCanvas) : selectedNodes;
+  if (!rawSelection.length) throw new Error('选中的图层均不可见。请显示图层或取消勾选「忽略隐藏图层」。');
+  if (!Number.isInteger(exportScale) || exportScale < 1 || exportScale > 5) {
+    throw new Error('请选择 1× 至 5× 的 PSD 导出倍率');
+  }
+  if (exportScale !== 1 && rawSelection.some(node => containsImportedPsdData(node, ignoreHiddenLayers))) {
+    throw new Error('选区含从 PSD 导入的图层。请用 1× 导出以保留原始 PSD 数据。');
   }
 
   // engineData 查找必须在「展开外壳」之前进行：psd_engine_data plugin data
   // 写在 Section 节点本身，展开后 Section 不再进入序列化树，需要先把它读出来。
   let engineData: string | undefined;
   for (const node of rawSelection) {
-    engineData = findPsdEngineData(node);
+    engineData = findPsdEngineData(node, ignoreHiddenLayers);
     if (engineData) break;
   }
   if (!engineData) {
@@ -1527,7 +1721,7 @@ export async function serializeSelection(
   // pattern 资源同样写在 Section 上，须在展开外壳前读出。
   let patterns: string | undefined;
   for (const node of rawSelection) {
-    patterns = findPsdPatterns(node);
+    patterns = findPsdPatterns(node, ignoreHiddenLayers);
     if (patterns) break;
   }
   if (!patterns) {
@@ -1544,6 +1738,9 @@ export async function serializeSelection(
       }
       if (patterns) break;
     }
+  }
+  if (exportScale !== 1 && (engineData || patterns)) {
+    throw new Error('选区含原始 PSD 数据。请用 1× 导出以保留原始 PSD 数据。');
   }
 
   // 展开 importer 凭空添加的根外壳（Section / isRootFrame Frame），让 PSD 顶层结构
@@ -1570,7 +1767,8 @@ export async function serializeSelection(
       }
     } catch { /* ignore */ }
   }
-  const selection = expandImportWrappers(rawSelection);
+  const expandedSelection = expandImportWrappers(rawSelection);
+  const selection = ignoreHiddenLayers ? expandedSelection.filter(isVisibleInCanvas) : expandedSelection;
   if (selection.length === 0) {
     throw new Error('选中的节点展开后为空');
   }
@@ -1581,7 +1779,7 @@ export async function serializeSelection(
 
   let totalNodes = 0;
   for (const node of selection) {
-    totalNodes += countNodes(node);
+    totalNodes += countNodes(node, ignoreHiddenLayers);
   }
   onLog('info', `Selection: ${selection.length} top-level nodes, ${totalNodes} total`);
 
@@ -1599,8 +1797,15 @@ export async function serializeSelection(
     maxY = Math.max(maxY, ay + (node.height ?? 0));
   }
 
+  const width = Math.max(1, Math.round((psdCanvasWidth || maxX - minX) * exportScale));
+  const height = Math.max(1, Math.round((psdCanvasHeight || maxY - minY) * exportScale));
+  if (exportScale !== 1 &&
+      (Math.max(width, height) > MAX_SCALED_DIMENSION || width * height > MAX_SCALED_PIXELS)) {
+    throw new Error(`导出尺寸 ${width} × ${height} px 过大，请降低 PSD 导出倍率。`);
+  }
+
   for (const node of selection) {
-    const nodeData = await serializeNode(node, minX, minY, onLog, onProgress, processed, totalNodes, 0, true, skippedNodeIds);
+    const nodeData = await serializeNode(node, minX, minY, onLog, onProgress, processed, totalNodes, 0, isVisibleInCanvas(node.parent), skippedNodeIds, exportScale, ignoreHiddenLayers);
     if (nodeData) nodes.push(nodeData);
   }
 
@@ -1609,12 +1814,20 @@ export async function serializeSelection(
   // 并通过 psd_multi_stroke_group_id 标记同组。这里把它们合并回单 ExportNodeData，
   // 主节点 (index=0) 承载所有 stroke，副本节点从导出树中移除，保持 PSD 文件结构与原始一致。
   mergeMultiStrokeTextNodes(nodes, onLog);
+  if (exportScale !== 1) for (const node of nodes) scaleLayer(node, exportScale);
+
+  const root = selection.length === 1 ? selection[0] : undefined;
+  const compositeBase64 = !isMasterGo && root?.type === 'FRAME' && root.visible &&
+    root.clipsContent && root.opacity === 1 && !root.rotation && !psdCanvasWidth
+    ? await exportNodeImage(root, { exportScale })
+    : undefined;
 
   return {
     nodes,
-    width: psdCanvasWidth > 0 ? Math.round(psdCanvasWidth) : Math.max(1, Math.round(maxX - minX)),
-    height: psdCanvasHeight > 0 ? Math.round(psdCanvasHeight) : Math.max(1, Math.round(maxY - minY)),
+    width,
+    height,
     engineData,
     patterns,
+    compositeBase64,
   };
 }

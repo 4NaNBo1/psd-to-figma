@@ -429,6 +429,8 @@ export interface ExportNodeData {
   isInstance: boolean;
 
   imageBase64?: string;
+  frameFillBase64?: string;
+  rasterizedGroup?: boolean;
   fills: ExportFillInfo[];
   strokes: ExportStrokeInfo[];
   effects: ExportEffectInfo[];
@@ -531,7 +533,7 @@ export type PluginMessage =
   | { type: 'progress-update'; percent: number; message: string }
   | { type: 'log'; level: 'info' | 'warn' | 'error'; message: string }
   | { type: 'selection-changed'; data: ExportSelectionInfo }
-  | { type: 'export-psd'; fileName: string }
+  | { type: 'export-psd'; fileName: string; scale?: number; ignoreHiddenLayers?: boolean }
   | { type: 'export-progress'; percent: number; message: string }
-  | { type: 'export-psd-data'; nodes: ExportNodeData[]; width: number; height: number; engineData?: string; patterns?: string }
+  | { type: 'export-psd-data'; nodes: ExportNodeData[]; width: number; height: number; engineData?: string; patterns?: string; compositeBase64?: string }
   | { type: 'export-psd-error'; message: string };

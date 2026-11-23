@@ -28,6 +28,8 @@ const tabExport = document.getElementById('tabExport')!;
 const selectionInfo = document.getElementById('selectionInfo')!;
 const filenameRow = document.getElementById('filenameRow')!;
 const exportFileName = document.getElementById('exportFileName') as HTMLInputElement;
+const exportScale = document.getElementById('exportScale') as HTMLSelectElement;
+const ignoreHiddenLayers = document.getElementById('ignoreHiddenLayers') as HTMLInputElement;
 const exportBtn = document.getElementById('exportBtn') as HTMLButtonElement;
 const exportProgressArea = document.getElementById('exportProgressArea')!;
 const exportProgressFill = document.getElementById('exportProgressFill')!;
@@ -335,7 +337,12 @@ exportBtn.addEventListener('click', () => {
   showExportProgress(0, '开始导出...');
   logger.info(`Export started: ${fileName}`);
 
-  const message: PluginMessage = { type: 'export-psd', fileName };
+  const message: PluginMessage = {
+    type: 'export-psd',
+    fileName,
+    scale: Number(exportScale.value),
+    ignoreHiddenLayers: ignoreHiddenLayers.checked,
+  };
   parent.postMessage({ pluginMessage: message }, '*');
 });
 
@@ -386,7 +393,7 @@ window.onmessage = (event) => {
 
       buildAndDownloadPsd(nodes, msg.width, msg.height, fileName, (percent, message) => {
         showExportProgress(percent, message);
-      }, msg.engineData, msg.patterns).then(() => {
+      }, msg.engineData, msg.patterns, msg.compositeBase64).then(() => {
         logger.info('Export complete');
         isExporting = false;
         exportBtn.disabled = selectionCount === 0;

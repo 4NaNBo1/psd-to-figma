@@ -733,7 +733,7 @@ function buildEffects(node: ExportNodeData, availablePatternIds?: Set<string>): 
   }
 
   const gradients = node.fills.filter(f => f.type.startsWith('GRADIENT_') && f.visible);
-  if (gradients.length > 0 && !fillBakedInRaster && !node.passThroughBaked) {
+  if (gradients.length > 0 && !fillBakedInRaster && !node.passThroughBaked && !node.frameFillBase64) {
     result.gradientOverlay = gradients.map(f => {
       const stops = f.gradientStops ?? [];
       const colorStops: ColorStop[] = stops.map(s => ({
@@ -984,12 +984,6 @@ async function buildLayer(node: ExportNodeData, parentClipRect?: { x: number; y:
 
   const isTextLayer = !!(node.textInfo && node.textInfo.characters);
   const hasPsdTextMetadata = isTextLayer && (node.textInfo!.bounds != null || node.textInfo!.boundingBox != null);
-  const isMultilineNoMeta = isTextLayer && !hasPsdTextMetadata && (() => {
-    const fs = node.textInfo!.styles?.[0]?.fontSize ?? 16;
-    const estCW = Math.max(1, fs * 0.6 * node.textInfo!.characters.length);
-    return estCW > node.width * 1.1;
-  })();
-  const shouldUseTextCanvas = isTextLayer && (hasPsdTextMetadata || isMultilineNoMeta);
   // round-trip 最高优先级：文本未被编辑时，用导入时保存的原始 PSD 文本栅格像素 + 原始文档坐标，
   // 规避 MasterGo/Figma 与 PS 同名字体（如 Asap SemiBold）字形度量差异导致的导出像素偏小/裁剪。
   // engineData（transform/boundingBox/font）仍在下方照常写回，保持文本可编辑。
@@ -1071,14 +1065,14 @@ async function buildLayer(node: ExportNodeData, parentClipRect?: { x: number; y:
     ? true
     : (!smartObjDowngrade &&
       !!(node.rawPsdPrePatternImage || node.rawPsdChannelImage || node.rawPsdOriginalImage || smartObjData?.origImageB64 || node.rawPsdLayerMaskImage));
-  if (!usedRawTextImage && effectiveImageBase64 && !(isTextLayer && !shouldUseTextCanvas)) {
+  if (!usedRawTextImage && effectiveImageBase64) {
     try {
       const pngBytes = base64ToUint8Array(effectiveImageBase64);
       const rawCanvas = await pngToCanvas(pngBytes);
       if (isTextLayer) {
         const intendedW = Math.max(1, layerRight - layerLeft);
         const intendedH = Math.max(1, layerBottom - layerTop);
-        if (isMultilineNoMeta) {
+        if (!hasPsdTextMetadata) {
           // MasterGo exportAsync 返回的 PNG 基于 absoluteRenderBounds（实际字符墨水范围），
           // 它的左上角 = absoluteRenderBounds.{x,y} = node.{x,y} + {dx,dy}
           const rbo = node.textInfo?.renderBoundsOffset;
@@ -1128,7 +1122,7 @@ async function buildLayer(node: ExportNodeData, parentClipRect?: { x: number; y:
         const cctx = cropped.getContext('2d')!;
         cctx.drawImage(rawCanvas, exp, exp, innerW, innerH, 0, 0, innerW, innerH);
         layer.canvas = cropped;
-      } else if (node.rotation != null && Math.abs(node.rotation) > 0.1 && !isTextLayer) {
+      } else if (node.rasterizedGroup || (node.rotation != null && Math.abs(node.rotation) > 0.1 && !isTextLayer)) {
         // exportAsync PNG = absoluteRenderBounds 尺寸，旋转已烘焙；禁止 fitCanvasCoverCrop 压到未旋转框。
         layer.canvas = rawCanvas;
         layerLeft = Math.round(node.x);
@@ -1621,6 +1615,15 @@ async function buildLayer(node: ExportNodeData, parentClipRect?: { x: number; y:
     if (layer.placedLayer) delete layer.placedLayer;
 
     layer.children = [];
+    if (node.frameFillBase64) {
+      const canvas = await pngToCanvas(base64ToUint8Array(node.frameFillBase64));
+      layer.children.push({
+        name: `${node.name} · Fill`,
+        left: Math.round(node.x),
+        top: Math.round(node.y),
+        canvas,
+      });
+    }
     const maskBaseIdx = node.children.findIndex(c => c.isMask);
     const maskNodeForClip = maskBaseIdx >= 0 && node.children[maskBaseIdx].psdClipping == null
       ? node.children[maskBaseIdx]
@@ -1831,6 +1834,7 @@ export async function buildAndDownloadPsd(
   onProgress: (percent: number, message: string) => void,
   engineData?: string,
   patterns?: string,
+  compositeBase64?: string,
 ): Promise<void> {
   onProgress(65, '构建 PSD 图层结构...');
 
@@ -1863,15 +1867,11 @@ export async function buildAndDownloadPsd(
 
   // 手动按 layer 顺序叠加生成 composite，让 PS 打开时显示正确的预览
   // ag-psd 不会从 layers 自动合成，必须显式提供
-  const compCanvas = document.createElement('canvas');
-  compCanvas.width = width;
-  compCanvas.height = height;
-  const compCtx = compCanvas.getContext('2d')!;
-  function paintLayerToComposite(layers: Layer[]): void {
+  function paintLayerToComposite(layers: Layer[], compCtx: CanvasRenderingContext2D): void {
     for (const l of layers) {
       if (l.hidden) continue;
       if (l.children && l.children.length > 0) {
-        paintLayerToComposite(l.children);
+        paintLayerToComposite(l.children, compCtx);
       } else if (((l as any).__clearComposite || (l as any).canvas || l.imageData) && (l.left != null) && (l.top != null)) {
         // 完整还原智能对象用清晰币画 composite 预览(__clearComposite)，其余用图层 canvas/imageData。
         compCtx.globalAlpha = l.opacity ?? 1;
@@ -1890,13 +1890,25 @@ export async function buildAndDownloadPsd(
       }
     }
   }
-  paintLayerToComposite(children);
+  let renderedComposite: HTMLCanvasElement | undefined;
+  if (compositeBase64) {
+    try {
+      const canvas = await pngToCanvas(base64ToUint8Array(compositeBase64));
+      if (canvas.width === width && canvas.height === height) renderedComposite = canvas;
+    } catch { /* ignore */ }
+  }
+  if (!renderedComposite) {
+    renderedComposite = document.createElement('canvas');
+    renderedComposite.width = width;
+    renderedComposite.height = height;
+    paintLayerToComposite(children, renderedComposite.getContext('2d')!);
+  }
 
   const psd: Psd = {
     width,
     height,
     children,
-    canvas: compCanvas,
+    canvas: renderedComposite,
   };
 
   // Preserve the original PSD's engineData (Txt2 block, base64) so PS can correctly associate
