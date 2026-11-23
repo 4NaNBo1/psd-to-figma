@@ -1,3 +1,5 @@
+import type { Locale } from '../i18n';
+
 export type LayerType = 'group' | 'image' | 'text' | 'shape' | 'smartObject';
 
 export interface SerializedColor {
@@ -525,13 +527,13 @@ export interface ExportNodeData {
   nineSliceSettings?: string;
 }
 
-export interface ExportSelectionInfo {
-  count: number;
-  names: string[];
+export interface ExportSelectionItem {
+  id: string;
+  name: string;
 }
 
 export type PluginMessage =
-  | { type: 'import-psd'; data: SerializedPsd; batchIndex?: number; batchTotal?: number }
+  | { type: 'import-psd'; data: SerializedPsd; batchIndex?: number; batchTotal?: number; locale?: Locale }
   | { type: 'import-psd-batch-start'; total: number }
   | { type: 'import-psd-batch-end' }
   | { type: 'progress'; percent: number; message: string }
@@ -539,8 +541,11 @@ export type PluginMessage =
   | { type: 'done' }
   | { type: 'progress-update'; percent: number; message: string }
   | { type: 'log'; level: 'info' | 'warn' | 'error'; message: string }
-  | { type: 'selection-changed'; data: ExportSelectionInfo }
-  | { type: 'export-psd'; fileName: string; scale?: number; ignoreHiddenLayers?: boolean }
+  | { type: 'request-selection' }
+  | { type: 'selection-changed'; items: ExportSelectionItem[] }
+  | { type: 'export-psd'; nodeId: string; scale?: number; ignoreHiddenLayers?: boolean; locale?: Locale }
   | { type: 'export-progress'; percent: number; message: string }
   | { type: 'export-psd-data'; nodes: ExportNodeData[]; width: number; height: number; engineData?: string; patterns?: string; compositeBase64?: string }
-  | { type: 'export-psd-error'; message: string };
+  | { type: 'export-psd-error'; message: string }
+  | { type: 'set-locale'; locale: Locale }
+  | { type: 'locale-loaded'; locale: Locale };

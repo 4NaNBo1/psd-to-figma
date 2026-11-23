@@ -1,0 +1,319 @@
+@import '@create-figma-plugin/ui/css/theme.css';
+@import '@create-figma-plugin/ui/css/base.css';
+
+:root {
+  --font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei', sans-serif;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  background-color: var(--figma-color-bg);
+  color: var(--figma-color-text);
+}
+
+.app-shell {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  overflow: hidden;
+}
+
+.app-main {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.tabs-shell {
+  position: relative;
+}
+
+.lang-toggle {
+  position: absolute;
+  top: var(--space-8);
+  right: var(--space-8);
+  z-index: 2;
+  height: var(--space-24);
+  padding: 0 var(--space-6);
+  border: var(--border-width-1) solid transparent;
+  border-radius: var(--border-radius-4);
+  background: transparent;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  font-family: var(--font-family);
+  font-size: var(--font-size-11);
+  line-height: 1;
+  cursor: pointer;
+}
+
+.lang-toggle:hover {
+  background-color: var(--figma-color-bg-hover);
+}
+
+.lang-toggle:focus-visible {
+  outline: none;
+  border-color: var(--figma-color-border-selected);
+}
+
+.lang-option-active {
+  color: var(--figma-color-text);
+  font-weight: var(--font-weight-bold);
+}
+
+.lang-option-inactive {
+  color: var(--figma-color-text-tertiary);
+}
+
+.lang-divider {
+  color: var(--figma-color-text-tertiary);
+  opacity: 0.6;
+}
+
+.panel {
+  padding: var(--space-16);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-12);
+}
+
+.dropzone-inner {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-6);
+  padding: var(--space-24) var(--space-12);
+}
+
+.dropzone-icon {
+  color: var(--figma-color-icon-secondary);
+}
+
+.selection-card {
+  display: flex;
+  align-items: center;
+  gap: var(--space-8);
+  padding: var(--space-8) var(--space-12);
+  border-radius: var(--border-radius-6);
+  background-color: var(--figma-color-bg-secondary);
+  min-height: 40px;
+}
+
+.selection-card-multi {
+  align-items: flex-start;
+}
+
+.selection-icon {
+  flex-shrink: 0;
+  color: var(--figma-color-icon-secondary);
+}
+
+.selection-single {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: var(--space-8);
+}
+
+.selection-label {
+  flex-shrink: 0;
+  color: var(--figma-color-text-secondary);
+}
+
+.selection-meta {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+
+.selection-list {
+  max-height: calc(3 * var(--space-20));
+  margin: 0;
+  padding: 0;
+  overflow-y: auto;
+  line-height: var(--space-20);
+  list-style: none;
+  color: var(--figma-color-text-secondary);
+}
+
+.truncate {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.field-group {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-6);
+}
+
+.field-label {
+  font-size: var(--font-size-11);
+  color: var(--figma-color-text-secondary);
+}
+
+.filename-input-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-6);
+}
+
+.filename-input-grow {
+  flex: 1;
+  min-width: 0;
+}
+
+.filename-ext {
+  flex-shrink: 0;
+  color: var(--figma-color-text-secondary);
+  font-family: var(--font-family-code);
+}
+
+.scale-control > div {
+  width: 100%;
+}
+
+.scale-control label {
+  flex: 1;
+}
+
+.progress-block {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-6);
+}
+
+.progress-track {
+  width: 100%;
+  height: 4px;
+  border-radius: 2px;
+  background-color: var(--figma-color-bg-tertiary);
+  overflow: hidden;
+}
+
+.progress-fill {
+  height: 100%;
+  border-radius: 2px;
+  background-color: var(--figma-color-bg-brand);
+  transition: width 0.2s ease;
+}
+
+.progress-message {
+  font-size: var(--font-size-11);
+  color: var(--figma-color-text-secondary);
+}
+
+.error-banner {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-6);
+  padding: var(--space-8);
+  border-radius: var(--border-radius-6);
+  background-color: var(--figma-color-bg-danger-tertiary);
+  color: var(--figma-color-text-danger);
+}
+
+.error-banner-icon {
+  flex-shrink: 0;
+  color: var(--figma-color-icon-danger);
+}
+
+.error-banner-text {
+  flex: 1;
+  min-width: 0;
+  white-space: pre-line;
+  word-break: break-word;
+}
+
+.app-footer {
+  flex-shrink: 0;
+  height: 32px;
+  padding: 0 var(--space-8) 0 var(--space-12);
+  border-top: var(--border-width-1) solid var(--figma-color-border);
+  background-color: var(--figma-color-bg);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-8);
+}
+
+.footer-meta {
+  display: flex;
+  align-items: center;
+  gap: var(--space-4);
+  font-size: var(--font-size-11);
+  color: var(--figma-color-text-secondary);
+  min-width: 0;
+}
+
+.footer-link {
+  color: var(--figma-color-text-secondary);
+  text-decoration: none;
+  cursor: pointer;
+}
+
+.footer-link:hover {
+  color: var(--figma-color-text);
+  text-decoration: underline;
+}
+
+.footer-update-link {
+  color: var(--figma-color-text-success);
+  font-weight: var(--font-weight-bold);
+  text-decoration: none;
+  cursor: pointer;
+}
+
+.footer-update-link:hover {
+  text-decoration: underline;
+}
+
+.footer-log-btn {
+  flex-shrink: 0;
+  height: var(--space-24);
+  padding: 0 var(--space-6);
+  border: var(--border-width-1) solid transparent;
+  border-radius: var(--border-radius-4);
+  background: transparent;
+  color: var(--figma-color-text-secondary);
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-4);
+  font-family: var(--font-family);
+  font-size: var(--font-size-11);
+  line-height: 1;
+  cursor: pointer;
+}
+
+.footer-log-btn:hover {
+  background-color: var(--figma-color-bg-hover);
+  color: var(--figma-color-text);
+}
+
+.footer-log-btn:focus-visible {
+  outline: none;
+  border-color: var(--figma-color-border-selected);
+}
+
+.footer-log-btn-icon {
+  width: 14px;
+  height: 14px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  overflow: visible;
+  flex-shrink: 0;
+}
+
+.footer-log-btn-copied,
+.footer-log-btn-copied:hover {
+  color: var(--figma-color-text-success);
+}

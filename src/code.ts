@@ -1,15 +1,18 @@
-import type { PluginMessage, SerializedPsd } from './types/psd-types';
+import type { PluginMessage } from './types/psd-types';
 import { buildIRTree } from './ir/builder';
 import { createRenderer } from './platform/index';
 import { serializeSelection } from './exporter/node-serializer';
+import { getMessages, isLocale, type Locale } from './i18n';
 
-declare const __VERSION__: string;
-declare const mg: any;
-const isMasterGo = typeof mg !== 'undefined';
+const LOCALE_STORAGE_KEY = 'psd_plugin_locale';
+let currentLocale: Locale = 'zh';
 
-const api = isMasterGo ? mg : figma;
-
-api.showUI(__html__, { width: 400, height: 460, title: `PSD Import & Export` });
+figma.showUI(__html__, {
+  width: 340,
+  height: 410,
+  title: 'PSD Import & Export',
+  themeColors: true,
+});
 
 // 批次内多个 PSD 水平依次排开时，相邻 section 之间的固定间距（画布像素）
 const BATCH_GAP = 100;
@@ -34,33 +37,52 @@ function computeNextPlacement(): { x: number; y: number } {
 type LogLevel = 'info' | 'warn' | 'error';
 
 function sendLog(level: LogLevel, message: string) {
-  api.ui.postMessage({ type: 'log', level, message } as PluginMessage);
+  figma.ui.postMessage({ type: 'log', level, message } as PluginMessage);
 }
 
 function sendSelectionInfo() {
-  const page = isMasterGo ? mg.document.currentPage : api.currentPage;
-  const selection = page.selection ?? [];
-  const names = selection.map((n: any) => n.name ?? 'Unnamed');
-  api.ui.postMessage({
+  const items = figma.currentPage.selection.map(({ id, name }) => ({ id, name }));
+  figma.ui.postMessage({
     type: 'selection-changed',
-    data: { count: selection.length, names },
+    items,
   } as PluginMessage);
 }
 
-// Push initial selection state once UI is ready
-sendSelectionInfo();
-
-// Listen for selection changes
-if (isMasterGo) {
+async function restoreSavedLocale() {
   try {
-    mg.on('selectionchange', () => sendSelectionInfo());
-  } catch { /* MasterGo may not support this event */ }
-} else {
-  figma.on('selectionchange', () => sendSelectionInfo());
+    const saved = await figma.clientStorage.getAsync(LOCALE_STORAGE_KEY);
+    if (isLocale(saved)) {
+      currentLocale = saved;
+      figma.ui.postMessage({
+        type: 'locale-loaded',
+        locale: saved,
+      } as PluginMessage);
+    }
+  } catch {
+    // ignore storage errors
+  }
 }
 
-api.ui.onmessage = async (rawMsg: any) => {
-  const msg: PluginMessage = isMasterGo && rawMsg?.pluginMessage ? rawMsg.pluginMessage : rawMsg;
+figma.on('selectionchange', () => sendSelectionInfo());
+void restoreSavedLocale();
+
+figma.ui.onmessage = async (msg: PluginMessage) => {
+  if (msg.type === 'set-locale') {
+    if (isLocale(msg.locale)) {
+      currentLocale = msg.locale;
+      try {
+        await figma.clientStorage.setAsync(LOCALE_STORAGE_KEY, msg.locale);
+      } catch {
+        // ignore storage errors
+      }
+    }
+    return;
+  }
+
+  if (msg.type === 'request-selection') {
+    sendSelectionInfo();
+    return;
+  }
 
   if (msg.type === 'import-psd-batch-start') {
     // 新批次开始：把锚点重置为当前视口（让首个文件落在用户当前视野中心）
@@ -80,23 +102,25 @@ api.ui.onmessage = async (rawMsg: any) => {
     const batchTotalForMsg = msg.batchTotal ?? 1;
     const isBatchTail = batchIndex >= batchTotalForMsg - 1;
     const prefix = batchTotalForMsg > 1 ? `[${batchIndex + 1}/${batchTotalForMsg}] ` : '';
+    const locale = isLocale(msg.locale) ? msg.locale : currentLocale;
+    const messages = getMessages(locale);
     sendLog('info', `${prefix}Received PSD: "${psd.name}" ${psd.width}x${psd.height}, ${psd.layers.length} layers, ${psd.images.length} images`);
 
     try {
-      api.ui.postMessage({
+      figma.ui.postMessage({
         type: 'progress-update',
         percent: 90,
-        message: `${prefix}Building IR tree...`,
+        message: `${prefix}${messages.buildingIrTree}`,
       } as PluginMessage);
 
       sendLog('info', `${prefix}Building IR tree...`);
       const irTree = buildIRTree(psd);
       sendLog('info', `${prefix}IR tree built: type=${irTree.type}, children=${irTree.children?.length}`);
 
-      api.ui.postMessage({
+      figma.ui.postMessage({
         type: 'progress-update',
         percent: 92,
-        message: `${prefix}Creating layers...`,
+        message: `${prefix}${messages.creatingLayers}`,
       } as PluginMessage);
 
       const renderer = createRenderer();
@@ -105,37 +129,43 @@ api.ui.onmessage = async (rawMsg: any) => {
       const placement = computeNextPlacement();
 
       await renderer.render(irTree, (percent, message) => {
-        api.ui.postMessage({
+        figma.ui.postMessage({
           type: 'progress-update',
           percent: 92 + Math.round(percent * 0.08),
           message: `${prefix}${message}`,
         } as PluginMessage);
-      }, sendLog, { placement, isBatchTail });
+      }, sendLog, { placement, isBatchTail, locale });
 
       // 记录占位矩形，供同批次后续文件水平排开
       lastImportRect = { x: placement.x, y: placement.y, w: psd.width, h: psd.height };
 
       sendLog('info', `${prefix}Render complete`);
-      api.ui.postMessage({ type: 'done' } as PluginMessage);
-      if (batchTotalForMsg === 1) api.notify('PSD import complete!');
-      else if (isBatchTail) api.notify(`PSD 导入完成：${batchTotalForMsg} 个文件`);
+      figma.ui.postMessage({ type: 'done' } as PluginMessage);
+      if (batchTotalForMsg === 1) figma.notify(messages.importCompleteNotify);
+      else if (isBatchTail) figma.notify(messages.importBatchCompleteNotify(batchTotalForMsg));
     } catch (err) {
-      const message = err instanceof Error ? err.message : 'Unknown error during import';
+      const message = err instanceof Error ? err.message : messages.unknownImportError;
       sendLog('error', `${prefix}Import failed: ${message}`);
-      api.ui.postMessage({ type: 'error', message: `${prefix}${message}` } as PluginMessage);
-      if (batchTotalForMsg === 1) api.notify('PSD import failed', { error: true });
+      figma.ui.postMessage({ type: 'error', message: `${prefix}${message}` } as PluginMessage);
+      if (batchTotalForMsg === 1) figma.notify(messages.importFailedNotify, { error: true });
     }
     return;
   }
 
   if (msg.type === 'export-psd') {
+    const locale = isLocale(msg.locale) ? msg.locale : currentLocale;
+    const messages = getMessages(locale);
     sendLog('info', 'Export PSD requested');
 
     try {
+      const node = await figma.getNodeByIdAsync(msg.nodeId);
+      if (!node || node.type === 'DOCUMENT' || node.type === 'PAGE') {
+        throw new Error(messages.exportNodeUnavailable);
+      }
       const result = await serializeSelection(
         sendLog,
         (percent, message) => {
-          api.ui.postMessage({
+          figma.ui.postMessage({
             type: 'export-progress',
             percent,
             message,
@@ -143,11 +173,13 @@ api.ui.onmessage = async (rawMsg: any) => {
         },
         msg.scale,
         msg.ignoreHiddenLayers,
+        locale,
+        [node],
       );
 
       sendLog('info', `Serialized ${result.nodes.length} nodes, canvas ${result.width}x${result.height}`);
 
-      api.ui.postMessage({
+      figma.ui.postMessage({
         type: 'export-psd-data',
         nodes: result.nodes,
         width: result.width,
@@ -157,9 +189,9 @@ api.ui.onmessage = async (rawMsg: any) => {
         compositeBase64: result.compositeBase64,
       } as PluginMessage);
     } catch (err) {
-      const message = err instanceof Error ? err.message : '导出失败';
+      const message = err instanceof Error ? err.message : messages.exportFailedFallback;
       sendLog('error', `Export failed: ${message}`);
-      api.ui.postMessage({
+      figma.ui.postMessage({
         type: 'export-psd-error',
         message,
       } as PluginMessage);

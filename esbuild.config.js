@@ -13,25 +13,31 @@ const htmlPlugin = {
       if (result.errors.length > 0) return;
 
       const jsPath = path.resolve(__dirname, 'dist/ui.js');
+      const cssPath = path.resolve(__dirname, 'dist/ui.css');
       if (!fs.existsSync(jsPath)) return;
 
-      const js = fs.readFileSync(jsPath, 'utf8');
+      const js = esbuild.transformSync(fs.readFileSync(jsPath, 'utf8'), {
+        minifyIdentifiers: true,
+        minifyWhitespace: true,
+      }).code;
+      const css = fs.readFileSync(cssPath, 'utf8');
+
       const htmlTemplate = fs.readFileSync(
         path.resolve(__dirname, 'src/ui.html'),
         'utf8'
       );
-      const html = htmlTemplate.replace(
-        '<!-- SCRIPT_PLACEHOLDER -->',
-        () => `<script>${js}</script>`
-      );
+      const html = htmlTemplate
+        .replace('<!-- STYLE_PLACEHOLDER -->', () => `<style>${css}</style>`)
+        .replace('<!-- SCRIPT_PLACEHOLDER -->', () => `<script>${js}</script>`);
       fs.writeFileSync(path.resolve(__dirname, 'dist/ui.html'), html);
       fs.unlinkSync(jsPath);
+      fs.unlinkSync(cssPath);
     });
   },
 };
 
-const copyManifestsPlugin = {
-  name: 'copy-manifests',
+const copyManifestPlugin = {
+  name: 'copy-manifest',
   setup(build) {
     build.onEnd((result) => {
       if (result.errors.length > 0) return;
@@ -42,9 +48,10 @@ const copyManifestsPlugin = {
       figmaManifest.ui = './ui.html';
       fs.writeFileSync(path.resolve(distDir, 'manifest.json'), JSON.stringify(figmaManifest, null, 2));
 
-      const mgManifest = JSON.parse(fs.readFileSync(path.resolve(__dirname, 'manifest.mastergo.json'), 'utf8'));
-      mgManifest.name = `PSD Importer by 4NaNBo1 - v${version}`;
-      fs.writeFileSync(path.resolve(distDir, 'manifest.mastergo.json'), JSON.stringify(mgManifest, null, 2));
+      const legacyMasterGoManifest = path.resolve(distDir, 'manifest.mastergo.json');
+      if (fs.existsSync(legacyMasterGoManifest)) {
+        fs.unlinkSync(legacyMasterGoManifest);
+      }
     });
   },
 };
@@ -52,7 +59,6 @@ const copyManifestsPlugin = {
 async function build() {
   const commonOptions = {
     bundle: true,
-    minify: true,
     target: 'es2017',
     define: {
       'process.env.NODE_ENV': '"production"',
@@ -62,10 +68,11 @@ async function build() {
 
   const sandboxCtx = await esbuild.context({
     ...commonOptions,
+    minify: true,
     entryPoints: ['src/code.ts'],
     outfile: 'dist/code.js',
     format: 'iife',
-    plugins: [copyManifestsPlugin],
+    plugins: [copyManifestPlugin],
   });
 
   const nodeShimPlugin = {
@@ -88,11 +95,31 @@ async function build() {
 
   const uiCtx = await esbuild.context({
     ...commonOptions,
-    entryPoints: ['src/ui.ts'],
+    minifyIdentifiers: false,
+    minifySyntax: true,
+    minifyWhitespace: true,
+    entryPoints: ['src/ui.tsx'],
     outfile: 'dist/ui.js',
     format: 'iife',
     platform: 'browser',
-    plugins: [nodeShimPlugin, htmlPlugin],
+    jsxFactory: 'h',
+    jsxFragment: 'Fragment',
+    loader: {
+      '.module.css': 'local-css',
+      '.css': 'css',
+    },
+    plugins: [
+      {
+        name: 'strip-css-bang-prefix',
+        setup(build) {
+          build.onResolve({ filter: /^!.*\.css$/ }, (args) => ({
+            path: path.resolve(args.resolveDir, args.path.slice(1)),
+          }));
+        },
+      },
+      nodeShimPlugin,
+      htmlPlugin,
+    ],
   });
 
   if (isWatch) {

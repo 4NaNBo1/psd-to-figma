@@ -1,15 +1,15 @@
-# PSD 剪贴蒙版（clipping mask）在 Figma / MasterGo 的渲染
+# PSD 剪贴蒙版（clipping mask）在 Figma 的渲染
 
 ## 背景
 
 PSD 剪贴蒙版（`layer.clipping = true`）的语义：被剪贴层只显示落在**基底层 alpha 形状**内的部分，且**基底层自身也显示**。
 
-在 Figma / MasterGo 中，用单个节点设 `isMask` 无法同时满足这两点——两种蒙版模式各有一个失败面，且不可兼得：
+在 Figma 中，用单个节点设 `isMask` 无法同时满足这两点——两种蒙版模式各有一个失败面，且不可兼得：
 
-| 蒙版模式 | MasterGo | Figma | mask 自身是否显示 | 裁剪形状 |
-| --- | --- | --- | --- | --- |
-| alpha 蒙版 | `isMaskOutline=false` | `maskType='ALPHA'` | ❌ 不显示（只贡献 alpha 通道） | ✅ 图片 alpha 形状（保留圆角等不规则形状） |
-| 轮廓蒙版 | `isMaskOutline=true` | `maskType='VECTOR'` | ✅ 显示 | ❌ 节点矩形（含 cornerRadii），丢失图片 alpha 的不规则形状 |
+| 蒙版模式 | Figma | mask 自身是否显示 | 裁剪形状 |
+| --- | --- | --- | --- |
+| alpha 蒙版 | `maskType='ALPHA'` | ❌ 不显示（只贡献 alpha 通道） | ✅ 图片 alpha 形状（保留圆角等不规则形状） |
+| 轮廓蒙版 | `maskType='VECTOR'` | ✅ 显示 | ❌ 节点矩形（含 cornerRadii），丢失图片 alpha 的不规则形状 |
 
 典型反例（来自 `新手礼包商城轮播图.psd`，含多个 clip group）：
 
@@ -34,12 +34,7 @@ clip group (frame, clipsContent=false)
 - 当基底效果已栅格化时，解析器额外生成“仅效果”叠加图，按 Photoshop 的 `base content → clipped content → base effects` 顺序放在最上方；该辅助节点带 `psd_import_helper` 标记，导出时跳过。
 - 显示职责给 `baseDisplay`、裁剪职责给 `baseMask`，二者解耦，因此不再依赖「mask 自身是否显示」这一平台行为。
 
-IR 通过 `IRNode.isMask` 字段（[src/ir/types.ts](../src/ir/types.ts)）标记 `baseMask`，两个 renderer 对称消费：
-
-- **MasterGo**（[src/platform/mastergo-renderer.ts](../src/platform/mastergo-renderer.ts)）：`isMask=true, isMaskOutline=false, isMaskVisible=false`（alpha 形状裁剪，自身不显示——显示由 baseDisplay 负责）。
-- **Figma**（[src/platform/figma-renderer.ts](../src/platform/figma-renderer.ts)）：`isMask=true, maskType='ALPHA'`。
-
-平台同步说明（遵循 [CLAUDE.md](../CLAUDE.md) §4）：双节点结构、alpha 蒙版裁剪是平台无关逻辑，两侧一致；`isMaskOutline/isMaskVisible`（MasterGo）与 `maskType`（Figma）是平台 API 差异，各自实现等价语义。
+IR 通过 `IRNode.isMask` 字段（[src/ir/types.ts](../src/ir/types.ts)）标记 `baseMask`，Figma 渲染器（[src/platform/figma-renderer.ts](../src/platform/figma-renderer.ts)）按 `isMask=true, maskType='ALPHA'` 消费。
 
 ## 已知限制
 

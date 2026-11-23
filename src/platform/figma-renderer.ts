@@ -2,10 +2,11 @@ import type { IRNode, IRFill, IRImageFill, IRShadow, IRStroke, IRCornerRadii, IR
 import type { PlatformRenderer, LogFn, ProgressFn, RenderOptions } from './types';
 import { writeNineSlicePluginDataForImport } from '../exporter/nine-slice-collapse';
 import { countIRNodes } from '../ir/builder';
+import { getMessages } from '../i18n';
 
 const FALLBACK_FONT: FontName = { family: 'Inter', style: 'Regular' };
 
-// radius=0 的纯 spread 阴影在部分平台渲染不出，给一个极小可见 radius 兜底（与 MasterGo 端对称，见 applyEffects）。
+// radius=0 的纯 spread 阴影在部分情况下渲染不出，给一个极小可见 radius 兜底。
 const MIN_VISIBLE_SHADOW_RADIUS = 0.01;
 
 const STYLE_VARIANT_GROUPS: string[][] = [
@@ -728,6 +729,7 @@ async function renderNode(
 export class FigmaRenderer implements PlatformRenderer {
   async render(tree: IRNode, onProgress: ProgressFn, onLog: LogFn, options?: RenderOptions): Promise<void> {
     const page = figma.currentPage;
+    const messages = getMessages(options?.locale);
     const totalNodes = countIRNodes(tree);
     let processed = 0;
 
@@ -735,7 +737,7 @@ export class FigmaRenderer implements PlatformRenderer {
       processed++;
       onProgress(
         Math.round((processed / totalNodes) * 100),
-        `Creating layers... (${processed}/${totalNodes})`
+        messages.creatingLayersProgress(processed, totalNodes)
       );
     };
 

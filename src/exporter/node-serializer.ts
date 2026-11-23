@@ -19,6 +19,7 @@ import {
   resolveNineSliceMetadataForExport,
   serializeNineSliceSettingsPayload,
 } from './nine-slice-collapse';
+import { getMessages, type Locale } from '../i18n';
 
 // Normalize platform TextCase ('UPPER'/'SMALL_CAPS'/'SMALL_CAPS_FORCED'/...) to our export case.
 // figma TITLE/LOWER 与 PSD fontCaps 无对应（PSD fontCaps 只有 normal/small/all caps），按 ORIGINAL 处理。
@@ -28,24 +29,20 @@ function normalizeTextCase(tc: any): SerializedTextCase | undefined {
   return undefined;
 }
 
-declare const mg: any;
-const isMasterGo = typeof mg !== 'undefined';
-const api: any = isMasterGo ? mg : (typeof figma !== 'undefined' ? figma : undefined);
-
 const MIXED = typeof figma !== 'undefined' ? (figma as any).mixed : undefined;
 
 type LogFn = (level: 'info' | 'warn' | 'error', message: string) => void;
 type ProgressFn = (percent: number, message: string) => void;
 
 /**
- * MasterGo 自动布局容器可通过 itemReverseZIndex 反转画布堆叠序（true 时第一层在最上）。
- * PS children[0] 恒为栈底，仅在此情况下反转以匹配 MG 绘制顺序。
+ * 自动布局容器可通过 itemReverseZIndex 反转画布堆叠序（true 时第一层在最上）。
+ * PS children[0] 恒为栈底，仅在此情况下反转以匹配画布绘制顺序。
  */
 function getNodeChildrenForExport(node: any): { kids: any[]; exportOrderReversed: boolean } {
   const raw = node?.children;
   if (!Array.isArray(raw) || raw.length === 0) return { kids: [], exportOrderReversed: false };
-  const autoLayout = isMasterGo ? node.flexMode && node.flexMode !== 'NONE' : node.layoutMode && node.layoutMode !== 'NONE';
-  const exportOrderReversed = !!(autoLayout && node.itemReverseZIndex === true && (isMasterGo || !raw.some((child: any) => child.isMask)));
+  const autoLayout = node.layoutMode && node.layoutMode !== 'NONE';
+  const exportOrderReversed = !!(autoLayout && node.itemReverseZIndex === true && !raw.some((child: any) => child.isMask));
   return {
     kids: exportOrderReversed ? [...raw].reverse() : raw,
     exportOrderReversed,
@@ -61,8 +58,7 @@ function nativeChildIndexFromExportIndex(
 }
 
 function setNodeVisible(node: any, visible: boolean): void {
-  const prop = typeof node.isVisible === 'boolean' ? 'isVisible' : 'visible';
-  try { node[prop] = visible; } catch { /* ignore */ }
+  try { node.visible = visible; } catch { /* ignore */ }
 }
 
 function isNativePassThroughOverlay(data: ExportNodeData): boolean {
@@ -452,7 +448,7 @@ function extractStrokes(node: any): ExportStrokeInfo[] {
   const align = node.strokeAlign ?? 'INSIDE';
   const result: ExportStrokeInfo[] = [];
   for (const stroke of strokes) {
-    if (stroke.visible === false || stroke.isVisible === false) continue;
+    if (stroke.visible === false) continue;
 
     if (stroke.type === 'SOLID') {
       result.push({
@@ -610,49 +606,6 @@ function extractTextInfo(node: any): ExportTextInfo | undefined {
   const len = characters.length;
   if (len === 0) return { characters, alignment, styles: [] };
 
-  // MasterGo uses node.textStyles (ReadonlyArray<TextSegStyle>) instead of getRangeFontName
-  const mgTextStyles: any[] | undefined = node.textStyles;
-  if (mgTextStyles && Array.isArray(mgTextStyles) && mgTextStyles.length > 0) {
-    const styles: ExportTextStyleRange[] = mgTextStyles.map(seg => {
-      const ts = seg.textStyle ?? {};
-      const fn = ts.fontName;
-      const fills = seg.fills;
-      let color: SerializedColor = { r: 0, g: 0, b: 0, a: 1 };
-      if (fills && fills.length > 0) {
-        const fill = fills[0];
-        if (fill.type === 'SOLID' && fill.color) {
-          const c = fill.color;
-          color = { r: c.r, g: c.g, b: c.b, a: fill.alpha ?? fill.opacity ?? 1 };
-        } else if (fill.type === 'GRADIENT_LINEAR' || fill.type === 'GRADIENT_RADIAL' || fill.type === 'GRADIENT_ANGULAR') {
-          color = { r: 1, g: 1, b: 1, a: 1 };
-        }
-      }
-      let letterSpacing = 0;
-      if (ts.letterSpacing) {
-        if (ts.letterSpacing.unit === 'PIXELS') letterSpacing = ts.letterSpacing.value;
-        else if (ts.letterSpacing.unit === 'PERCENT') letterSpacing = (ts.letterSpacing.value / 100) * (ts.fontSize ?? 16);
-      }
-      let lineHeight: number | null = null;
-      if (ts.lineHeight && ts.lineHeight.unit !== 'AUTO') {
-        if (ts.lineHeight.unit === 'PIXELS') lineHeight = ts.lineHeight.value;
-        else if (ts.lineHeight.unit === 'PERCENT') lineHeight = (ts.lineHeight.value / 100) * (ts.fontSize ?? 16);
-      }
-      const segTextCase = normalizeTextCase(ts.textCase);
-      return {
-        start: seg.start ?? 0,
-        end: seg.end ?? len,
-        fontFamily: fn?.family ?? 'Arial',
-        fontStyle: fn?.style ?? 'Regular',
-        fontSize: ts.fontSize ?? 16,
-        color,
-        letterSpacing,
-        lineHeight,
-        ...(segTextCase ? { textCase: segTextCase } : {}),
-      };
-    });
-    return { characters, alignment, styles, textAutoResize: node.textAutoResize };
-  }
-
   // Figma: Try whole-range first -- if the entire text has uniform style, one call is enough
   const hasRangeApi = typeof node.getRangeFontName === 'function';
   if (!hasRangeApi) {
@@ -759,13 +712,12 @@ async function exportNodeImage(node: any, options?: {
   const limit = exportScale === 1 ? MAX_IMAGE_DIMENSION : MAX_SCALED_DIMENSION;
   const scale = Math.min(exportScale, limit / Math.max(w, h));
 
-  // MasterGo/Figma 对不可见节点 exportAsync 可能返回空数据，
+  // Figma 对不可见节点 exportAsync 可能返回空数据，
   // 临时设为可见再导出，导出后恢复原始可见性。
   let wasHidden = false;
-  const visibleProp = typeof node.isVisible === 'boolean' ? 'isVisible' : 'visible';
-  if (node[visibleProp] === false) {
+  if (node.visible === false) {
     wasHidden = true;
-    try { node[visibleProp] = true; } catch { /* ignore */ }
+    try { node.visible = true; } catch { /* ignore */ }
     await yieldThread();
   }
 
@@ -818,24 +770,13 @@ async function exportNodeImage(node: any, options?: {
     }
   } catch { /* ignore */ }
 
-  // MasterGo isMask 节点 isMaskVisible=false 时不显示填充，exportAsync 可能导出空/错误像素；
-  // 临时显示蒙版像素以获取正确 alpha 形状。
-  let savedIsMaskVisible: boolean | undefined;
-  if (node.isMask === true && node.isMaskVisible === false) {
-    try {
-      savedIsMaskVisible = false;
-      node.isMaskVisible = true;
-      await yieldThread();
-    } catch { /* ignore */ }
-  }
-
   try {
     const bounds = node.absoluteRenderBounds;
     if (bounds) options?.onRenderBounds?.(bounds);
     const bytes: Uint8Array = await withTimeout(
       node.exportAsync({
         format: 'PNG', constraint: { type: 'SCALE', value: scale },
-        ...(!isMasterGo && options?.absoluteBounds ? { useAbsoluteBounds: true } : {}),
+        ...(options?.absoluteBounds ? { useAbsoluteBounds: true } : {}),
       }),
       EXPORT_TIMEOUT_MS,
     );
@@ -846,7 +787,7 @@ async function exportNodeImage(node: any, options?: {
     return undefined;
   } finally {
     if (wasHidden) {
-      try { node[visibleProp] = false; } catch { /* ignore */ }
+      try { node.visible = false; } catch { /* ignore */ }
     }
     if (savedStrokes !== undefined) {
       try { node.strokes = savedStrokes; } catch { /* ignore */ }
@@ -859,9 +800,6 @@ async function exportNodeImage(node: any, options?: {
     }
     if (savedOpacity !== undefined) {
       try { node.opacity = savedOpacity; } catch { /* ignore */ }
-    }
-    if (savedIsMaskVisible === false) {
-      try { node.isMaskVisible = false; } catch { /* ignore */ }
     }
   }
 }
@@ -892,7 +830,7 @@ async function exportFigmaMask(node: SceneNode & BlendMixin, exportScale: number
   let copy: (SceneNode & BlendMixin) | undefined;
   try {
     if (node.type === 'RECTANGLE') {
-      const rect: RectangleNode = api.createRectangle();
+      const rect: RectangleNode = figma.createRectangle();
       copy = rect;
       rect.resize(node.width, node.height);
       rect.fills = node.maskType === 'VECTOR' ? [{ type: 'SOLID', color: { r: 1, g: 1, b: 1 } }] : node.fills;
@@ -908,7 +846,7 @@ async function exportFigmaMask(node: SceneNode & BlendMixin, exportScale: number
         rect.effects = node.effects;
       }
     } else if (node.type === 'VECTOR' && node.maskType === 'VECTOR') {
-      const vector: VectorNode = api.createVector();
+      const vector: VectorNode = figma.createVector();
       copy = vector;
       const network = node.vectorNetwork;
       const white: SolidPaint = { type: 'SOLID', color: { r: 1, g: 1, b: 1 } };
@@ -924,7 +862,7 @@ async function exportFigmaMask(node: SceneNode & BlendMixin, exportScale: number
       vector.fills = [white];
     } else if ('clone' in node) {
       copy = node.clone() as SceneNode & BlendMixin;
-      api.currentPage.appendChild(copy);
+      figma.currentPage.appendChild(copy);
       copy.isMask = false;
     }
     if (!copy) return undefined;
@@ -946,7 +884,7 @@ async function exportFigmaMask(node: SceneNode & BlendMixin, exportScale: number
 async function exportFrameFill(node: FrameNode, exportScale: number): Promise<string | undefined> {
   const copy = node.clone();
   try {
-    api.currentPage.appendChild(copy);
+    figma.currentPage.appendChild(copy);
     copy.layoutMode = 'NONE';
     for (const child of [...copy.children]) child.remove();
     copy.rotation = 0;
@@ -970,10 +908,8 @@ function countNodes(node: any, ignoreHiddenLayers = false): number {
 
 const MAX_DEPTH = 50;
 
-// 读取节点的"可见"属性：兼容 MasterGo (`isVisible`) 和 Figma (`visible`)。
-// 两者都可能返回 undefined，此时按 true 处理（与 figma 默认值一致）。
+// 读取节点的可见属性；undefined 时按 true 处理（与 Figma 默认值一致）。
 function getNodeVisible(node: any): boolean {
-  if (typeof node.isVisible === 'boolean') return node.isVisible;
   if (typeof node.visible === 'boolean') return node.visible;
   return true;
 }
@@ -987,10 +923,10 @@ function isVisibleInCanvas(node: any): boolean {
 
 async function readNodeStoredImageBytes(node: any): Promise<Uint8Array | undefined> {
   if (!node || !Array.isArray(node.fills)) return undefined;
-  const imagePaint = node.fills.find((f: any) => f?.type === 'IMAGE' && typeof f.imageRef === 'string');
-  if (!imagePaint || typeof api?.getImageByHref !== 'function') return undefined;
+  const imagePaint = node.fills.find((f: any) => f?.type === 'IMAGE' && typeof f.imageHash === 'string');
+  if (!imagePaint || typeof figma?.getImageByHash !== 'function') return undefined;
   try {
-    return await api.getImageByHref(imagePaint.imageRef)?.getBytesAsync?.();
+    return await figma.getImageByHash(imagePaint.imageHash)?.getBytesAsync?.();
   } catch {
     return undefined;
   }
@@ -998,10 +934,10 @@ async function readNodeStoredImageBytes(node: any): Promise<Uint8Array | undefin
 
 async function exportNineSliceStoredImage(component: any): Promise<string | undefined> {
   if (Array.isArray(component.fills)) {
-    const imagePaint = component.fills.find((f: any) => f?.type === 'IMAGE' && typeof f.imageRef === 'string');
-    if (imagePaint && typeof api?.getImageByHref === 'function') {
+    const imagePaint = component.fills.find((f: any) => f?.type === 'IMAGE' && typeof f.imageHash === 'string');
+    if (imagePaint && typeof figma?.getImageByHash === 'function') {
       try {
-        const img = api.getImageByHref(imagePaint.imageRef);
+        const img = figma.getImageByHash(imagePaint.imageHash);
         const bytes: Uint8Array | undefined = await img?.getBytesAsync?.();
         if (bytes?.length) return uint8ArrayToBase64(bytes);
       } catch { /* ignore */ }
@@ -1187,7 +1123,7 @@ async function rasterizeDecorativeGroup(
   const automatic = data.figmaNative && ignoreHiddenLayers && node.children?.length > 0 &&
     data.opacity > 0 && (data.clipsContent || node.children.some(hasMaskInSubtree));
   if (!marked && !automatic) return undefined;
-  if (isMasterGo || !['frame', 'group', 'instance', 'component'].includes(data.type) ||
+  if (!['frame', 'group', 'instance', 'component'].includes(data.type) ||
       !data.visible || data.isMask || isClippedByIsMaskSibling(node) ||
       containsText(node) || containsImportedPsdData(node)) {
     if (marked) onLog('warn', `保留「${data.name}」的图层结构：转图只适用于 Figma 可见、无文字的独立装饰组。`);
@@ -1254,6 +1190,7 @@ async function serializeNode(
   skippedNodeIds: Set<string> = new Set(),
   exportScale = 1,
   ignoreHiddenLayers = true,
+  locale: Locale = 'zh',
 ): Promise<ExportNodeData | null> {
   if (!node || typeof node !== 'object') return null;
   if (ignoreHiddenLayers && (!parentVisible || !getNodeVisible(node))) return null;
@@ -1272,6 +1209,7 @@ async function serializeNode(
     }
   } catch { /* ignore */ }
 
+  const messages = getMessages(locale);
   const nodeType = mapNodeType(node);
 
   processed.count++;
@@ -1279,7 +1217,7 @@ async function serializeNode(
 
   onProgress(
     Math.round((processed.count / total) * 60),
-    `导出节点 ${processed.count}/${total}: ${node.name}`,
+    messages.exportingNode(processed.count, total, node.name),
   );
 
   let absX = node.absoluteTransform?.[0]?.[2] ?? node.x ?? 0;
@@ -1315,12 +1253,12 @@ async function serializeNode(
   const relX = absX - parentX;
   const relY = absY - parentY;
 
-  // MasterGo 的可见性属性是 isVisible（Figma 是 visible）；隐藏父节点会让子树视觉上不可见
-  // 但子节点的 isVisible 仍为 true，导出时必须显式继承父级 visible，否则 PSD 中所有节点都会显示。
+  // 隐藏父节点会让子树视觉上不可见，但子节点的 visible 仍可能为 true，
+  // 导出时显式继承父级 visible，确保 PSD 中可见性与画布一致。
   const selfVisible = getNodeVisible(node);
   const effectiveVisible = selfVisible && parentVisible;
 
-  const figmaNative = !isMasterGo && !node.getPluginDataKeys?.()?.some((key: string) => key.startsWith('psd_'));
+  const figmaNative = !node.getPluginDataKeys?.()?.some((key: string) => key.startsWith('psd_'));
   const data: ExportNodeData = {
     id: node.id,
     figmaNative,
@@ -1519,7 +1457,7 @@ async function serializeNode(
       prescanNineSliceHiddenSources(exportKids, skippedNodeIds, getNodeVisible);
       data.children = [];
       for (const child of exportKids) {
-        const childData = await serializeNode(child, parentX, parentY, onLog, onProgress, processed, total, depth + 1, effectiveVisible, skippedNodeIds, exportScale, ignoreHiddenLayers);
+        const childData = await serializeNode(child, parentX, parentY, onLog, onProgress, processed, total, depth + 1, effectiveVisible, skippedNodeIds, exportScale, ignoreHiddenLayers, locale);
         if (childData) data.children.push(childData);
       }
       if (!figmaNative) {
@@ -1527,7 +1465,7 @@ async function serializeNode(
       }
     }
 
-    if (!isMasterGo && nodeType === 'frame' && data.children?.length &&
+    if (nodeType === 'frame' && data.children?.length &&
         data.fills.some(f => f.visible) && !hasEditablePsdRoundTripRestore(node)) {
       try {
         data.frameFillBase64 = await exportFrameFill(node, exportScale);
@@ -1773,7 +1711,7 @@ function isImportWrapper(node: any): boolean {
   return false;
 }
 
-function expandImportWrappers(selection: any[]): any[] {
+function expandImportWrappers(selection: readonly any[]): any[] {
   const out: any[] = [];
   for (const node of selection) {
     if (isImportWrapper(node)) {
@@ -1848,19 +1786,20 @@ export async function serializeSelection(
   onProgress: ProgressFn,
   exportScale = 1,
   ignoreHiddenLayers = true,
+  locale: Locale = 'zh',
+  selectedNodes: readonly SceneNode[] = figma.currentPage.selection,
 ): Promise<{ nodes: ExportNodeData[]; width: number; height: number; engineData?: string; patterns?: string; compositeBase64?: string }> {
-  const page = isMasterGo ? mg.document.currentPage : api.currentPage;
-  const selectedNodes: any[] = [...(page.selection ?? [])];
+  const messages = getMessages(locale);
   if (!selectedNodes.length) {
-    throw new Error('没有选中任何节点');
+    throw new Error(messages.noSelectionError);
   }
-  const rawSelection = ignoreHiddenLayers ? selectedNodes.filter(isVisibleInCanvas) : selectedNodes;
-  if (!rawSelection.length) throw new Error('选中的图层均不可见。请显示图层或取消勾选「忽略隐藏图层」。');
+  const rawSelection = ignoreHiddenLayers ? selectedNodes.filter(isVisibleInCanvas) : [...selectedNodes];
+  if (!rawSelection.length) throw new Error(messages.allHiddenSelectionError);
   if (!Number.isInteger(exportScale) || exportScale < 1 || exportScale > 5) {
-    throw new Error('请选择 1× 至 5× 的 PSD 导出倍率');
+    throw new Error(messages.invalidScaleError);
   }
   if (exportScale !== 1 && rawSelection.some(node => containsImportedPsdData(node, ignoreHiddenLayers))) {
-    throw new Error('选区含从 PSD 导入的图层。请用 1× 导出以保留原始 PSD 数据。');
+    throw new Error(messages.importedPsdScaleError);
   }
 
   // engineData 查找必须在「展开外壳」之前进行：psd_engine_data plugin data
@@ -1908,7 +1847,7 @@ export async function serializeSelection(
     }
   }
   if (exportScale !== 1 && (engineData || patterns)) {
-    throw new Error('选区含原始 PSD 数据。请用 1× 导出以保留原始 PSD 数据。');
+    throw new Error(messages.rawPsdDataScaleError);
   }
 
   // 展开 importer 凭空添加的根外壳（Section / isRootFrame Frame），让 PSD 顶层结构
@@ -1938,7 +1877,7 @@ export async function serializeSelection(
   const expandedSelection = expandImportWrappers(rawSelection);
   const selection = ignoreHiddenLayers ? expandedSelection.filter(isVisibleInCanvas) : expandedSelection;
   if (selection.length === 0) {
-    throw new Error('选中的节点展开后为空');
+    throw new Error(messages.emptyExpandedSelectionError);
   }
   const expandedCount = selection.length - rawSelection.length;
   if (expandedCount !== 0) {
@@ -1969,11 +1908,11 @@ export async function serializeSelection(
   const height = Math.max(1, Math.round((psdCanvasHeight || maxY - minY) * exportScale));
   if (exportScale !== 1 &&
       (Math.max(width, height) > MAX_SCALED_DIMENSION || width * height > MAX_SCALED_PIXELS)) {
-    throw new Error(`导出尺寸 ${width} × ${height} px 过大，请降低 PSD 导出倍率。`);
+    throw new Error(messages.exportSizeTooLargeError(width, height));
   }
 
   for (const node of selection) {
-    const nodeData = await serializeNode(node, minX, minY, onLog, onProgress, processed, totalNodes, 0, isVisibleInCanvas(node.parent), skippedNodeIds, exportScale, ignoreHiddenLayers);
+    const nodeData = await serializeNode(node, minX, minY, onLog, onProgress, processed, totalNodes, 0, isVisibleInCanvas(node.parent), skippedNodeIds, exportScale, ignoreHiddenLayers, locale);
     if (nodeData) nodes.push(nodeData);
   }
 
@@ -1985,7 +1924,7 @@ export async function serializeSelection(
   if (exportScale !== 1) for (const node of nodes) scaleLayer(node, exportScale);
 
   const root = selection.length === 1 ? selection[0] : undefined;
-  const compositeBase64 = !isMasterGo && root && ['FRAME', 'INSTANCE', 'COMPONENT'].includes(root.type) &&
+  const compositeBase64 = root && ['FRAME', 'INSTANCE', 'COMPONENT'].includes(root.type) &&
     root.visible && root.opacity === 1 && !root.rotation && !psdCanvasWidth
     ? await exportNodeImage(root, { exportScale, absoluteBounds: true })
     : undefined;

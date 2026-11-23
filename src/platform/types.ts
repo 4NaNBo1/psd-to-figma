@@ -1,4 +1,5 @@
 import type { IRNode } from '../ir/types';
+import type { Locale } from '../i18n';
 
 export type LogFn = (level: 'info' | 'warn' | 'error', message: string) => void;
 export type ProgressFn = (percent: number, message: string) => void;
@@ -13,6 +14,8 @@ export interface RenderOptions {
   placement?: RenderPlacement;
   /** 是否为本批次最后一个文件；仅 tail 时调用 viewport 聚焦，避免多文件互相把视口拽走。 */
   isBatchTail?: boolean;
+  /** 当前界面语言，用于进度提示国际化。 */
+  locale?: Locale;
 }
 
 export interface PlatformRenderer {

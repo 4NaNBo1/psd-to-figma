@@ -8,7 +8,7 @@
  * 该脚本扫描源码，确保：
  *   (1) parser 不再把带栅格像素的 vectorFill 写成 overlayFills（会被叠在 IMAGE 之上盖住整层）；
  *   (2) builder 会设置 rotationBaked；
- *   (3) Figma / MasterGo 两个渲染器都按 rotationBaked 跳过旋转赋值。
+ *   (3) Figma 渲染器按 rotationBaked 跳过旋转赋值。
  * 用法：node scripts/self-check-rotation-baked.mjs
  */
 import { readFileSync } from 'node:fs';
@@ -42,11 +42,10 @@ must(
   'ir/builder.ts: rasterized rotated shape node must set rotationBaked',
 );
 
-// ── 3. 两个渲染器：rotationBaked 时跳过旋转赋值 ───────────────────────────────
-for (const [file, negate] of [
-  ['src/platform/figma-renderer.ts', '!irNode.rotationBaked'],
-  ['src/platform/mastergo-renderer.ts', '!irNode.rotationBaked'],
-]) {
+// ── 3. Figma 渲染器：rotationBaked 时跳过旋转赋值 ────────────────────────────
+{
+  const file = 'src/platform/figma-renderer.ts';
+  const negate = '!irNode.rotationBaked';
   const src = read(file);
   // 文本/companion 分支：tp.rotation 的旋转赋值必须包在 !irNode.rotationBaked 里。
   const textGuard = src.match(/if \(tp\.rotation\) \{[\s\S]{0,600}?\n {4,8}\}/g) || [];
@@ -60,7 +59,7 @@ for (const [file, negate] of [
   );
 }
 
-// ── 4. Figma 端补齐 psd_transform_rotation（与 MasterGo 对齐，供导出还原） ──────
+// ── 4. Figma 端保留 psd_transform_rotation（供导出还原） ─────────────────────
 must(
   /setPluginData\('psd_transform_rotation'/.test(read('src/platform/figma-renderer.ts')),
   'figma-renderer.ts: must persist psd_transform_rotation for round-trip',

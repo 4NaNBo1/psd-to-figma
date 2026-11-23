@@ -3,6 +3,7 @@ import type { Psd, Layer, BlendMode, LayerEffectShadow, LayerEffectSolidFill, La
 import type { ExportNodeData, ExportFillInfo, SerializedColor } from '../types/psd-types';
 import { resolvePostScriptName } from '../font-names';
 import { encodeNineSliceLayerName, parseNineSliceSettingsJson } from './nine-slice-collapse';
+import { getMessages, type Locale } from '../i18n';
 
 const BLEND_MODE_MAP: Record<string, BlendMode> = {
   'PASS_THROUGH': 'pass through',
@@ -1826,7 +1827,8 @@ async function buildLayer(node: ExportNodeData, parentClipRect?: { x: number; y:
 // Photoshop repairs source groups deeper than ten levels when opening the PSD.
 const MAX_PHOTOSHOP_GROUP_DEPTH = 10;
 
-function compactGroupDepth(layers: Layer[]): Layer[] {
+function compactGroupDepth(layers: Layer[], locale: Locale = 'zh'): Layer[] {
+  const messages = getMessages(locale);
   const minimumDepth = new Map<Layer, number>();
   const isTransparentGroup = (layer: Layer) => layer.blendMode === 'pass through' &&
     (layer.opacity ?? 1) === 1 && !layer.mask && !layer.realMask && !layer.vectorMask &&
@@ -1848,7 +1850,7 @@ function compactGroupDepth(layers: Layer[]): Layer[] {
         return [layer];
       }
       if (isTransparentGroup(layer)) return fit(layer.children, budget);
-      throw new Error(`「${layer.name}」的独立效果或蒙版需要超过 Photoshop 支持的组嵌套深度。请减少嵌套后再导出。`);
+      throw new Error(messages.groupDepthExceededError(layer.name ?? ''));
     });
   }
   return fit(layers, MAX_PHOTOSHOP_GROUP_DEPTH);
@@ -1878,8 +1880,10 @@ export async function buildAndDownloadPsd(
   engineData?: string,
   patterns?: string,
   compositeBase64?: string,
+  locale: Locale = 'zh',
 ): Promise<void> {
-  onProgress(65, '构建 PSD 图层结构...');
+  const messages = getMessages(locale);
+  onProgress(65, messages.buildingPsdStructure);
 
   // 重置智能对象完整还原收集器(每次导出独立)。
   collectedLinkedFiles = [];
@@ -1894,7 +1898,7 @@ export async function buildAndDownloadPsd(
   for (let i = 0; i < nodes.length; i++) {
     onProgress(
       65 + Math.round(((i + 1) / nodes.length) * 20),
-      `构建图层 ${i + 1}/${nodes.length}: ${nodes[i].name}`,
+      messages.buildingLayer(i + 1, nodes.length, nodes[i].name),
     );
     const result = await buildLayer(nodes[i], undefined, availablePatternIds);
     if (Array.isArray(result)) {
@@ -1904,9 +1908,9 @@ export async function buildAndDownloadPsd(
     }
   }
 
-  onProgress(88, '生成 PSD 文件...');
+  onProgress(88, messages.generatingPsdFile);
 
-  const exportLayers = nodes.some(node => node.figmaNative) ? compactGroupDepth(children) : children;
+  const exportLayers = nodes.some(node => node.figmaNative) ? compactGroupDepth(children, locale) : children;
   let nextId = 1;
   function assignLayerIds(layers: Layer[]): void {
     for (const layer of layers) {
@@ -1995,7 +1999,7 @@ export async function buildAndDownloadPsd(
     noBackground: true,
   });
 
-  onProgress(95, '准备下载...');
+  onProgress(95, messages.preparingDownload);
 
   const blob = new Blob([arrayBuffer], { type: 'application/octet-stream' });
   const url = URL.createObjectURL(blob);
@@ -2008,5 +2012,5 @@ export async function buildAndDownloadPsd(
 
   setTimeout(() => URL.revokeObjectURL(url), 5000);
 
-  onProgress(100, '导出完成！');
+  onProgress(100, messages.exportComplete);
 }

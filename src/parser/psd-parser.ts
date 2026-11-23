@@ -13,6 +13,7 @@ import type {
   SerializedGradientOverlay,
   LayerType,
 } from '../types/psd-types';
+import { getMessages, type Locale } from '../i18n';
 import { decodeNineSliceLayerName } from '../exporter/nine-slice-collapse';
 import { convertEffects, convertStrokes } from '../converter/effect-converter';
 import { convertBlendMode } from '../converter/blend-converter';
@@ -3384,8 +3385,10 @@ async function serializeLayer(
   parentLeft: number,
   parentTop: number,
   rootLeft?: number,
-  rootTop?: number
+  rootTop?: number,
+  locale: Locale = 'zh'
 ): Promise<SerializedLayer | null> {
+  const messages = getMessages(locale);
   // PS 调整图层（brightness/contrast, hue/saturation, vibrance 等）在 Figma/MasterGo
   // 中无法表达。跳过序列化，避免它们作为空矩形出现在 clip group 中，
   // 导致不必要的 clipping frame 裁剪掉基底图层的 shadow 等向外延伸效果。
@@ -3783,7 +3786,7 @@ async function serializeLayer(
   }
 
   if (serialized.type !== 'text' && layer.imageData && layer.imageData.width > 0 && layer.imageData.height > 0) {
-    onProgress({ percent: 0, message: `Encoding image: ${layer.name}` });
+    onProgress({ percent: 0, message: messages.encodingImage(layer.name ?? '') });
     try {
       const maskedData = applyLayerMask(layer.imageData, layer);
       const effectiveImageData = maskedData ?? layer.imageData;
@@ -3878,7 +3881,7 @@ async function serializeLayer(
       logger.warn(`Failed to encode imageData for "${layer.name}": ${e instanceof Error ? e.message : e}`);
     }
   } else if (serialized.type !== 'text' && layer.canvas) {
-    onProgress({ percent: 0, message: `Encoding canvas: ${layer.name}` });
+    onProgress({ percent: 0, message: messages.encodingCanvas(layer.name ?? '') });
     try {
       const cvs = layer.canvas as HTMLCanvasElement;
       const cctx = cvs.getContext('2d')!;
@@ -4033,7 +4036,7 @@ async function serializeLayer(
     }
 
     for (const child of layer.children) {
-      const childSerialized = await serializeLayer(child, images, onProgress, depth + 1, childParentLeft, childParentTop, effectiveRootLeft, effectiveRootTop);
+      const childSerialized = await serializeLayer(child, images, onProgress, depth + 1, childParentLeft, childParentTop, effectiveRootLeft, effectiveRootTop, locale);
       if (childSerialized) {
         const adjJson = baseAdjustmentsMap.get(child);
         if (adjJson) {
@@ -4113,10 +4116,12 @@ async function serializeLayer(
 
 export async function parsePsdFile(
   buffer: ArrayBuffer,
-  onProgress: (p: ParseProgress) => void
+  onProgress: (p: ParseProgress) => void,
+  locale: Locale = 'zh'
 ): Promise<SerializedPsd> {
+  const messages = getMessages(locale);
   logger.info('Parsing PSD structure...');
-  onProgress({ percent: 5, message: 'Parsing PSD structure...' });
+  onProgress({ percent: 5, message: messages.parsingPsdStructure });
 
   const psd = readPsd(buffer, {
     useImageData: true,
@@ -4130,7 +4135,7 @@ export async function parsePsdFile(
   globalPsdLinkedFiles = (psd as any).linkedFiles as typeof globalPsdLinkedFiles;
   globalSmartObjectSourceCache = new Map();
   logger.info(`PSD structure parsed: ${psd.width}x${psd.height}, ${psd.children?.length ?? 0} top-level layers, ${globalPsdPatterns?.length ?? 0} global patterns, ${globalPsdLinkedFiles?.length ?? 0} linked files`);
-  onProgress({ percent: 20, message: 'PSD structure parsed. Processing layers...' });
+  onProgress({ percent: 20, message: messages.psdParsedProcessingLayers });
 
   const images: Uint8Array[] = [];
   const layers: SerializedLayer[] = [];
@@ -4144,10 +4149,10 @@ export async function parsePsdFile(
       logger.info(`Processing top-level layer ${i + 1}/${total}: "${layerName}"`);
       onProgress({
         percent: 20 + Math.round(((i + 1) / total) * 60),
-        message: `Processing layer ${i + 1}/${total}: ${layerName}`,
+        message: messages.processingLayer(i + 1, total, layerName),
       });
 
-      const serializedLayer = await serializeLayer(psd.children[i], images, onProgress, 0, 0, 0);
+      const serializedLayer = await serializeLayer(psd.children[i], images, onProgress, 0, 0, 0, undefined, undefined, locale);
       if (serializedLayer) {
         layers.push(serializedLayer);
       }
@@ -4155,7 +4160,7 @@ export async function parsePsdFile(
   }
 
   logger.info(`Layers processed. Total serialized layers: ${layers.length}, images: ${images.length}`);
-  onProgress({ percent: 85, message: 'Layers processed. Preparing transfer...' });
+  onProgress({ percent: 85, message: messages.layersProcessedTransferring });
 
   const base64Images: string[] = images.map((img) => uint8ArrayToBase64(img));
 
