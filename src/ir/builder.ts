@@ -1,6 +1,7 @@
 import type { SerializedLayer, SerializedPsd, SerializedShadow, SerializedStroke, SerializedCornerRadii, SerializedFill } from '../types/psd-types';
 import type { IRNode, IRFill, IRShadow, IRStroke, IRCornerRadii, IRTextProps, IRTextRange, IRGradientFill, IRSolidFill, IRColor } from './types';
 import { readPngDimensions } from '../exporter/nine-slice-collapse';
+import { resolveDisplayFont } from '../font-names';
 
 const POSTSCRIPT_TO_FAMILY: Record<string, string> = {
   'PingFangSC': 'PingFang SC',
@@ -94,6 +95,8 @@ function normalizeBlendMode(mode: string): string {
 
 export function parseFontName(rawName: string): { family: string; style: string } {
   const cleaned = rawName.replace(/^\s+|\s+$/g, '');
+  const knownFont = resolveDisplayFont(cleaned);
+  if (knownFont) return knownFont;
 
   const lastDash = cleaned.lastIndexOf('-');
   if (lastDash > 0) {

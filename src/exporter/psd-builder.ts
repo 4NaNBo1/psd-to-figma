@@ -1,6 +1,7 @@
 import { writePsd } from 'ag-psd';
 import type { Psd, Layer, BlendMode, LayerEffectShadow, LayerEffectSolidFill, LayerEffectGradientOverlay, LayerEffectStroke, LayerMaskData, ColorStop, OpacityStop } from 'ag-psd';
 import type { ExportNodeData, ExportFillInfo, SerializedColor } from '../types/psd-types';
+import { resolvePostScriptName } from '../font-names';
 import { encodeNineSliceLayerName, parseNineSliceSettingsJson } from './nine-slice-collapse';
 
 const BLEND_MODE_MAP: Record<string, BlendMode> = {
@@ -64,6 +65,8 @@ function textCaseToFontCaps(tc: string | undefined): number {
 }
 
 function toPostScriptName(family: string, style: string): string {
+  const knownName = resolvePostScriptName(family, style);
+  if (knownName) return knownName;
   if (family === 'Arial') {
     if (!style || style === 'Regular') return 'ArialMT';
     if (['Bold', 'Italic', 'Bold Italic'].includes(style)) return `Arial-${style.replace(/\s+/g, '')}MT`;

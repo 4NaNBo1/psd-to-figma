@@ -66,14 +66,15 @@ initializeCanvas(createCanvas);
 const entry = buildSync({
   stdin: {
     contents: `export { serializeSelection } from './src/exporter/node-serializer';
-               export { buildAndDownloadPsd } from './src/exporter/psd-builder';`,
+               export { buildAndDownloadPsd } from './src/exporter/psd-builder';
+               export { parseFontName } from './src/ir/builder';`,
     resolveDir: root,
   },
   bundle: true, platform: 'node', format: 'cjs', write: false, external: ['ag-psd'],
 }).outputFiles[0].text;
 const bundled = { exports: {} };
 new Function('module', 'exports', 'require', entry)(bundled, bundled.exports, require);
-const { serializeSelection, buildAndDownloadPsd } = bundled.exports;
+const { serializeSelection, buildAndDownloadPsd, parseFontName } = bundled.exports;
 
 // Route decoded browser image data through node-canvas in this harness.
 const canvasFactory = document.createElement;
@@ -203,7 +204,7 @@ const voicePlate = node('FRAME', 'voice background', voiceBounds, {
   props: { children: [node('VECTOR', 'outer outline', voiceBounds), voiceSurface] },
 });
 const voiceText = node('TEXT', 'voice label', [61, 195, 62, 22], {
-  props: { textAutoResize: 'WIDTH_AND_HEIGHT', characters: '按住说话', fontName: { family: 'PingFang SC', style: 'Regular' }, fontSize: 16 },
+  props: { textAutoResize: 'WIDTH_AND_HEIGHT', characters: '按住说话', fontName: { family: 'FZXinZongYiHeiS', style: 'DemiBold' }, fontSize: 16 },
 });
 const voice = node('INSTANCE', 'voice button', voiceBounds, { props: { children: [voicePlate, voiceText] } });
 const externalBlend = node('GROUP', 'external blend', voiceBounds, {
@@ -262,6 +263,7 @@ for (const scale of [1, 3]) {
   assert.equal(plate.getImageData(0, 0, 1, 1).data[3], 0, 'The button corner stays transparent');
   assert.equal(plate.getImageData(60 * scale, 20 * scale, 1, 1).data[3], 255);
   assert.equal(speechText.text.text, '按住说话');
+  assert.equal(speechText.text.style.font.name, 'FZXINZYHS-DB--GB1-0');
   assert.equal(unbacked.children[0].blendMode, 'soft light', 'A blend using an external backdrop stays live');
   assert.equal(new Set([roomLayer, ...roomLayer.children].map(l => l.id)).size, 10);
 }
@@ -275,4 +277,39 @@ const maskPixels = roundedMask.canvas.getContext('2d');
 assert.equal(maskPixels.getImageData(0, 0, 1, 1).data[0], 0, 'The editable mask preserves rounded vertices');
 assert.equal(maskPixels.getImageData(60, 20, 1, 1).data[0], 255);
 
-process.stdout.write('Figma export checks passed at 1× and 3×, including the layered mask fallback.\n');
+const mixedFonts = node('TEXT', 'mixed fonts', [0, 0, 120, 24], {
+  props: {
+    characters: '方正钉普健摩9 Arial',
+    textAutoResize: 'WIDTH_AND_HEIGHT',
+    getRangeFontName: start => [
+      { family: '方正新综艺黑 简', style: 'Demi Bold' },
+      { family: 'FZXinZongYiHeiS SemiBold', style: 'Regular' },
+      { family: '钉钉进步体', style: 'Regular' },
+      { family: 'Alibaba PuHuiTi 2.0', style: '85 Bold' },
+      { family: 'Alibaba Health Font 2.0 CN', style: '85 B' },
+      { family: 'MF MoDeng', style: 'Regular' },
+      { family: 'DINPro', style: 'Regular' },
+    ][start] ?? { family: 'Arial', style: 'Regular' },
+    getRangeFontSize: () => 16,
+  },
+});
+globalThis.figma.currentPage.selection = [mixedFonts];
+const fontExport = await serializeSelection(() => {}, () => {}, 1);
+await buildAndDownloadPsd(fontExport.nodes, fontExport.width, fontExport.height, 'fonts.psd', () => {});
+const fontPsd = readPsd(Buffer.from(await download.arrayBuffer()));
+const [textLayer] = fontPsd.children;
+assert.equal(textLayer.text.text, mixedFonts.characters);
+assert.deepEqual(textLayer.text.styleRuns.map(({ style }) => (style.font ?? textLayer.text.style.font).name), [
+  'FZXINZYHS-DB--GB1-0',
+  'FZXINZYHS-SB--GB1-0',
+  'DingTalk-JinBuTi',
+  'AlibabaPuHuiTi_2_85_Bold',
+  'AlibabaHealthFont20CN-85B',
+  'MF-MoDeng-Regular',
+  'DINPro-Regular',
+  'ArialMT',
+]);
+assert.deepEqual(parseFontName('FZXINZYHS-DB--GB1-0'), { family: 'FZXinZongYiHeiS', style: 'DemiBold' });
+assert.deepEqual(parseFontName('FZXINZYHS-SB--GB1-0'), { family: 'FZXinZongYiHeiS', style: 'SemiBold' });
+
+process.stdout.write('Figma export checks passed at 1× and 3×, including layered masks and editable font mappings.\n');
